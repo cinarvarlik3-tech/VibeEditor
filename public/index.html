@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vibe Editor</title>
+  <link rel="stylesheet" href="/styles.css" />
+
+  <!-- Tailwind CSS CDN (play CDN — all utilities available at runtime) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            'vibe-primary':   '#111111',
+            'vibe-secondary': '#161616',
+            'vibe-tertiary':  '#1e1e1e',
+            'vibe-elevated':  '#2a2a2a',
+            'vibe-accent':    '#00BCD4',
+            'vibe-accent-dk': '#00897B',
+          }
+        }
+      }
+    }
+  </script>
+</head>
+
+<body style="background:#111111; margin:0; padding:0; overflow:hidden;">
+  <div id="root"></div>
+
+  <!-- ── CDN Libraries (load order is critical) ──────────────── -->
+
+  <!-- 1. React 18 UMD — exposes window.React -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+
+  <!-- 2. ReactDOM 18 UMD — exposes window.ReactDOM -->
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+
+  <!-- 3. Babel Standalone — enables <script type="text/babel"> for JSX in browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- 4. Framer Motion UMD — exposes window.Motion -->
+  <script src="https://unpkg.com/framer-motion/dist/framer-motion.js"></script>
+
+  <!-- 5. Lucide React UMD @0.294.0 — last version with UMD build, exposes window.LucideReact -->
+  <!-- Shim: lucide-react@0.294.0 UMD references global.react (lowercase) but React sets global.React (uppercase) -->
+  <script>window.react = window.React;</script>
+  <script src="https://unpkg.com/lucide-react@0.294.0/dist/umd/lucide-react.js"></script>
+
+  <!-- ── State (dual-export: CommonJS in Node, globals in browser) ── -->
+
+  <!-- 6. Timeline state schema — window.TimelineSchema -->
+  <script src="/state/schema.js"></script>
+
+  <!-- 7. Timeline reducer + helpers — window.TimelineReducer -->
+  <script src="/state/timelineReducer.js"></script>
+
+  <!-- 7b. Effect style resolver — window.EffectStyles -->
+  <script src="/effectStyles.js"></script>
+
+  <!-- ── Components (each sets window.ComponentName before App runs) ── -->
+
+  <!-- 8. VideoPreview — window.VideoPreview -->
+  <script type="text/babel" src="/components/VideoPreview.jsx"></script>
+
+  <!-- 9. Timeline — window.Timeline -->
+  <script type="text/babel" src="/components/Timeline.jsx"></script>
+
+  <!-- 10. LeftPanel — window.LeftPanel -->
+  <script type="text/babel" src="/components/LeftPanel.jsx"></script>
+
+  <!-- 11. AgentPanel — window.AgentPanel -->
+  <script type="text/babel" src="/components/AgentPanel.jsx"></script>
+
+  <!-- 12. Header — window.Header -->
+  <script type="text/babel" src="/components/Header.jsx"></script>
+
+  <!-- 13. ExportModal — window.ExportModal -->
+  <script type="text/babel" src="/components/ExportModal.jsx"></script>
+
+  <!-- 14. ContextMenu — window.ContextMenu -->
+  <script type="text/babel" src="/components/ContextMenu.jsx"></script>
+
+  <!-- 15. App — root component, mounts to #root -->
+  <script type="text/babel" src="/App.jsx"></script>
+</body>
+</html>

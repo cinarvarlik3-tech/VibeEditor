@@ -1,0 +1,12 @@
+{
+  "watch": ["src"],
+  "ext": "js,json",
+  "ignore": [
+    "public/**",
+    "uploads/**",
+    "output/**",
+    "frames/**",
+    "src/state/schema.js",
+    "src/state/timelineReducer.js"
+  ]
+}

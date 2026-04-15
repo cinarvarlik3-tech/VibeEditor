@@ -1,0 +1,65 @@
+[
+  {
+    "text": "The only way to do great work",
+    "startTime": 0.0,
+    "endTime": 2.8,
+    "wordTimings": [
+      { "word": "The", "start": 0.0, "end": 0.2 },
+      { "word": "only", "start": 0.2, "end": 0.5 },
+      { "word": "way", "start": 0.5, "end": 0.8 },
+      { "word": "to", "start": 0.8, "end": 0.9 },
+      { "word": "do", "start": 0.9, "end": 1.1 },
+      { "word": "great", "start": 1.1, "end": 1.6 },
+      { "word": "work", "start": 1.6, "end": 2.1 }
+    ]
+  },
+  {
+    "text": "is to love what you do",
+    "startTime": 3.0,
+    "endTime": 5.5,
+    "wordTimings": [
+      { "word": "is", "start": 3.0, "end": 3.2 },
+      { "word": "to", "start": 3.2, "end": 3.4 },
+      { "word": "love", "start": 3.4, "end": 3.9 },
+      { "word": "what", "start": 3.9, "end": 4.2 },
+      { "word": "you", "start": 4.2, "end": 4.5 },
+      { "word": "do", "start": 4.5, "end": 4.9 }
+    ]
+  },
+  {
+    "text": "Stay hungry, stay foolish",
+    "startTime": 6.0,
+    "endTime": 8.8,
+    "wordTimings": [
+      { "word": "Stay", "start": 6.0, "end": 6.4 },
+      { "word": "hungry,", "start": 6.4, "end": 7.0 },
+      { "word": "stay", "start": 7.2, "end": 7.6 },
+      { "word": "foolish", "start": 7.6, "end": 8.3 }
+    ]
+  },
+  {
+    "text": "Your time is limited",
+    "startTime": 9.5,
+    "endTime": 11.8,
+    "wordTimings": [
+      { "word": "Your", "start": 9.5, "end": 9.8 },
+      { "word": "time", "start": 9.8, "end": 10.2 },
+      { "word": "is", "start": 10.2, "end": 10.4 },
+      { "word": "limited", "start": 10.4, "end": 11.1 }
+    ]
+  },
+  {
+    "text": "Don't waste it living someone else's life",
+    "startTime": 12.0,
+    "endTime": 15.0,
+    "wordTimings": [
+      { "word": "Don't", "start": 12.0, "end": 12.3 },
+      { "word": "waste", "start": 12.3, "end": 12.7 },
+      { "word": "it", "start": 12.7, "end": 12.9 },
+      { "word": "living", "start": 12.9, "end": 13.3 },
+      { "word": "someone", "start": 13.3, "end": 13.8 },
+      { "word": "else's", "start": 13.8, "end": 14.3 },
+      { "word": "life", "start": 14.3, "end": 14.9 }
+    ]
+  }
+]
