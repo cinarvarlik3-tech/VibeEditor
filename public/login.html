@@ -140,8 +140,7 @@
         errEl.textContent = '';
         setLoading(true);
         window.Auth.signIn(emailEl.value, passEl.value)
-          .then(function (res) {
-            window.Auth.setToken(res.token);
+          .then(function () {
             window.location.href = '/landing.html';
           })
           .catch(function (er) {
