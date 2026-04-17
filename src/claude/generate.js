@@ -18,6 +18,511 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { SYSTEM_PROMPT } = require('./systemPrompt');
 const { searchAudio }   = require('../assets/audio');
 
+const log = (...args) => console.log('[generate]', ...args);
+
+function deepCloneJson(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+// ── Track compression (Claude input only) ─────────────────────────────────
+
+function omitKeys(obj, keysToOmit) {
+  if (!obj || typeof obj !== 'object') return {};
+  const out = { ...obj };
+  for (const k of keysToOmit) delete out[k];
+  return out;
+}
+
+function compressKeyframePoint(kf) {
+  if (!kf || typeof kf !== 'object') return kf;
+  const pt = {};
+  if (kf.time !== undefined) pt.ti = kf.time;
+  if (kf.value !== undefined) pt.vl = kf.value;
+  if (kf.easing !== undefined) pt.ea = kf.easing;
+  return pt;
+}
+
+function compressVideoKeyframes(kfRoot) {
+  if (!kfRoot || typeof kfRoot !== 'object') return kfRoot;
+  const out = {};
+  if (Array.isArray(kfRoot.scale)) {
+    out.sc = kfRoot.scale.map(compressKeyframePoint);
+  }
+  if (Array.isArray(kfRoot.opacity)) {
+    out.op = kfRoot.opacity.map(compressKeyframePoint);
+  }
+  return out;
+}
+
+function compressSubtitleStyle(style) {
+  if (!style || typeof style !== 'object') return {};
+  const stripped = omitKeys(style, [
+    'textShadow', 'letterSpacing', 'backgroundColor', 'padding', 'borderRadius',
+  ]);
+  const out = {};
+  if (stripped.fontFamily !== undefined) out.ff = stripped.fontFamily;
+  if (stripped.fontSize !== undefined) out.fs = stripped.fontSize;
+  if (stripped.fontWeight !== undefined) out.fw = stripped.fontWeight;
+  if (stripped.fontStyle !== undefined) out.fi = stripped.fontStyle;
+  if (stripped.textTransform !== undefined) out.tt = stripped.textTransform;
+  if (stripped.textAlign !== undefined) out.ta = stripped.textAlign;
+  if (stripped.color !== undefined) out.c = stripped.color;
+  if (stripped.effect !== undefined) out.fx = stripped.effect && typeof stripped.effect === 'object'
+    ? { ...stripped.effect }
+    : stripped.effect;
+  return out;
+}
+
+function stripAnimInOutDuration(anim) {
+  if (!anim || typeof anim !== 'object') return anim;
+  const out = { ...anim };
+  if (out.in && typeof out.in === 'object') {
+    out.in = omitKeys(out.in, ['duration']);
+  }
+  if (out.out && typeof out.out === 'object') {
+    out.out = omitKeys(out.out, ['duration']);
+  }
+  return out;
+}
+
+function compressSubtitleElement(el) {
+  const pos = el.position && typeof el.position === 'object'
+    ? { x: el.position.x, y: el.position.y }
+    : {};
+  const an = el.animation ? stripAnimInOutDuration(deepCloneJson(el.animation)) : el.animation;
+  return {
+    id: el.id,
+    st: el.startTime,
+    et: el.endTime,
+    tp: 'subtitle',
+    tx: el.text,
+    s:  compressSubtitleStyle(el.style || {}),
+    p:  pos,
+    an,
+  };
+}
+
+function compressVideoElement(el) {
+  const stripped = omitKeys(el, ['storageRef', 'imageDuration', 'isImage', 'src']);
+  const out = {
+    id: stripped.id,
+    st: stripped.startTime,
+    et: stripped.endTime,
+    tp: 'videoClip',
+  };
+  if (stripped.playbackRate !== undefined) out.pr = stripped.playbackRate;
+  if (stripped.volume !== undefined) out.v = stripped.volume;
+  if (stripped.sourceStart !== undefined) out.ss = stripped.sourceStart;
+  if (stripped.sourceEnd !== undefined) out.se = stripped.sourceEnd;
+  if (stripped.originalFilename !== undefined) out.fn = stripped.originalFilename;
+  if (stripped.keyframes) out.kf = compressVideoKeyframes(stripped.keyframes);
+  return out;
+}
+
+function compressAudioElement(el) {
+  const stripped = omitKeys(el, ['storageRef', 'src']);
+  const out = {
+    id: stripped.id,
+    st: stripped.startTime,
+    et: stripped.endTime,
+    tp: 'audioClip',
+  };
+  if (stripped.volume !== undefined) out.v = stripped.volume;
+  if (stripped.fadeIn !== undefined) out.fi = stripped.fadeIn;
+  if (stripped.fadeOut !== undefined) out.fo = stripped.fadeOut;
+  if (stripped.sourceName !== undefined) out.sn = stripped.sourceName;
+  if (stripped.sourceType !== undefined) out.st_ = stripped.sourceType;
+  return out;
+}
+
+function compressElement(el) {
+  if (!el || typeof el !== 'object') return el;
+  if (el.type === 'subtitle') return compressSubtitleElement(el);
+  if (el.type === 'videoClip') return compressVideoElement(el);
+  if (el.type === 'audioClip') return compressAudioElement(el);
+  return deepCloneJson(el);
+}
+
+function compressTrack(track) {
+  if (!track || typeof track !== 'object') return track;
+  return {
+    id:       track.id,
+    index:    track.index,
+    name:     track.name,
+    elements: (track.elements || []).map(compressElement),
+  };
+}
+
+/**
+ * compressTracks — pure; returns compressed timeline tracks for Claude.
+ * @param {object} tracks
+ * @returns {object}
+ */
+function compressTracks(tracks) {
+  const raw = deepCloneJson(tracks || {});
+  const out = {};
+  for (const kind of ['video', 'subtitle', 'audio']) {
+    if (!Array.isArray(raw[kind])) continue;
+    out[kind] = raw[kind].map(compressTrack);
+  }
+  return out;
+}
+
+const SUBTITLE_KEYWORDS = [
+  'subtitle', 'caption', 'text', 'font', 'size', 'color', 'bold', 'italic', 'animation',
+  'slide', 'pop', 'typewriter', 'outline', 'shadow', 'glow', 'box', 'uppercase', 'position',
+  'align', 'center', 'bottom', 'top',
+];
+const SUBTITLE_PHRASES = ['word by word', 'fade in', 'fade out'];
+
+const VIDEO_KEYWORDS = [
+  'clip', 'video', 'zoom', 'scale', 'speed', 'slow', 'fast', 'trim', 'cut', 'split',
+  'keyframe', 'opacity', 'source', 'playback', 'second', 'gradual', 'instant',
+  'remove section', 'keep only',
+];
+
+const AUDIO_KEYWORDS = [
+  'audio', 'music', 'sound', 'track', 'volume', 'lofi', 'ambient', 'beat',
+  'background', 'jamendo', 'freesound', 'upload', 'song', 'instrumental',
+];
+
+function promptMatchesAnyKeyword(promptLower, list) {
+  for (const kw of list) {
+    if (promptLower.includes(kw)) return true;
+  }
+  return false;
+}
+
+/**
+ * selectRelevantTracks — returns a subset of track-type keys based on prompt.
+ * Never returns an empty object when input has data (falls back to all types).
+ */
+function selectRelevantTracks(tracks, prompt) {
+  if (!tracks || typeof tracks !== 'object') return tracks;
+  const p = String(prompt || '').toLowerCase();
+  const words = p.split(/\s+/).filter(Boolean);
+
+  if (words.length < 3) {
+    return deepCloneJson(tracks);
+  }
+
+  let wantSub = false;
+  let wantVid = false;
+  let wantAud = false;
+
+  if (/\bfade\b|fade\s*in|fade\s*out/i.test(p)) {
+    wantSub = true;
+    wantAud = true;
+  }
+
+  for (const ph of SUBTITLE_PHRASES) {
+    if (p.includes(ph)) wantSub = true;
+  }
+  if (promptMatchesAnyKeyword(p, SUBTITLE_KEYWORDS)) wantSub = true;
+  if (promptMatchesAnyKeyword(p, VIDEO_KEYWORDS)) wantVid = true;
+  if (promptMatchesAnyKeyword(p, AUDIO_KEYWORDS)) wantAud = true;
+
+  if (!wantSub && !wantVid && !wantAud) {
+    return deepCloneJson(tracks);
+  }
+
+  const out = {};
+  if (wantSub && Array.isArray(tracks.subtitle)) out.subtitle = deepCloneJson(tracks.subtitle);
+  if (wantVid && Array.isArray(tracks.video)) out.video = deepCloneJson(tracks.video);
+  if (wantAud && Array.isArray(tracks.audio)) out.audio = deepCloneJson(tracks.audio);
+
+  if (Object.keys(out).length === 0) {
+    return deepCloneJson(tracks);
+  }
+  return out;
+}
+
+function promptNeedsFullTrackTypes(prompt) {
+  const p = String(prompt || '');
+  return /\b(undo|revert|go\s+back|redo|explain|what\s+did\s+you(\s+do)?)\b/i.test(p);
+}
+
+/**
+ * Safe compress + optional selection for Claude payloads.
+ * @param {object} rawTracks
+ * @param {string} prompt
+ * @param {{ skipSelection?: boolean }} opts
+ */
+function prepareTracksForClaude(rawTracks, prompt, opts) {
+  try {
+    const compressed = compressTracks(rawTracks);
+    if (opts && opts.skipSelection) return compressed;
+    if (promptNeedsFullTrackTypes(prompt)) return compressed;
+    return selectRelevantTracks(compressed, prompt);
+  } catch (err) {
+    console.warn('[generate] compress/select failed, using raw tracks —', err.message);
+    return rawTracks;
+  }
+}
+
+// ── Operation decompression (Claude output → reducer) ─────────────────────
+
+const UPDATE_CHANGE_KEY_MAP = {
+  's.fs': 'style.fontSize',
+  's.fw': 'style.fontWeight',
+  's.fi': 'style.fontStyle',
+  's.c':  'style.color',
+  's.ff': 'style.fontFamily',
+  's.tt': 'style.textTransform',
+  's.ta': 'style.textAlign',
+  's.fx.type':  'style.effect.type',
+  's.fx.color': 'style.effect.color',
+  'p.x':  'position.x',
+  'p.y':  'position.y',
+  'an.in.type':  'animation.in.type',
+  'an.out.type': 'animation.out.type',
+  'an.in.duration':  'animation.in.duration',
+  'an.out.duration': 'animation.out.duration',
+  'tx': 'text',
+  'pr': 'playbackRate',
+  'v':  'volume',
+  'ss': 'sourceStart',
+  'se': 'sourceEnd',
+  'fn': 'originalFilename',
+  'st': 'startTime',
+  'et': 'endTime',
+  'tp': 'type',
+  'fi': 'fadeIn',
+  'fo': 'fadeOut',
+  'sn': 'sourceName',
+  'st_': 'sourceType',
+};
+
+function mapUpdateChangeDotKey(key) {
+  if (typeof key !== 'string') return key;
+  if (UPDATE_CHANGE_KEY_MAP[key]) return UPDATE_CHANGE_KEY_MAP[key];
+  let k = key;
+  k = k.replace(/^kf\.sc\.(\d+)\.ti\b/, 'keyframes.scale.$1.time');
+  k = k.replace(/^kf\.sc\.(\d+)\.vl\b/, 'keyframes.scale.$1.value');
+  k = k.replace(/^kf\.sc\.(\d+)\.ea\b/, 'keyframes.scale.$1.easing');
+  k = k.replace(/^kf\.op\.(\d+)\.ti\b/, 'keyframes.opacity.$1.time');
+  k = k.replace(/^kf\.op\.(\d+)\.vl\b/, 'keyframes.opacity.$1.value');
+  k = k.replace(/^kf\.op\.(\d+)\.ea\b/, 'keyframes.opacity.$1.easing');
+  return k;
+}
+
+function decompressUpdateChanges(changes) {
+  if (!changes || typeof changes !== 'object') return changes;
+  const out = {};
+  for (const [k, v] of Object.entries(changes)) {
+    out[mapUpdateChangeDotKey(k)] = v;
+  }
+  return out;
+}
+
+const STYLE_COMP_TO_FULL = {
+  ff: 'fontFamily', fs: 'fontSize', fw: 'fontWeight', fi: 'fontStyle',
+  tt: 'textTransform', ta: 'textAlign', c: 'color', fx: 'effect',
+};
+
+function decompressStyleObject(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (obj.fontFamily !== undefined || obj.fontSize !== undefined) return { ...obj };
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const nk = STYLE_COMP_TO_FULL[k] || k;
+    out[nk] = v;
+  }
+  return out;
+}
+
+function decompressKeyframePoint(pt) {
+  if (!pt || typeof pt !== 'object') return pt;
+  if (pt.time !== undefined || pt.value !== undefined) return { ...pt };
+  const out = {};
+  if (pt.ti !== undefined) out.time = pt.ti;
+  if (pt.vl !== undefined) out.value = pt.vl;
+  if (pt.ea !== undefined) out.easing = pt.ea;
+  return out;
+}
+
+function decompressVideoKeyframes(kf) {
+  if (!kf || typeof kf !== 'object') return kf;
+  if (kf.scale || kf.opacity) return kf;
+  const out = {};
+  if (Array.isArray(kf.sc)) out.scale = kf.sc.map(decompressKeyframePoint);
+  if (Array.isArray(kf.op)) out.opacity = kf.op.map(decompressKeyframePoint);
+  return out;
+}
+
+function decompressSubtitleLikeBody(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const t = obj.tp || obj.type;
+  if (t && t !== 'subtitle') return obj;
+  if (obj.style && !obj.s) return { ...obj };
+
+  const out = {};
+  if (obj.id != null) out.id = obj.id;
+  out.type = 'subtitle';
+  if (obj.startTime != null || obj.st != null) {
+    out.startTime = obj.startTime != null ? obj.startTime : obj.st;
+  }
+  if (obj.endTime != null || obj.et != null) {
+    out.endTime = obj.endTime != null ? obj.endTime : obj.et;
+  }
+  if (obj.text != null || obj.tx != null) {
+    out.text = obj.text != null ? obj.text : obj.tx;
+  }
+  out.style = decompressStyleObject(obj.s || obj.style || {});
+  out.position = { ...(obj.p || obj.position || {}) };
+  if (obj.an || obj.animation) {
+    out.animation = deepCloneJson(obj.an || obj.animation);
+  }
+  return out;
+}
+
+function decompressVideoLikeBody(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const t = obj.tp || obj.type;
+  if (t && t !== 'videoClip') return obj;
+  if (obj.keyframes && !obj.kf) return { ...obj };
+
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    if (['tp', 'st', 'et', 'pr', 'v', 'ss', 'se', 'fn', 'kf'].includes(k)) continue;
+    out[k] = obj[k];
+  }
+  out.type = 'videoClip';
+  if (obj.startTime != null || obj.st != null) {
+    out.startTime = obj.startTime != null ? obj.startTime : obj.st;
+  }
+  if (obj.endTime != null || obj.et != null) {
+    out.endTime = obj.endTime != null ? obj.endTime : obj.et;
+  }
+  if (obj.playbackRate != null || obj.pr != null) {
+    out.playbackRate = obj.playbackRate != null ? obj.playbackRate : obj.pr;
+  }
+  if (obj.volume != null || obj.v != null) {
+    out.volume = obj.volume != null ? obj.volume : obj.v;
+  }
+  if (obj.sourceStart != null || obj.ss != null) {
+    out.sourceStart = obj.sourceStart != null ? obj.sourceStart : obj.ss;
+  }
+  if (obj.sourceEnd != null || obj.se != null) {
+    out.sourceEnd = obj.sourceEnd != null ? obj.sourceEnd : obj.se;
+  }
+  if (obj.originalFilename || obj.fn) {
+    out.originalFilename = obj.originalFilename || obj.fn;
+  }
+  if (obj.kf) out.keyframes = decompressVideoKeyframes(obj.kf);
+  else if (obj.keyframes) out.keyframes = deepCloneJson(obj.keyframes);
+  return out;
+}
+
+function decompressAudioLikeBody(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const t = obj.tp || obj.type;
+  if (t && t !== 'audioClip') return obj;
+  const compressed = obj.tp === 'audioClip' || obj.st_ !== undefined;
+  if (!compressed && obj.type === 'audioClip') return { ...obj };
+
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    if (['tp', 'st', 'et', 'v', 'fi', 'fo', 'sn', 'st_'].includes(k)) continue;
+    out[k] = obj[k];
+  }
+  out.type = 'audioClip';
+  if (obj.startTime != null || obj.st != null) {
+    out.startTime = obj.startTime != null ? obj.startTime : obj.st;
+  }
+  if (obj.endTime != null || obj.et != null) {
+    out.endTime = obj.endTime != null ? obj.endTime : obj.et;
+  }
+  if (obj.volume != null || obj.v != null) {
+    out.volume = obj.volume != null ? obj.volume : obj.v;
+  }
+  if (obj.fadeIn != null || obj.fi != null) {
+    out.fadeIn = obj.fadeIn != null ? obj.fadeIn : obj.fi;
+  }
+  if (obj.fadeOut != null || obj.fo != null) {
+    out.fadeOut = obj.fadeOut != null ? obj.fadeOut : obj.fo;
+  }
+  if (obj.sourceName || obj.sn) {
+    out.sourceName = obj.sourceName || obj.sn;
+  }
+  if (obj.sourceType != null || obj.st_ != null) {
+    out.sourceType = obj.sourceType != null ? obj.sourceType : obj.st_;
+  }
+  return out;
+}
+
+function decompressCreateElement(el) {
+  if (!el || typeof el !== 'object') return el;
+  const t = el.tp || el.type;
+  if (t === 'subtitle' || (el.s && !el.style)) return decompressSubtitleLikeBody(el);
+  if (t === 'videoClip' || (el.kf && !el.keyframes)) return decompressVideoLikeBody(el);
+  if (t === 'audioClip' || el.st_ != null) return decompressAudioLikeBody(el);
+  return el;
+}
+
+function decompressBatchTemplate(tpl) {
+  if (!tpl || typeof tpl !== 'object') return tpl;
+  const o = decompressSubtitleLikeBody(tpl);
+  return o;
+}
+
+function decompressBatchElementPatch(el) {
+  if (!el || typeof el !== 'object') return el;
+  const o = { ...el };
+  if (o.st !== undefined) { o.startTime = o.startTime !== undefined ? o.startTime : o.st; delete o.st; }
+  if (o.et !== undefined) { o.endTime = o.endTime !== undefined ? o.endTime : o.et; delete o.et; }
+  if (o.tx !== undefined) { o.text = o.text !== undefined ? o.text : o.tx; delete o.tx; }
+  return o;
+}
+
+function decompressKeyframeChangesFlat(ch) {
+  if (!ch || typeof ch !== 'object') return ch;
+  const out = { ...ch };
+  if (out.ti !== undefined) { out.time = out.time !== undefined ? out.time : out.ti; delete out.ti; }
+  if (out.vl !== undefined) { out.value = out.value !== undefined ? out.value : out.vl; delete out.vl; }
+  if (out.ea !== undefined) { out.easing = out.easing !== undefined ? out.easing : out.ea; delete out.ea; }
+  return out;
+}
+
+/**
+ * decompressOperations — expand compressed keys from Claude before reducer.
+ * @param {Array<object>} operations
+ * @returns {Array<object>}
+ */
+function decompressOperations(operations) {
+  if (!Array.isArray(operations)) return operations;
+  return operations.map(op => {
+    if (!op || typeof op !== 'object') return op;
+    const out = { ...op };
+    switch (op.op) {
+      case 'UPDATE':
+        if (op.changes) out.changes = decompressUpdateChanges(op.changes);
+        break;
+      case 'UPDATE_KEYFRAME':
+        if (op.changes) out.changes = decompressKeyframeChangesFlat(op.changes);
+        break;
+      case 'ADD_KEYFRAME':
+        if (op.keyframe) out.keyframe = decompressKeyframePoint(op.keyframe);
+        break;
+      case 'CREATE':
+        if (op.element) out.element = decompressCreateElement(op.element);
+        break;
+      case 'BATCH_CREATE':
+        if (op.template) out.template = decompressBatchTemplate(op.template);
+        if (Array.isArray(op.elements)) {
+          out.elements = op.elements.map(decompressBatchElementPatch);
+        }
+        break;
+      case 'CREATE_SUBTITLES':
+        if (op.template) out.template = decompressBatchTemplate(op.template);
+        break;
+      default:
+        break;
+    }
+    return out;
+  });
+}
+
 /**
  * buildClipSummary
  * Numbered reference for every videoClip on the timeline (by startTime order).
@@ -63,18 +568,30 @@ function buildClipSummary(tracks) {
  * Single user turn in the format the system prompt expects (PROMPT + state blocks).
  *
  * @param {string}      userPrompt
- * @param {object}      currentTracks
+ * @param {object}      tracksForCurrentTracksJson  Serialized into CURRENT_TRACKS (may be compressed / selected).
  * @param {Array|null}  transcript
  * @param {number}      sourceDuration
  * @param {Array}       uploadedAudioFiles
+ * @param {object}      [tracksForClipSummary]       Full timeline for CLIP_SUMMARY (defaults to tracksForCurrentTracksJson).
  * @returns {string}
  */
-function buildUserTurnContent(userPrompt, currentTracks, transcript, sourceDuration, uploadedAudioFiles) {
+function buildUserTurnContent(
+  userPrompt,
+  tracksForCurrentTracksJson,
+  transcript,
+  sourceDuration,
+  uploadedAudioFiles,
+  tracksForClipSummary
+) {
+  const clipSrc =
+    tracksForClipSummary != null && typeof tracksForClipSummary === 'object'
+      ? tracksForClipSummary
+      : tracksForCurrentTracksJson;
   return (
     'PROMPT: ' + userPrompt + '\n\n' +
-    'CURRENT_TRACKS: ' + JSON.stringify(currentTracks) + '\n\n' +
+    'CURRENT_TRACKS: ' + JSON.stringify(tracksForCurrentTracksJson) + '\n\n' +
     'TRANSCRIPT: ' + (transcript ? JSON.stringify(transcript) : 'null') + '\n\n' +
-    buildClipSummary(currentTracks) + '\n\n' +
+    buildClipSummary(clipSrc) + '\n\n' +
     'SOURCE_DURATION: ' + (sourceDuration || 0) + '\n\n' +
     'CURRENT_UPLOADS: ' + JSON.stringify(uploadedAudioFiles || [])
   );
@@ -92,23 +609,24 @@ function isSummaryExchangeRow(ex) {
 }
 
 /**
- * buildLightUserMessageFromExchange
- * Older turns: PROMPT + CLIP_SUMMARY only (no CURRENT_TRACKS) to bound token usage.
+ * buildStrippedUserMessageFromExchange
+ * Older turns: PROMPT + CLIP_SUMMARY only (no CURRENT_TRACKS / TRANSCRIPT / uploads).
+ * Uses persisted clipSummary only — no full tracks JSON (token savings).
  *
  * @param {object} ex
  * @returns {string}
  */
-function buildLightUserMessageFromExchange(ex) {
+function buildStrippedUserMessageFromExchange(ex) {
   const prompt = ex && ex.promptText != null ? String(ex.promptText) : '';
-  let clipBlock = '';
-  if (ex && ex.clipSummary && String(ex.clipSummary).trim()) {
-    clipBlock = String(ex.clipSummary).trim();
-  } else if (ex && ex.tracksSnapshot && typeof ex.tracksSnapshot === 'object') {
-    clipBlock = buildClipSummary(ex.tracksSnapshot);
-  } else {
-    clipBlock = 'CLIP_SUMMARY: (not available for this turn; use PROMPT and prior assistant JSON only.)';
+  const raw = ex && ex.clipSummary != null ? String(ex.clipSummary).trim() : '';
+  if (raw) {
+    // Client stores clipSummary already prefixed with "CLIP_SUMMARY:\n…"
+    if (/^CLIP_SUMMARY:/i.test(raw)) {
+      return 'PROMPT: ' + prompt + '\n\n' + raw;
+    }
+    return 'PROMPT: ' + prompt + '\n\n' + 'CLIP_SUMMARY:\n' + raw;
   }
-  return 'PROMPT: ' + prompt + '\n\n' + clipBlock;
+  return 'PROMPT: ' + prompt + '\n\n' + 'CLIP_SUMMARY:\n' + 'N/A';
 }
 
 /**
@@ -119,23 +637,55 @@ function buildLightUserMessageFromExchange(ex) {
  * @returns {string}
  */
 function buildFullUserMessageFromExchange(ex) {
-  const tracks = ex && ex.tracksSnapshot && typeof ex.tracksSnapshot === 'object' ? ex.tracksSnapshot : {};
+  const rawTracks = ex && ex.tracksSnapshot && typeof ex.tracksSnapshot === 'object' ? ex.tracksSnapshot : {};
   const transcript = ex && ex.transcriptSnapshot !== undefined ? ex.transcriptSnapshot : null;
   const dur = ex && Number(ex.sourceDuration) ? Number(ex.sourceDuration) : 0;
   const prompt = ex && ex.promptText != null ? String(ex.promptText) : '';
-  return buildUserTurnContent(prompt, tracks, transcript, dur, []);
+  const tracksPayload = prepareTracksForClaude(rawTracks, prompt, {});
+  return buildUserTurnContent(prompt, tracksPayload, transcript, dur, [], rawTracks);
+}
+
+const FULL_SNAPSHOT_DEFAULT = 3;
+const MAX_HISTORY_EXCHANGES   = 10;
+
+/**
+ * Rough token estimate for rate-limit / payload guarding (chars ÷ 4).
+ *
+ * @param {Array<{role:string,content?:unknown}>} messages
+ * @returns {number}
+ */
+function estimateTokens(messages) {
+  if (!Array.isArray(messages)) return 0;
+  return messages.reduce((total, msg) => {
+    const c = msg && msg.content;
+    const s =
+      typeof c === 'string'
+        ? c
+        : c === undefined || c === null
+          ? ''
+          : JSON.stringify(c);
+    return total + Math.ceil(String(s).length / 4);
+  }, 0);
 }
 
 /**
  * buildHistoryMessagesFromConversationExchanges
- * Builds Anthropic messages[] from structured exchanges; only the last 3 turns include full tracks.
+ * Builds Anthropic messages[] from structured exchanges.
+ * Only the last `fullSnapshotCount` exchanges in the retained tail include full CURRENT_TRACKS;
+ * older retained exchanges use stripped PROMPT + CLIP_SUMMARY only.
  *
  * @param {Array<object>} exchanges
+ * @param {number}        [fullSnapshotCount=3]
  * @returns {Array<{role:string,content:string}>}
  */
-function buildHistoryMessagesFromConversationExchanges(exchanges) {
+function buildHistoryMessagesFromConversationExchanges(exchanges, fullSnapshotCount) {
   const messages = [];
   if (!Array.isArray(exchanges) || exchanges.length === 0) return messages;
+
+  const nFull =
+    typeof fullSnapshotCount === 'number' && fullSnapshotCount >= 0
+      ? Math.floor(fullSnapshotCount)
+      : FULL_SNAPSHOT_DEFAULT;
 
   let body = exchanges;
   if (isSummaryExchangeRow(exchanges[0])) {
@@ -150,17 +700,20 @@ function buildHistoryMessagesFromConversationExchanges(exchanges) {
     body = exchanges.slice(1);
   }
 
-  const maxExchanges = 10;
-  const tail = body.length > maxExchanges ? body.slice(-maxExchanges) : body.slice();
-  const recentCount = 3;
+  const nonSummary = (body || []).filter(ex => !isSummaryExchangeRow(ex));
+  const tail =
+    nonSummary.length > MAX_HISTORY_EXCHANGES
+      ? nonSummary.slice(-MAX_HISTORY_EXCHANGES)
+      : nonSummary.slice();
+
+  const startFullSnapshotIndex = Math.max(0, tail.length - nFull);
 
   for (let index = 0; index < tail.length; index++) {
     const ex = tail[index];
-    if (isSummaryExchangeRow(ex)) continue;
-    const isRecent = index >= tail.length - recentCount;
-    const userContent = isRecent
+    const includeFullSnapshot = index >= startFullSnapshotIndex;
+    const userContent = includeFullSnapshot
       ? buildFullUserMessageFromExchange(ex)
-      : buildLightUserMessageFromExchange(ex);
+      : buildStrippedUserMessageFromExchange(ex);
     messages.push({ role: 'user', content: userContent });
     messages.push({
       role:      'assistant',
@@ -168,6 +721,24 @@ function buildHistoryMessagesFromConversationExchanges(exchanges) {
     });
   }
   return messages;
+}
+
+/**
+ * Full messages array for generateOperations: prior turns + current user turn.
+ *
+ * @param {Array<object>} conversationExchanges
+ * @param {string}        currentUserMessageContent
+ * @param {number}        fullSnapshotCount
+ * @returns {Array<{role:string,content:string}>}
+ */
+function buildMessagesForGenerate(conversationExchanges, currentUserMessageContent, fullSnapshotCount) {
+  const prior = buildHistoryMessagesFromConversationExchanges(
+    Array.isArray(conversationExchanges) ? conversationExchanges : [],
+    fullSnapshotCount
+  );
+  return prior.length > 0
+    ? [...prior, { role: 'user', content: currentUserMessageContent }]
+    : [{ role: 'user', content: currentUserMessageContent }];
 }
 
 const SUMMARY_SYSTEM =
@@ -405,9 +976,9 @@ function expandSubtitleOps(operations, transcript) {
  * @param {object}      currentTracks  The tracks object from the current timeline state.
  * @param {Array|null}  transcript     Whisper transcript array, or null if not yet transcribed.
  * @param {number}      sourceDuration Total source video duration in seconds.
- * @param {Array<object>} conversationExchanges Optional prior structured exchanges (max 10 used); recent 3 include full tracks in user content.
+ * @param {Array<object>} conversationExchanges Optional prior structured exchanges (max 10 used); only the last few include full tracks in user content (see buildHistoryMessagesFromConversationExchanges).
  *
- * @returns {Promise<{operations:Array,warnings?:Array,isExplanation?:boolean}>}
+ * @returns {Promise<{operations:Array,warnings?:Array,isExplanation?:boolean,claudeUsage?:{inputTokens:number,outputTokens:number,totalTokens:number}|null}>}
  * @throws  {Error}           Descriptive error if API call fails or response is not valid JSON array.
  */
 async function generateOperations(
@@ -428,17 +999,42 @@ async function generateOperations(
     throw new Error('generateOperations: ANTHROPIC_API_KEY is not set in environment');
   }
 
-  const prior = buildHistoryMessagesFromConversationExchanges(
-    Array.isArray(conversationExchanges) ? conversationExchanges : []
-  );
+  const tracksPayload = prepareTracksForClaude(currentTracks, userPrompt, {});
   const userMessage = buildUserTurnContent(
     userPrompt,
-    currentTracks,
+    tracksPayload,
     transcript,
     sourceDuration,
-    uploadedAudioFiles
+    uploadedAudioFiles,
+    currentTracks
   );
-  const messages = prior.length > 0 ? [...prior, { role: 'user', content: userMessage }] : [{ role: 'user', content: userMessage }];
+
+  let messages = buildMessagesForGenerate(
+    Array.isArray(conversationExchanges) ? conversationExchanges : [],
+    userMessage,
+    FULL_SNAPSHOT_DEFAULT
+  );
+
+  if (estimateTokens(messages) > 20000) {
+    messages = buildMessagesForGenerate(
+      Array.isArray(conversationExchanges) ? conversationExchanges : [],
+      userMessage,
+      1
+    );
+  }
+
+  if (estimateTokens(messages) > 25000) {
+    messages = [{ role: 'user', content: userMessage }];
+    console.warn(
+      '[generateOperations] Warning: conversation history dropped due to token limit (messages-only estimate > 25000)'
+    );
+  }
+
+  const estSys = Math.ceil(String(SYSTEM_PROMPT).length / 4);
+  const estimatedTokens = estimateTokens(messages);
+  log(
+    `Token estimate — system: ~${estSys} | messages: ~${estimatedTokens} | total: ~${estSys + estimatedTokens}`
+  );
 
   let response;
   try {
@@ -451,6 +1047,24 @@ async function generateOperations(
   } catch (err) {
     throw new Error('generateOperations: Claude API call failed — ' + err.message);
   }
+
+  log(
+    'REAL token usage — ' +
+    'input: ' + response.usage.input_tokens + ' | ' +
+    'output: ' + response.usage.output_tokens + ' | ' +
+    'total: ' + (response.usage.input_tokens + response.usage.output_tokens) + ' | ' +
+    'estimated was: ' + estimatedTokens
+  );
+
+  const claudeUsage = (function usageFromAnthropicMessage(resp) {
+    const u = resp && resp.usage;
+    if (!u || typeof u !== 'object') return null;
+    const input = Number(u.input_tokens != null ? u.input_tokens : u.inputTokens);
+    const output = Number(u.output_tokens != null ? u.output_tokens : u.outputTokens);
+    const inTok = Number.isFinite(input) ? input : 0;
+    const outTok = Number.isFinite(output) ? output : 0;
+    return { inputTokens: inTok, outputTokens: outTok, totalTokens: inTok + outTok };
+  })(response);
 
   // Extract text content from the response.
   const content = response.content;
@@ -472,6 +1086,7 @@ async function generateOperations(
       operations:    [],
       warnings:      explanation ? [explanation] : ['No explanation text after [].'],
       isExplanation: true,
+      claudeUsage,
     };
   }
 
@@ -494,12 +1109,14 @@ async function generateOperations(
     );
   }
 
+  operations = decompressOperations(operations);
+
   // Expand any CREATE_SUBTITLES operations into BATCH_CREATE server-side.
   operations = expandSubtitleOps(operations, transcript);
 
   const refInvalid = validateOperationElementRefs(operations, currentTracks);
   if (refInvalid) {
-    return refInvalid;
+    return { ...refInvalid, claudeUsage };
   }
 
   // Validate BATCH_CREATE operations before dispatching to reducer.
@@ -662,8 +1279,50 @@ async function generateOperations(
     }
   }
 
-  return { operations, warnings, isExplanation: false };
+  return { operations, warnings, isExplanation: false, claudeUsage };
 }
+
+(function logCompressionRatioOnce() {
+  try {
+    const sampleSubtitle = {
+      id: 'elem_s_test',
+      type: 'subtitle',
+      startTime: 0,
+      endTime: 1,
+      text: 'test',
+      style: {
+        color: '#fff',
+        fontSize: 52,
+        fontFamily: 'Arial',
+        fontWeight: 'bold',
+        fontStyle: 'normal',
+        textTransform: 'none',
+        textShadow: null,
+        letterSpacing: 'normal',
+        textAlign: 'center',
+        backgroundColor: 'transparent',
+        padding: 0,
+        borderRadius: 0,
+        effect: { type: 'none', color: null },
+      },
+      position: { x: 0, y: 0, xOffset: 0, yOffset: 0 },
+      animation: {
+        in:  { type: 'none', duration: 8 },
+        out: { type: 'none', duration: 8 },
+      },
+    };
+    const sampleTrack = { id: 'track_sub_0', index: 0, elements: [sampleSubtitle] };
+    const sampleTracks = { subtitle: [sampleTrack], video: [], audio: [] };
+    const compressed = compressTracks(sampleTracks);
+    const before = JSON.stringify(sampleTracks).length;
+    const after = JSON.stringify(compressed).length;
+    log(
+      `Track compression ratio: ${before} chars → ${after} chars (${Math.round((1 - after / before) * 100)}% reduction per element)`
+    );
+  } catch (e) {
+    console.warn('[generate] compression verification log failed —', e.message);
+  }
+})();
 
 module.exports = {
   generateOperations,
@@ -671,4 +1330,9 @@ module.exports = {
   buildClipSummary,
   buildUserTurnContent,
   buildHistoryMessagesFromConversationExchanges,
+  estimateTokens,
+  buildMessagesForGenerate,
+  compressTracks,
+  selectRelevantTracks,
+  decompressOperations,
 };

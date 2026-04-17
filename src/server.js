@@ -160,6 +160,69 @@ app.get('/status', (req, res) => {
   res.json({ status: 'ok', version: '0.2.0' });
 });
 
+/** Google Fonts catalogue — used when GOOGLE_FONTS_API_KEY is missing or API fails */
+const FONTS_FALLBACK = [
+  { family: 'Inter', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Roboto', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Open Sans', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Lato', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Montserrat', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Oswald', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Raleway', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Poppins', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Nunito', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Playfair Display', category: 'serif', variants: ['400', '700'] },
+  { family: 'Merriweather', category: 'serif', variants: ['400', '700'] },
+  { family: 'Anton', category: 'sans-serif', variants: ['400'] },
+  { family: 'Bebas Neue', category: 'display', variants: ['400'] },
+  { family: 'Impact', category: 'sans-serif', variants: ['400'] },
+  { family: 'PT Sans', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Source Sans Pro', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Ubuntu', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Noto Sans', category: 'sans-serif', variants: ['400', '700'] },
+  { family: 'Crimson Text', category: 'serif', variants: ['400', '700'] },
+  { family: 'Dancing Script', category: 'handwriting', variants: ['400', '700'] },
+];
+
+const FONTS_CACHE_MS = 24 * 60 * 60 * 1000;
+let fontsApiCache = { expiresAt: 0, list: null };
+
+/**
+ * GET /api/fonts — simplified Google Web Fonts list (public, no auth).
+ * Cached 24h in memory. Falls back to FONTS_FALLBACK if no API key or request fails.
+ */
+app.get('/api/fonts', async (req, res) => {
+  try {
+    if (fontsApiCache.list && Date.now() < fontsApiCache.expiresAt) {
+      return res.json(fontsApiCache.list);
+    }
+    const key = process.env.GOOGLE_FONTS_API_KEY;
+    if (!key || !String(key).trim()) {
+      fontsApiCache = { expiresAt: Date.now() + FONTS_CACHE_MS, list: FONTS_FALLBACK };
+      return res.json(FONTS_FALLBACK);
+    }
+    const url =
+      'https://www.googleapis.com/webfonts/v1/webfonts?key=' +
+      encodeURIComponent(String(key).trim()) +
+      '&sort=popularity';
+    const r = await axios.get(url, { timeout: 20000 });
+    const items = r.data && r.data.items;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.json(FONTS_FALLBACK);
+    }
+    const list = items.map(it => ({
+      family:   it.family,
+      category: it.category || 'sans-serif',
+      variants: Array.isArray(it.variants) ? it.variants : ['400', '700'],
+    }));
+    fontsApiCache = { expiresAt: Date.now() + FONTS_CACHE_MS, list };
+    res.json(list);
+  } catch (err) {
+    log('GET /api/fonts failed: ' + (err.message || err));
+    res.json(FONTS_FALLBACK);
+  }
+});
+
 app.get('/', (req, res) => {
   res.redirect(302, '/landing.html');
 });
@@ -647,7 +710,7 @@ app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
  *   presetName    {string|null}   Optional preset (Stage 3)
  *   conversationExchanges {Array<object>} Optional structured prior exchanges (see generate.js)
  *
- * Response: { operations: Array, transcript: Array, warnings?: Array, isExplanation?: boolean }
+ * Response: { operations: Array, transcript: Array, warnings?: Array, isExplanation?: boolean, claudeUsage?: { inputTokens, outputTokens, totalTokens } }
  */
 app.post('/generate', requireAuth, async (req, res) => {
   const {
@@ -716,8 +779,11 @@ app.post('/generate', requireAuth, async (req, res) => {
       uploadedAudioFiles,
       priorEx
     );
-    const { operations, warnings, isExplanation } = result;
+    const { operations, warnings, isExplanation, claudeUsage } = result;
     log(`Operations generated — ${operations.length} operation(s)`);
+    if (claudeUsage && typeof claudeUsage.totalTokens === 'number') {
+      log(`Claude tokens — in: ${claudeUsage.inputTokens} · out: ${claudeUsage.outputTokens} · total: ${claudeUsage.totalTokens}`);
+    }
     if (warnings && warnings.length > 0) {
       log(`Warnings: ${warnings.join('; ')}`);
     }
@@ -730,6 +796,7 @@ app.post('/generate', requireAuth, async (req, res) => {
       transcript,
       warnings:       warnings != null && Array.isArray(warnings) ? warnings : [],
       isExplanation:  !!isExplanation,
+      claudeUsage:    claudeUsage && typeof claudeUsage === 'object' ? claudeUsage : null,
     });
 
   } catch (err) {

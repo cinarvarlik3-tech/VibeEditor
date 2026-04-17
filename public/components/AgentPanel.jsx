@@ -234,9 +234,16 @@
     lineHeight:    1.3,
   };
 
+  function fmtTok(n) {
+    if (n == null || !Number.isFinite(Number(n))) return '—';
+    return Number(n).toLocaleString();
+  }
+
   function AgentPanel({
     messages            = [],
     isProcessing        = false,
+    claudeUsageLast     = null,
+    claudeUsageSessionTotal = 0,
     currentFile         = null,
     hasPromptCheckpoint = false,
     hasConversationHistory = false,
@@ -306,15 +313,18 @@
 
         {/* ── Top bar ────────────────────────────────────────────────── */}
         <div style={{
-          height:         48,
           flexShrink:     0,
           background:     '#111111',
           borderBottom:   '1px solid rgba(255,255,255,0.08)',
-          display:        'flex',
-          alignItems:     'center',
-          justifyContent: 'space-between',
-          padding:        '0 16px',
+          padding:        '6px 16px 8px',
         }}>
+          <div style={{
+            display:        'flex',
+            alignItems:     'center',
+            justifyContent: 'space-between',
+            gap:            8,
+            marginBottom:   4,
+          }}>
           <span style={{ color: '#ffffff', fontSize: 14, fontWeight: 600 }}>
             Vibe Editor
           </span>
@@ -356,6 +366,23 @@
               }}
               title="Ready"
             />
+          </div>
+          </div>
+          <div
+            title="Billable tokens from the Claude API (Messages). Session Σ sums totals across this browser session until you clear agent history."
+            style={{
+              fontSize:     10,
+              lineHeight:   1.35,
+              color:        'rgba(0,188,212,0.75)',
+              fontFamily:   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+              whiteSpace:   'nowrap',
+              overflow:     'hidden',
+              textOverflow: 'ellipsis',
+            }}
+          >
+            {claudeUsageLast
+              ? `Claude tokens (last): in ${fmtTok(claudeUsageLast.inputTokens)} + out ${fmtTok(claudeUsageLast.outputTokens)} = ${fmtTok(claudeUsageLast.totalTokens)} · session Σ ${fmtTok(claudeUsageSessionTotal)}`
+              : 'Claude tokens: — (send a prompt after /generate returns usage)'}
           </div>
         </div>
 

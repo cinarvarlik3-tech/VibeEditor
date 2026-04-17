@@ -392,6 +392,36 @@
     return msgs;
   }
 
+  function collectSubtitleFontFamiliesFromTracks(tracks) {
+    const families = new Set();
+    if (!tracks || !tracks.subtitle) return families;
+    for (const track of tracks.subtitle) {
+      for (const el of track.elements || []) {
+        if (el && el.style && el.style.fontFamily) families.add(el.style.fontFamily);
+      }
+    }
+    return families;
+  }
+
+  function loadFontsFromAIOperations(ops) {
+    if (!window.FontLoader || !ops || !ops.length) return;
+    try {
+      for (const op of ops) {
+        if (!op || typeof op !== 'object') continue;
+        const fam =
+          (op.element && op.element.style && op.element.style.fontFamily) ||
+          (op.changes && op.changes['style.fontFamily']) ||
+          (op.template && op.template.style && op.template.style.fontFamily);
+        if (fam) window.FontLoader.load(String(fam));
+        if (Array.isArray(op.elements)) {
+          for (const el of op.elements) {
+            if (el && el.style && el.style.fontFamily) window.FontLoader.load(String(el.style.fontFamily));
+          }
+        }
+      }
+    } catch (_) { /* best-effort */ }
+  }
+
   // ── Root App component ───────────────────────────────────────────────────
   function App() {
 
@@ -413,6 +443,9 @@
 
     const [isProcessing,      setIsProcessing]       = useState(false);
     const [cachedTranscript,  setCachedTranscript]   = useState(null);
+    /** Dev / tuning: last Claude Messages API usage from POST /generate (Anthropic billing tokens). */
+    const [claudeUsageLast,   setClaudeUsageLast]    = useState(null);
+    const [claudeUsageSession, setClaudeUsageSession] = useState(0);
 
     // Uploaded file tracking (File object + path/URL for /generate — prefer Supabase signed URL)
     const [uploadedFile,      setUploadedFile]       = useState(null);
@@ -435,6 +468,16 @@
 
     // Media items shown in LeftPanel Media tab (without _file after refresh — re-import to edit raw file)
     const [mediaItems, setMediaItems] = useState([]);
+    const [googleFonts, setGoogleFonts] = useState([]);
+
+    useEffect(() => {
+      fetch('/api/fonts')
+        .then(r => r.json())
+        .then(data => {
+          setGoogleFonts(Array.isArray(data) ? data : []);
+        })
+        .catch(() => {});
+    }, []);
 
     // ── Load project from Supabase (once) ───────────────────────────────────
     useEffect(() => {
@@ -464,6 +507,11 @@
             merged.project = { ...merged.project, name: project.name };
           }
           dispatch({ type: 'SET_STATE', payload: merged });
+
+          if (window.FontLoader && merged.tracks && merged.tracks.subtitle) {
+            const fams = collectSubtitleFontFamiliesFromTracks(merged.tracks);
+            window.FontLoader.loadAll([...fams]);
+          }
 
           if (merged && merged.tracks && merged.tracks.video) {
             const restoredItems = [];
@@ -1053,6 +1101,11 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Generation failed');
 
+        if (data.claudeUsage && typeof data.claudeUsage.totalTokens === 'number') {
+          setClaudeUsageLast(data.claudeUsage);
+          setClaudeUsageSession(prev => prev + data.claudeUsage.totalTokens);
+        }
+
         const ops = Array.isArray(data.operations) ? data.operations : [];
         const warnList = data.warnings != null && Array.isArray(data.warnings) ? data.warnings : [];
         const isExplanation = !!data.isExplanation;
@@ -1124,6 +1177,7 @@
             type:    'APPLY_OPERATIONS',
             payload: { operations: ops, promptText: prompt },
           });
+          loadFontsFromAIOperations(ops);
 
           let summary = summarizeOperationsForChat(ops);
           if (warnList.length > 0) {
@@ -1173,6 +1227,8 @@
       setConversationHistory([]);
       setAgentMessages([]);
       conversationHistoryRef.current = [];
+      setClaudeUsageLast(null);
+      setClaudeUsageSession(0);
       if (!projectId) return;
       try {
         await fetch('/api/projects/' + encodeURIComponent(projectId), {
@@ -1441,6 +1497,7 @@
             selectedElementId={selectedElementId}
             selectedKeyframe={selectedKeyframe}
             audioFiles={audioFiles}
+            googleFonts={googleFonts}
             onMediaImport={handleMediaImport}
             onMediaRemove={handleMediaRemove}
             onSetCurrentFile={handleSetCurrentFile}
@@ -1518,6 +1575,8 @@
           <AgentPanel
             messages={agentMessages}
             isProcessing={isProcessing}
+            claudeUsageLast={claudeUsageLast}
+            claudeUsageSessionTotal={claudeUsageSession}
             currentFile={
               uploadedFile
                 ? { filename: uploadedFile.name }

@@ -13,7 +13,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 (function () {
-  const { useState, useEffect, useRef, useCallback } = React;
+  const { useState, useEffect, useRef, useCallback, useMemo } = React;
   const {
     FolderOpen, Plus, Trash2, Film, Music, Image,
     AlignLeft, Info, Sliders, Upload, Play, Pause,
@@ -619,8 +619,209 @@
     );
   }
 
+  const FONT_PICKER_CATEGORIES = ['All', 'Serif', 'Sans-serif', 'Display', 'Handwriting', 'Monospace'];
+
+  function fontPickerCategoryToApi(label) {
+    const m = {
+      Serif: 'serif', 'Sans-serif': 'sans-serif', Display: 'display',
+      Handwriting: 'handwriting', Monospace: 'monospace',
+    };
+    return m[label] || '';
+  }
+
+  function FontPicker({ value, onChange, fonts }) {
+    const [open, setOpen] = useState(false);
+    const [search, setSearch] = useState('');
+    const [category, setCategory] = useState('All');
+    const wrapRef = useRef(null);
+    const scrollRef = useRef(null);
+    const searchRef = useRef(null);
+    const hoverTimerRef = useRef(null);
+
+    const filtered = useMemo(() => {
+      const list = fonts || [];
+      const apiCat = fontPickerCategoryToApi(category);
+      const q = (search || '').trim().toLowerCase();
+      return list.filter(f => {
+        if (category !== 'All' && String(f.category || '').toLowerCase() !== apiCat) return false;
+        if (!q) return true;
+        return String(f.family || '').toLowerCase().includes(q);
+      });
+    }, [fonts, search, category]);
+
+    const displayList = filtered.slice(0, 50);
+
+    useEffect(() => {
+      if (value && window.FontLoader) {
+        try { window.FontLoader.load(value); } catch (_) { /* best-effort */ }
+      }
+    }, [value]);
+
+    useEffect(() => {
+      if (!open) return;
+      const id = setTimeout(() => {
+        try { searchRef.current && searchRef.current.focus(); } catch (_) { /* ignore */ }
+      }, 0);
+      return () => clearTimeout(id);
+    }, [open]);
+
+    useEffect(() => {
+      if (!open) return;
+      function onDoc(e) {
+        if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+      }
+      function onKey(e) {
+        if (e.key === 'Escape') setOpen(false);
+      }
+      document.addEventListener('mousedown', onDoc);
+      document.addEventListener('keydown', onKey);
+      return () => {
+        document.removeEventListener('mousedown', onDoc);
+        document.removeEventListener('keydown', onKey);
+      };
+    }, [open]);
+
+    useEffect(() => {
+      if (!open || !window.FontLoader) return;
+      const root = scrollRef.current;
+      if (!root) return;
+      let obs = null;
+      let cancelled = false;
+      const raf = requestAnimationFrame(() => {
+        if (cancelled || !scrollRef.current) return;
+        try {
+          obs = new IntersectionObserver(entries => {
+            entries.forEach(en => {
+              if (en.isIntersecting) {
+                const fam = en.target.getAttribute('data-family');
+                if (fam) try { window.FontLoader.load(fam); } catch (_) { /* ignore */ }
+              }
+            });
+          }, { root: scrollRef.current, rootMargin: '32px', threshold: 0.01 });
+          scrollRef.current.querySelectorAll('[data-font-row]').forEach(n => obs.observe(n));
+        } catch (_) { /* ignore */ }
+      });
+      return () => {
+        cancelled = true;
+        cancelAnimationFrame(raf);
+        if (obs) try { obs.disconnect(); } catch (_) { /* ignore */ }
+      };
+    }, [open, displayList, search, category]);
+
+    const displayName = value || 'Arial';
+
+    return (
+      <div ref={wrapRef} style={{ position: 'relative', width: '100%' }}>
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          style={{
+            ...inputStyle(),
+            cursor: 'pointer',
+            textAlign: 'left',
+            width: '100%',
+            fontFamily: '"' + String(displayName).replace(/"/g, '') + '", sans-serif',
+          }}
+        >
+          {displayName}
+        </button>
+        {open && (
+          <div
+            style={{
+              position:       'absolute',
+              left:           0,
+              right:          0,
+              top:            '100%',
+              marginTop:      4,
+              maxHeight:      280,
+              background:     '#1e1e1e',
+              border:         '1px solid #333',
+              borderRadius:   6,
+              zIndex:         50,
+              boxShadow:      '0 8px 24px rgba(0,0,0,0.5)',
+              display:        'flex',
+              flexDirection:  'column',
+              overflow:       'hidden',
+            }}
+          >
+            <input
+              ref={searchRef}
+              type="text"
+              placeholder="Search fonts…"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              style={{ ...inputStyle(), borderRadius: 0, borderWidth: '0 0 1px 0', flexShrink: 0 }}
+            />
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '6px 8px', borderBottom: '1px solid #2a2a2a', flexShrink: 0 }}>
+              {FONT_PICKER_CATEGORIES.map(c => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => setCategory(c)}
+                  style={{
+                    background:   category === c ? 'rgba(0,188,212,0.2)' : 'transparent',
+                    border:         '1px solid ' + (category === c ? '#00BCD4' : 'transparent'),
+                    color:          category === c ? '#00BCD4' : '#888',
+                    fontSize:       10,
+                    padding:        '3px 8px',
+                    borderRadius:   4,
+                    cursor:         'pointer',
+                  }}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+            <div ref={scrollRef} style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
+              {displayList.length === 0 ? (
+                <div style={{ padding: 12, color: '#666', fontSize: 12 }}>No matches</div>
+              ) : (
+                displayList.map(f => (
+                  <div
+                    key={f.family}
+                    data-font-row="1"
+                    data-family={f.family}
+                    onMouseEnter={() => {
+                      if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+                      hoverTimerRef.current = setTimeout(() => {
+                        if (window.FontLoader) try { window.FontLoader.load(f.family); } catch (_) { /* ignore */ }
+                      }, 300);
+                    }}
+                    onMouseLeave={() => {
+                      if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+                    }}
+                    onClick={() => {
+                      if (window.FontLoader) try { window.FontLoader.load(f.family); } catch (_) { /* ignore */ }
+                      onChange(f.family);
+                      setOpen(false);
+                    }}
+                    style={{
+                      padding:      '8px 10px',
+                      cursor:       'pointer',
+                      fontSize:     13,
+                      color:        '#e0e0e0',
+                      borderBottom: '1px solid rgba(255,255,255,0.04)',
+                      fontFamily:   '"' + String(f.family || '').replace(/"/g, '') + '", sans-serif',
+                    }}
+                  >
+                    {f.family}
+                  </div>
+                ))
+              )}
+              {filtered.length > 50 && (
+                <div style={{ padding: 8, color: '#666', fontSize: 10 }}>
+                  Showing 50 of {filtered.length} — refine search.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   // ── SubtitleProps (module scope) ───────────────────────────────────────────
-  function SubtitleProps({ element, elementId, update, onPreviewPosition }) {
+  function SubtitleProps({ element, elementId, update, onPreviewPosition, fonts }) {
     const [localText, setLocalText] = useState(element.text || '');
     const [localColor, setLocalColor] = useState(element.style.color || '#ffffff');
     const [localFontSize, setLocalFontSize] = useState(element.style.fontSize || 52);
@@ -696,15 +897,11 @@
           </PropRow>
         </div>
         <PropRow label="FONT FAMILY">
-          <select
+          <FontPicker
             value={element.style.fontFamily || 'Arial'}
-            onChange={e => update('style.fontFamily', e.target.value)}
-            style={{ ...inputStyle(), cursor: 'pointer' }}
-          >
-            {['Arial', 'Georgia', 'Impact', 'Courier New', 'Trebuchet MS', 'Verdana', 'Times New Roman'].map(f => (
-              <option key={f} value={f}>{f}</option>
-            ))}
-          </select>
+            onChange={fam => update('style.fontFamily', fam)}
+            fonts={fonts}
+          />
         </PropRow>
         <div style={{ display: 'flex', gap: 8 }}>
           <PropRow label="WEIGHT">
@@ -1114,7 +1311,7 @@
 
   // ── Properties tab ─────────────────────────────────────────────────────────
   function PropertiesTab({ element, elementId, onUpdateElement, onDeleteElement, onPreviewPosition,
-                           selectedKeyframe, onUpdateKeyframe, onDeleteKeyframe }) {
+                           selectedKeyframe, onUpdateKeyframe, onDeleteKeyframe, googleFonts }) {
     if (!element) {
       return (
         <div style={{ padding: 16, color: '#444', fontSize: 12, textAlign: 'center', marginTop: 20 }}>
@@ -1184,7 +1381,15 @@
         )}
 
         {/* Type-specific props — all components are module-scope, stable identity */}
-        {element.type === 'subtitle'  && <SubtitleProps  element={element} elementId={elementId} update={update} onPreviewPosition={onPreviewPosition} />}
+        {element.type === 'subtitle'  && (
+          <SubtitleProps
+            element={element}
+            elementId={elementId}
+            update={update}
+            onPreviewPosition={onPreviewPosition}
+            fonts={googleFonts}
+          />
+        )}
         {element.type === 'videoClip' && <VideoClipProps element={element} elementId={elementId} update={update} />}
         {element.type === 'audioClip' && <AudioClipProps element={element} elementId={elementId} update={update} />}
       </div>
@@ -1200,6 +1405,7 @@
     selectedElementId    = null,
     selectedKeyframe     = null,
     audioFiles           = [],
+    googleFonts          = [],
     onMediaImport,
     onMediaRemove,
     onSetCurrentFile,
@@ -1213,6 +1419,11 @@
   }) {
     // Auto-switch to Properties tab when an element is selected
     const [activeTab, setActiveTab] = useState('media');
+
+    useEffect(() => {
+      if (!selectedElement || !selectedElement.style || !selectedElement.style.fontFamily || !window.FontLoader) return;
+      try { window.FontLoader.load(selectedElement.style.fontFamily); } catch (_) { /* ignore */ }
+    }, [selectedElementId, selectedElement && selectedElement.style && selectedElement.style.fontFamily]);
 
     // When selectedElement changes to a non-null value, open Properties
     const prevElementId = useRef(null);
@@ -1278,6 +1489,7 @@
               selectedKeyframe={selectedKeyframe}
               onUpdateKeyframe={onUpdateKeyframe}
               onDeleteKeyframe={onDeleteKeyframe}
+              googleFonts={googleFonts}
             />
           )}
         </div>

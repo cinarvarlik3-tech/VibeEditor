@@ -122,6 +122,18 @@ function serializeToRemotion(timelineState) {
   const audioJson = JSON.stringify(serialAudio, null, 2);
   const subsJson = JSON.stringify(serialSubs, null, 2);
 
+  const fontFamiliesArr = [...new Set(
+    serialSubs.map(el => el.style && el.style.fontFamily).filter(Boolean)
+  )];
+  const fontImportsStr = fontFamiliesArr.length
+    ? fontFamiliesArr.map(f =>
+      '@import url(\'https://fonts.googleapis.com/css2?family=' +
+      encodeURIComponent(f).replace(/%20/g, '+') +
+      ':wght@400;700&display=swap\');'
+    ).join('\n')
+    : '';
+  const fontImportsLiteral = JSON.stringify(fontImportsStr);
+
   const jsx = `/*
  * Vibe Editor — Remotion export
  * totalFrames: ${totalFrames}  (= Math.ceil(maxEndTime * ${fps}) + 2 frame buffer)
@@ -144,6 +156,7 @@ const VIDEO_H = ${VIDEO_H};
 const SERIALIZED_VIDEO = ${videoJson};
 const SERIALIZED_SUBTITLES = ${subsJson};
 const SERIALIZED_AUDIO = ${audioJson};
+const GOOGLE_FONT_IMPORT_CSS = ${fontImportsLiteral};
 
 function interpolateKeyframes(keyframes, localTime) {
   if (!keyframes || keyframes.length === 0) return 1.0;
@@ -425,6 +438,9 @@ function AudioBlock(props) {
 export const VibeComposition = () => {
   return (
     <AbsoluteFill style={{ backgroundColor: '#000' }}>
+      {GOOGLE_FONT_IMPORT_CSS ? (
+        <style dangerouslySetInnerHTML={{ __html: GOOGLE_FONT_IMPORT_CSS }} />
+      ) : null}
       <CompositionFpsGuard />
       {SERIALIZED_VIDEO.map(function (clip) {
         var from = Math.max(0, Math.round(clip.startTime * FPS));
