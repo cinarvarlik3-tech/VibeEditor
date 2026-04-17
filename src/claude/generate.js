@@ -59,6 +59,169 @@ function buildClipSummary(tracks) {
 }
 
 /**
+ * buildUserTurnContent
+ * Single user turn in the format the system prompt expects (PROMPT + state blocks).
+ *
+ * @param {string}      userPrompt
+ * @param {object}      currentTracks
+ * @param {Array|null}  transcript
+ * @param {number}      sourceDuration
+ * @param {Array}       uploadedAudioFiles
+ * @returns {string}
+ */
+function buildUserTurnContent(userPrompt, currentTracks, transcript, sourceDuration, uploadedAudioFiles) {
+  return (
+    'PROMPT: ' + userPrompt + '\n\n' +
+    'CURRENT_TRACKS: ' + JSON.stringify(currentTracks) + '\n\n' +
+    'TRANSCRIPT: ' + (transcript ? JSON.stringify(transcript) : 'null') + '\n\n' +
+    buildClipSummary(currentTracks) + '\n\n' +
+    'SOURCE_DURATION: ' + (sourceDuration || 0) + '\n\n' +
+    'CURRENT_UPLOADS: ' + JSON.stringify(uploadedAudioFiles || [])
+  );
+}
+
+/**
+ * isSummaryExchangeRow
+ * Rolled-up summary object stored as the first history entry.
+ *
+ * @param {object} ex
+ * @returns {boolean}
+ */
+function isSummaryExchangeRow(ex) {
+  return !!(ex && String(ex.id || '').startsWith('summary-') && ex.summary);
+}
+
+/**
+ * buildLightUserMessageFromExchange
+ * Older turns: PROMPT + CLIP_SUMMARY only (no CURRENT_TRACKS) to bound token usage.
+ *
+ * @param {object} ex
+ * @returns {string}
+ */
+function buildLightUserMessageFromExchange(ex) {
+  const prompt = ex && ex.promptText != null ? String(ex.promptText) : '';
+  let clipBlock = '';
+  if (ex && ex.clipSummary && String(ex.clipSummary).trim()) {
+    clipBlock = String(ex.clipSummary).trim();
+  } else if (ex && ex.tracksSnapshot && typeof ex.tracksSnapshot === 'object') {
+    clipBlock = buildClipSummary(ex.tracksSnapshot);
+  } else {
+    clipBlock = 'CLIP_SUMMARY: (not available for this turn; use PROMPT and prior assistant JSON only.)';
+  }
+  return 'PROMPT: ' + prompt + '\n\n' + clipBlock;
+}
+
+/**
+ * buildFullUserMessageFromExchange
+ * Recent turns: full user turn including CURRENT_TRACKS (same shape as the live prompt).
+ *
+ * @param {object} ex
+ * @returns {string}
+ */
+function buildFullUserMessageFromExchange(ex) {
+  const tracks = ex && ex.tracksSnapshot && typeof ex.tracksSnapshot === 'object' ? ex.tracksSnapshot : {};
+  const transcript = ex && ex.transcriptSnapshot !== undefined ? ex.transcriptSnapshot : null;
+  const dur = ex && Number(ex.sourceDuration) ? Number(ex.sourceDuration) : 0;
+  const prompt = ex && ex.promptText != null ? String(ex.promptText) : '';
+  return buildUserTurnContent(prompt, tracks, transcript, dur, []);
+}
+
+/**
+ * buildHistoryMessagesFromConversationExchanges
+ * Builds Anthropic messages[] from structured exchanges; only the last 3 turns include full tracks.
+ *
+ * @param {Array<object>} exchanges
+ * @returns {Array<{role:string,content:string}>}
+ */
+function buildHistoryMessagesFromConversationExchanges(exchanges) {
+  const messages = [];
+  if (!Array.isArray(exchanges) || exchanges.length === 0) return messages;
+
+  let body = exchanges;
+  if (isSummaryExchangeRow(exchanges[0])) {
+    messages.push({
+      role:    'user',
+      content: 'Here is a summary of our previous editing session:\n' + String(exchanges[0].summary),
+    });
+    messages.push({
+      role:      'assistant',
+      content:   'Understood. I have context of the previous edits.',
+    });
+    body = exchanges.slice(1);
+  }
+
+  const maxExchanges = 10;
+  const tail = body.length > maxExchanges ? body.slice(-maxExchanges) : body.slice();
+  const recentCount = 3;
+
+  for (let index = 0; index < tail.length; index++) {
+    const ex = tail[index];
+    if (isSummaryExchangeRow(ex)) continue;
+    const isRecent = index >= tail.length - recentCount;
+    const userContent = isRecent
+      ? buildFullUserMessageFromExchange(ex)
+      : buildLightUserMessageFromExchange(ex);
+    messages.push({ role: 'user', content: userContent });
+    messages.push({
+      role:      'assistant',
+      content:   JSON.stringify(Array.isArray(ex.operations) ? ex.operations : []),
+    });
+  }
+  return messages;
+}
+
+const SUMMARY_SYSTEM =
+  'You are summarizing a video editing conversation. Respond with plain prose only — no JSON, no markdown code fences, no bullet list unless necessary.';
+
+/**
+ * summarizeEditingConversation
+ * Separate Claude call to compress the last N editing exchanges into a short summary.
+ *
+ * @param {Array<{ promptText: string, operations: Array }>} exchanges
+ * @returns {Promise<string>}
+ */
+async function summarizeEditingConversation(exchanges) {
+  if (!Array.isArray(exchanges) || exchanges.length === 0) {
+    throw new Error('summarizeEditingConversation: exchanges must be a non-empty array');
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error('summarizeEditingConversation: ANTHROPIC_API_KEY is not set in environment');
+  }
+  const lines = [];
+  for (let i = 0; i < exchanges.length; i++) {
+    const ex = exchanges[i];
+    lines.push('Exchange ' + (i + 1) + ':');
+    lines.push('User prompt: ' + (ex && ex.promptText != null ? String(ex.promptText) : ''));
+    lines.push('Operations: ' + JSON.stringify(ex && Array.isArray(ex.operations) ? ex.operations : []));
+    lines.push('');
+  }
+  const userMsg =
+    'Here are the last ' + exchanges.length + ' editing exchanges. Summarize what was ' +
+    'done concisely in 3-5 sentences, focusing on: what elements were created or modified, ' +
+    'what style decisions were made, and what the current state of the edit is. Be specific ' +
+    'about element types, counts, and property values.\n\n' +
+    lines.join('\n');
+
+  let response;
+  try {
+    response = await client.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system:     SUMMARY_SYSTEM,
+      messages:   [{ role: 'user', content: userMsg }],
+    });
+  } catch (err) {
+    throw new Error('summarizeEditingConversation: Claude API call failed — ' + err.message);
+  }
+  const content = response.content;
+  const textBlock = content && content.find(block => block.type === 'text');
+  if (!textBlock || !textBlock.text) {
+    throw new Error('summarizeEditingConversation: Claude returned no text');
+  }
+  return textBlock.text.trim();
+}
+
+/**
  * collectAllElementIds — every element id on the timeline (all track types).
  *
  * @param {object} tracks
@@ -106,10 +269,11 @@ function validateOperationElementRefs(operations, currentTracks) {
       .map(r => `${r.op} on "${r.elementId}"`)
       .join(', ');
     return {
-      operations: [],
-      warnings: [
+      operations:     [],
+      warnings:       [
         `Claude referenced clip IDs that don't exist on the timeline: ${details}. This can happen if you described a clip by number or name and Claude misidentified it. Try rephrasing with the exact filename or clip number from the timeline.`,
       ],
+      isExplanation:  false,
     };
   }
   return null;
@@ -241,11 +405,19 @@ function expandSubtitleOps(operations, transcript) {
  * @param {object}      currentTracks  The tracks object from the current timeline state.
  * @param {Array|null}  transcript     Whisper transcript array, or null if not yet transcribed.
  * @param {number}      sourceDuration Total source video duration in seconds.
+ * @param {Array<object>} conversationExchanges Optional prior structured exchanges (max 10 used); recent 3 include full tracks in user content.
  *
- * @returns {Promise<Array>}  Parsed operations array, e.g. [{ op: "CREATE", ... }]
+ * @returns {Promise<{operations:Array,warnings?:Array,isExplanation?:boolean}>}
  * @throws  {Error}           Descriptive error if API call fails or response is not valid JSON array.
  */
-async function generateOperations(userPrompt, currentTracks, transcript, sourceDuration, uploadedAudioFiles = []) {
+async function generateOperations(
+  userPrompt,
+  currentTracks,
+  transcript,
+  sourceDuration,
+  uploadedAudioFiles = [],
+  conversationExchanges = []
+) {
   if (!userPrompt || typeof userPrompt !== 'string') {
     throw new Error('generateOperations: userPrompt must be a non-empty string');
   }
@@ -256,14 +428,17 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
     throw new Error('generateOperations: ANTHROPIC_API_KEY is not set in environment');
   }
 
-  // Construct the user message in the exact format the system prompt expects.
-  const userMessage =
-    'PROMPT: ' + userPrompt + '\n\n' +
-    'CURRENT_TRACKS: ' + JSON.stringify(currentTracks) + '\n\n' +
-    'TRANSCRIPT: ' + (transcript ? JSON.stringify(transcript) : 'null') + '\n\n' +
-    buildClipSummary(currentTracks) + '\n\n' +
-    'SOURCE_DURATION: ' + (sourceDuration || 0) + '\n\n' +
-    'CURRENT_UPLOADS: ' + JSON.stringify(uploadedAudioFiles || []);
+  const prior = buildHistoryMessagesFromConversationExchanges(
+    Array.isArray(conversationExchanges) ? conversationExchanges : []
+  );
+  const userMessage = buildUserTurnContent(
+    userPrompt,
+    currentTracks,
+    transcript,
+    sourceDuration,
+    uploadedAudioFiles
+  );
+  const messages = prior.length > 0 ? [...prior, { role: 'user', content: userMessage }] : [{ role: 'user', content: userMessage }];
 
   let response;
   try {
@@ -271,7 +446,7 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
       model:      'claude-sonnet-4-20250514',
       max_tokens: 8000,
       system:     SYSTEM_PROMPT,
-      messages:   [{ role: 'user', content: userMessage }],
+      messages,
     });
   } catch (err) {
     throw new Error('generateOperations: Claude API call failed — ' + err.message);
@@ -289,6 +464,16 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
   }
 
   const rawText = textBlock.text.trim();
+
+  // [] followed by plain-language explanation (e.g. explain-last-change replies)
+  if (rawText.startsWith('[]') && rawText.length > 2) {
+    const explanation = rawText.slice(2).trim();
+    return {
+      operations:    [],
+      warnings:      explanation ? [explanation] : ['No explanation text after [].'],
+      isExplanation: true,
+    };
+  }
 
   // Parse as JSON — response must be a valid JSON array.
   let operations;
@@ -477,7 +662,13 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
     }
   }
 
-  return { operations, warnings };
+  return { operations, warnings, isExplanation: false };
 }
 
-module.exports = { generateOperations };
+module.exports = {
+  generateOperations,
+  summarizeEditingConversation,
+  buildClipSummary,
+  buildUserTurnContent,
+  buildHistoryMessagesFromConversationExchanges,
+};

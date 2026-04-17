@@ -244,6 +244,154 @@
     });
   }
 
+  /**
+   * summarizeOperationsForChat
+   * Human-readable summary from an operations array (agent UI + history restore).
+   */
+  function summarizeOperationsForChat(operations) {
+    let batchCount = 0;
+    const otherCounts = {};
+    for (const op of operations || []) {
+      if (op.op === 'BATCH_CREATE') {
+        batchCount += (op.elements ? op.elements.length : 0);
+      } else {
+        otherCounts[op.op] = (otherCounts[op.op] || 0) + 1;
+      }
+    }
+    const parts = [];
+    if (batchCount > 0) {
+      parts.push('Added ' + batchCount + ' subtitle' + (batchCount !== 1 ? 's' : ''));
+    }
+    for (const [opType, count] of Object.entries(otherCounts)) {
+      if (opType === 'CREATE') {
+        parts.push('created ' + count + ' element' + (count !== 1 ? 's' : ''));
+      } else if (opType === 'UPDATE') {
+        parts.push('updated ' + count + ' element' + (count !== 1 ? 's' : ''));
+      } else if (opType === 'DELETE') {
+        parts.push('deleted ' + count + ' element' + (count !== 1 ? 's' : ''));
+      } else {
+        parts.push(count + ' ' + opType);
+      }
+    }
+    return parts.length > 0 ? parts.join(', ') : 'No changes';
+  }
+
+  function isSummaryExchange(ex) {
+    return !!(ex && String(ex.id || '').startsWith('summary-') && ex.summary);
+  }
+
+  function buildClipSummaryForAgent(tracks) {
+    if (!tracks || typeof tracks !== 'object') return 'CLIP_SUMMARY: No video clips on timeline.';
+    const allClips = [];
+    for (const track of tracks.video || []) {
+      for (const el of track.elements || []) {
+        if (el.type === 'videoClip') {
+          allClips.push({ ...el, trackId: track.id, trackIndex: track.index });
+        }
+      }
+    }
+    allClips.sort((a, b) => a.startTime - b.startTime);
+    if (allClips.length === 0) return 'CLIP_SUMMARY: No video clips on timeline.';
+    const lines = allClips.map((clip, i) => {
+      const num = i + 1;
+      const filename = clip.originalFilename || (clip.src && clip.src.split('/').pop()) || 'unknown';
+      const startSec = Number(clip.startTime).toFixed(2);
+      const endSec = Number(clip.endTime).toFixed(2);
+      const duration = (Number(clip.endTime) - Number(clip.startTime)).toFixed(2);
+      const sourceIn = clip.sourceStart != null ? Number(clip.sourceStart).toFixed(2) : '0.00';
+      const sourceOut = clip.sourceEnd != null ? Number(clip.sourceEnd).toFixed(2) : duration;
+      const speed = clip.playbackRate != null && Number(clip.playbackRate) !== 1.0
+        ? ' | speed ' + clip.playbackRate + 'x'
+        : '';
+      const isImg = clip.isImage ? ' | IMAGE' : '';
+      return 'Clip ' + num + ': ' + filename + ' | timeline ' + startSec + 's–' + endSec + 's | duration ' + duration + 's | source ' + sourceIn + 's–' + sourceOut + 's | id:' + clip.id + ' | track:' + clip.trackId + speed + isImg;
+    });
+    return 'CLIP_SUMMARY:\n' + lines.join('\n');
+  }
+
+  function stripConversationForSave(history) {
+    return (Array.isArray(history) ? history : []).map(ex => {
+      const o = { ...ex };
+      delete o.tracksSnapshot;
+      return o;
+    });
+  }
+
+  function normalizeConversationExchange(raw, projectIdFallback) {
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+      id:                 raw.id || ('ex-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)),
+      projectId:          raw.projectId != null ? String(raw.projectId) : (projectIdFallback != null ? String(projectIdFallback) : ''),
+      promptText:         raw.promptText != null ? String(raw.promptText) : '',
+      operations:         Array.isArray(raw.operations) ? raw.operations : [],
+      tracksSnapshot:     raw.tracksSnapshot && typeof raw.tracksSnapshot === 'object' ? raw.tracksSnapshot : null,
+      transcriptSnapshot: raw.transcriptSnapshot !== undefined ? raw.transcriptSnapshot : null,
+      sourceDuration:     Number(raw.sourceDuration) || 0,
+      clipSummary:        raw.clipSummary != null ? String(raw.clipSummary) : '',
+      summary:            raw.summary != null ? String(raw.summary) : null,
+      createdAt:          raw.createdAt || new Date().toISOString(),
+    };
+  }
+
+  function parseConversationHistory(raw, projectIdFallback) {
+    if (raw == null) return [];
+    let arr = raw;
+    if (typeof arr === 'string') {
+      try { arr = JSON.parse(arr); } catch (_) { return []; }
+    }
+    if (!Array.isArray(arr)) return [];
+    return arr.map(r => normalizeConversationExchange(r, projectIdFallback)).filter(Boolean);
+  }
+
+  function rebuildAgentMessagesFromHistory(history) {
+    const hist = Array.isArray(history) ? history : [];
+    const msgs = [];
+    let n = 0;
+    for (const ex of hist) {
+      if (isSummaryExchange(ex)) {
+        msgs.push({
+          id:         'h-u-' + ex.id,
+          role:       'user',
+          type:       'user',
+          content:    ex.promptText || '[Summary of previous 10 exchanges]',
+          timestamp:  new Date(ex.createdAt || Date.now()),
+          editLabel:  'Summary',
+        });
+        msgs.push({
+          id:         'h-r-' + ex.id,
+          role:       'system',
+          type:       'result',
+          content:    { summary: ex.summary, prompt: '', editLabel: 'Summary', isWarning: false },
+          timestamp:  new Date(ex.createdAt || Date.now()),
+        });
+        continue;
+      }
+      n += 1;
+      const label = 'Edit ' + n;
+      msgs.push({
+        id:         'h-u-' + ex.id,
+        role:       'user',
+        type:       'user',
+        content:    ex.promptText,
+        timestamp:  new Date(ex.createdAt || Date.now()),
+        editLabel:  label,
+      });
+      msgs.push({
+        id:         'h-r-' + ex.id,
+        role:       'system',
+        type:       'result',
+        content:    {
+          summary:   summarizeOperationsForChat(ex.operations),
+          prompt:    ex.promptText,
+          editLabel: label,
+          isWarning: false,
+        },
+        timestamp: new Date(ex.createdAt || Date.now()),
+      });
+    }
+    return msgs;
+  }
+
   // ── Root App component ───────────────────────────────────────────────────
   function App() {
 
@@ -257,6 +405,12 @@
     const [selectedElementId, setSelectedElementId] = useState(null);
     const [timelineZoom,      setTimelineZoom]       = useState(80);
     const [agentMessages,     setAgentMessages]      = useState([]);
+    const [conversationHistory, setConversationHistory] = useState([]);
+    const conversationHistoryRef = useRef([]);
+    useEffect(() => {
+      conversationHistoryRef.current = conversationHistory;
+    }, [conversationHistory]);
+
     const [isProcessing,      setIsProcessing]       = useState(false);
     const [cachedTranscript,  setCachedTranscript]   = useState(null);
 
@@ -340,6 +494,10 @@
 
           setCachedTranscript(project.transcript != null ? project.transcript : null);
 
+          const conv = parseConversationHistory(project.conversation_history, pid);
+          setConversationHistory(conv);
+          setAgentMessages(rebuildAgentMessagesFromHistory(conv));
+
           const vp = project.video_path;
           if (vp) {
             setUploadedVideoPath(vp);
@@ -379,6 +537,7 @@
               transcript: cachedTranscript,
               name: state.project && state.project.name,
               duration: state.source && state.source.duration,
+              conversation_history: stripConversationForSave(conversationHistory),
             }),
           });
           const data = await res.json().catch(() => ({}));
@@ -391,7 +550,7 @@
       return () => {
         if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
       };
-    }, [state, cachedTranscript, projectLoaded, projectId]);
+    }, [state, cachedTranscript, conversationHistory, projectLoaded, projectId]);
 
     const handleRetrySave = useCallback(async () => {
       if (!projectId) return;
@@ -409,6 +568,7 @@
             transcript: cachedTranscript,
             name: state.project && state.project.name,
             duration: state.source && state.source.duration,
+            conversation_history: stripConversationForSave(conversationHistory),
           }),
         });
         const data = await res.json().catch(() => ({}));
@@ -417,7 +577,7 @@
       } catch (err) {
         setSaveStatus('error');
       }
-    }, [projectId, state, cachedTranscript]);
+    }, [projectId, state, cachedTranscript, conversationHistory]);
 
     // ── Clear preview position and selected keyframe when element changes ─
     useEffect(() => {
@@ -805,46 +965,6 @@
       dispatch({ type: 'SET_PLAYBACK_TIME', payload: { currentTime: t } });
     }, []);
 
-    // ── Operation summary builder ────────────────────────────────────────
-    /**
-     * summarizeOperations
-     * Builds a human-readable summary from an operations array.
-     * Counts BATCH_CREATE element totals separately from other operations.
-     *
-     * @param {Array} operations  The operations array from the server response.
-     * @returns {string}          e.g. "Added 47 subtitles" or "Added 30 subtitles, updated 2 elements"
-     */
-    function summarizeOperations(operations) {
-      let batchCount = 0;
-      const otherCounts = {};
-
-      for (const op of operations) {
-        if (op.op === 'BATCH_CREATE') {
-          batchCount += (op.elements ? op.elements.length : 0);
-        } else {
-          otherCounts[op.op] = (otherCounts[op.op] || 0) + 1;
-        }
-      }
-
-      const parts = [];
-      if (batchCount > 0) {
-        parts.push('Added ' + batchCount + ' subtitle' + (batchCount !== 1 ? 's' : ''));
-      }
-      for (const [opType, count] of Object.entries(otherCounts)) {
-        if (opType === 'CREATE') {
-          parts.push('created ' + count + ' element' + (count !== 1 ? 's' : ''));
-        } else if (opType === 'UPDATE') {
-          parts.push('updated ' + count + ' element' + (count !== 1 ? 's' : ''));
-        } else if (opType === 'DELETE') {
-          parts.push('deleted ' + count + ' element' + (count !== 1 ? 's' : ''));
-        } else {
-          parts.push(count + ' ' + opType);
-        }
-      }
-
-      return parts.length > 0 ? parts.join(', ') : 'No changes';
-    }
-
     // ── Agent prompt handler ───────────────────────────────────────────────
     const addMessage = useCallback((msg) => {
       setAgentMessages(prev => [...prev, msg]);
@@ -856,31 +976,78 @@
       );
     }, []);
 
+    const maybeRollUpConversation = useCallback(async (tenExchanges) => {
+      if (!Array.isArray(tenExchanges) || tenExchanges.length !== 10 || !projectId) return;
+      try {
+        const body = tenExchanges.map(ex => ({
+          promptText: ex.promptText,
+          operations: Array.isArray(ex.operations) ? ex.operations : [],
+        }));
+        const sr = await fetch('/api/summarize-conversation', {
+          method:  'POST',
+          headers: authHeadersJson(),
+          body:    JSON.stringify({ exchanges: body }),
+        });
+        const sd = await sr.json().catch(() => ({}));
+        if (!sr.ok || !sd.summary) return;
+        const summaryText = String(sd.summary);
+        const summaryEx = {
+          id:                 'summary-' + Date.now(),
+          projectId:          String(projectId),
+          promptText:         '[Summary of previous 10 exchanges]',
+          operations:         [],
+          tracksSnapshot:     null,
+          transcriptSnapshot: null,
+          sourceDuration:     Number(tenExchanges[9].sourceDuration) || 0,
+          clipSummary:        '',
+          summary:            summaryText,
+          createdAt:          new Date().toISOString(),
+        };
+        setConversationHistory([summaryEx]);
+        setAgentMessages(rebuildAgentMessagesFromHistory([summaryEx]));
+      } catch (_) { /* keep full history if summarization fails */ }
+    }, [projectId]);
+
     const handleSubmitPrompt = useCallback(async (prompt, language) => {
       if (!uploadedVideoPath) return;
 
-      const userId   = `u-${Date.now()}`;
+      const priorHist = conversationHistoryRef.current;
+      const nonSummaryCount = priorHist.filter(ex => !isSummaryExchange(ex)).length;
+      const editLabel = 'Edit ' + (nonSummaryCount + 1);
+
+      const userId   = 'u-' + Date.now();
       const statusId = 'status';
 
-      addMessage({ id: userId,   role: 'user',   type: 'user',   content: prompt,                    timestamp: new Date() });
-      addMessage({ id: statusId, role: 'system', type: 'status', content: 'Generating operations…',  timestamp: new Date() });
+      addMessage({
+        id:         userId,
+        role:       'user',
+        type:       'user',
+        content:    prompt,
+        timestamp:  new Date(),
+        editLabel,
+      });
+      addMessage({ id: statusId, role: 'system', type: 'status', content: 'Generating operations…', timestamp: new Date() });
       setIsProcessing(true);
 
+      const tracksSnapshot = JSON.parse(JSON.stringify(state.tracks));
+      const transcriptSnapshot = cachedTranscript != null ? JSON.parse(JSON.stringify(cachedTranscript)) : null;
+      const clipSummaryStr = buildClipSummaryForAgent(tracksSnapshot);
+
       try {
-        // If no transcript yet, server will transcribe. Pass cached transcript to skip.
         if (!cachedTranscript) {
           updateLastStatus('Extracting audio & transcribing…');
         }
 
-        const res  = await fetch('/generate', {
+        const res = await fetch('/generate', {
           method:  'POST',
           headers: authHeadersJson(),
           body:    JSON.stringify({
-            videoPath:     uploadedVideoPath,
+            videoPath:            uploadedVideoPath,
             prompt,
-            currentTracks: state.tracks,
-            transcript:    cachedTranscript || null,
-            language:      language || null,
+            currentTracks:        state.tracks,
+            transcript:           cachedTranscript || null,
+            language:               language || null,
+            conversationExchanges:  priorHist,
           }),
         });
         const data = await res.json();
@@ -888,23 +1055,66 @@
 
         const ops = Array.isArray(data.operations) ? data.operations : [];
         const warnList = data.warnings != null && Array.isArray(data.warnings) ? data.warnings : [];
+        const isExplanation = !!data.isExplanation;
 
-        // Cache the transcript for future prompts (avoid re-transcribing)
         if (data.transcript && !cachedTranscript) {
           setCachedTranscript(data.transcript);
         }
 
-        if (ops.length === 0 && warnList.length > 0) {
+        const newExchange = {
+          id:                 'ex-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+          projectId:          projectId ? String(projectId) : '',
+          promptText:         prompt,
+          operations:         ops,
+          tracksSnapshot,
+          transcriptSnapshot: transcriptSnapshot != null
+            ? transcriptSnapshot
+            : (data.transcript || null),
+          sourceDuration:     state.source && state.source.duration != null ? Number(state.source.duration) : 0,
+          clipSummary:        clipSummaryStr,
+          summary:            null,
+          createdAt:          new Date().toISOString(),
+        };
+
+        const pushExchange = () => {
+          setConversationHistory(prev => {
+            const next = prev.concat([newExchange]);
+            if (next.length === 10) {
+              const snapshot = next.slice();
+              setTimeout(() => { maybeRollUpConversation(snapshot); }, 0);
+            }
+            return next;
+          });
+        };
+
+        if (isExplanation) {
+          const explanationText = (warnList.length ? warnList.join(' ') : '').trim() || 'Assistant reply';
+          newExchange.operations = [];
+          pushExchange();
           setAgentMessages(prev => [
             ...prev.filter(m => m.type !== 'status'),
             {
-              id:        `r-${Date.now()}`,
-              role:      'system',
-              type:      'result',
-              content:   {
-                summary: warnList.join(' '),
+              id:         'i-' + Date.now(),
+              role:       'assistant',
+              type:       'info',
+              content:    explanationText,
+              editLabel,
+              timestamp:  new Date(),
+            },
+          ]);
+        } else if (ops.length === 0 && warnList.length > 0) {
+          pushExchange();
+          setAgentMessages(prev => [
+            ...prev.filter(m => m.type !== 'status'),
+            {
+              id:         'r-' + Date.now(),
+              role:       'system',
+              type:       'result',
+              content:    {
+                summary:   warnList.join(' '),
                 prompt,
                 isWarning: true,
+                editLabel,
               },
               timestamp: new Date(),
             },
@@ -915,19 +1125,20 @@
             payload: { operations: ops, promptText: prompt },
           });
 
-          let summary = summarizeOperations(ops);
+          let summary = summarizeOperationsForChat(ops);
           if (warnList.length > 0) {
             summary += ' (' + warnList.join('; ') + ')';
           }
 
+          pushExchange();
           setAgentMessages(prev => [
             ...prev.filter(m => m.type !== 'status'),
             {
-              id:        `r-${Date.now()}`,
-              role:      'system',
-              type:      'result',
-              content:   { summary, prompt },
-              timestamp: new Date(),
+              id:         'r-' + Date.now(),
+              role:       'system',
+              type:       'result',
+              content:    { summary, prompt, editLabel, isWarning: false },
+              timestamp:  new Date(),
             },
           ]);
         }
@@ -936,17 +1147,49 @@
         setAgentMessages(prev => [
           ...prev.filter(m => m.type !== 'status'),
           {
-            id:        `e-${Date.now()}`,
-            role:      'system',
-            type:      'error',
-            content:   err.message,
-            timestamp: new Date(),
+            id:         'e-' + Date.now(),
+            role:       'system',
+            type:       'error',
+            content:    err.message,
+            timestamp:  new Date(),
           },
         ]);
       } finally {
         setIsProcessing(false);
       }
-    }, [uploadedVideoPath, state.tracks, cachedTranscript, addMessage, updateLastStatus]);
+    }, [
+      uploadedVideoPath,
+      state.tracks,
+      state.source,
+      cachedTranscript,
+      projectId,
+      addMessage,
+      updateLastStatus,
+      maybeRollUpConversation,
+    ]);
+
+    const handleClearConversationHistory = useCallback(async () => {
+      if (!window.confirm('Clear all agent conversation history for this project? This cannot be undone.')) return;
+      setConversationHistory([]);
+      setAgentMessages([]);
+      conversationHistoryRef.current = [];
+      if (!projectId) return;
+      try {
+        await fetch('/api/projects/' + encodeURIComponent(projectId), {
+          method:  'PATCH',
+          headers: authHeadersJson(),
+          body:    JSON.stringify({ conversation_history: [] }),
+        });
+      } catch (_) { /* non-fatal */ }
+    }, [projectId]);
+
+    const handleQuickUndoLastEdit = useCallback(() => {
+      handleSubmitPrompt('undo that', null);
+    }, [handleSubmitPrompt]);
+
+    const handleExplainLastChange = useCallback(() => {
+      handleSubmitPrompt('what did you just do?', null);
+    }, [handleSubmitPrompt]);
 
     // ── Preview position handler (from Properties panel typing) ───────────
     const handlePreviewPosition = useCallback(({ elementId, x, y }) => {
@@ -1281,10 +1524,14 @@
                 : (state.source && state.source.filename ? { filename: state.source.filename } : null)
             }
             hasPromptCheckpoint={hasPromptCheckpoint}
+            hasConversationHistory={conversationHistory.length > 0}
             onSubmitPrompt={handleSubmitPrompt}
             onUndo={handleUndo}
             onRedo={handleRedo}
             onUndoLastPrompt={handleUndoLastPrompt}
+            onQuickUndoLastEdit={handleQuickUndoLastEdit}
+            onExplainLastChange={handleExplainLastChange}
+            onClearConversationHistory={handleClearConversationHistory}
           />
         </div>
 

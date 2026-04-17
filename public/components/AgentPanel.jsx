@@ -11,7 +11,7 @@
 (function () {
   const { useState, useEffect, useRef } = React;
   const { motion, AnimatePresence }     = Motion;
-  const { ArrowUp, Loader, AlertCircle, Undo2, Redo2, RotateCcw, Wand2, AlertTriangle } = LucideReact;
+  const { ArrowUp, Loader, AlertCircle, Undo2, Redo2, RotateCcw, Wand2, AlertTriangle, Info } = LucideReact;
 
   // ── Timestamp formatter ──────────────────────────────────────────────────
   function fmtTime(date) {
@@ -22,8 +22,20 @@
   // ── Message renderers ────────────────────────────────────────────────────
 
   function UserBubble({ msg }) {
+    const label = msg.editLabel;
     return (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginBottom: 12 }}>
+        {label ? (
+          <span style={{
+            color:        'rgba(0,188,212,0.45)',
+            fontSize:     10,
+            fontWeight:   600,
+            marginBottom: 4,
+            letterSpacing: 0.3,
+          }}>
+            {label}
+          </span>
+        ) : null}
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
@@ -72,6 +84,44 @@
     );
   }
 
+  function InfoMessage({ msg }) {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        style={{
+          background:   'rgba(96, 165, 250, 0.08)',
+          borderLeft:   '2px solid #60A5FA',
+          borderRadius: '0 6px 6px 0',
+          padding:      '10px 12px',
+          marginBottom: 12,
+          color:        '#B8D4F0',
+          fontSize:     13,
+          lineHeight:   1.55,
+          display:      'flex',
+          alignItems:   'flex-start',
+          gap:          8,
+        }}
+      >
+        <Info size={14} color="#60A5FA" style={{ flexShrink: 0, marginTop: 1 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {msg.editLabel ? (
+            <div style={{
+              fontSize:      10,
+              fontWeight:    700,
+              color:         'rgba(147, 197, 253, 0.95)',
+              marginBottom:  4,
+              letterSpacing: 0.35,
+            }}>
+              {msg.editLabel}
+            </div>
+          ) : null}
+          <span>{msg.content}</span>
+        </div>
+      </motion.div>
+    );
+  }
+
   function ErrorMessage({ msg }) {
     return (
       <motion.div
@@ -97,7 +147,7 @@
   }
 
   function ResultMessage({ msg }) {
-    const { summary, prompt, isWarning } = msg.content || {};
+    const { summary, prompt, isWarning, editLabel } = msg.content || {};
     const warn = !!isWarning;
     return (
       <motion.div
@@ -111,19 +161,32 @@
           marginBottom: 12,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
+          {editLabel ? (
+            <span style={{
+              color:        warn ? 'rgba(186,117,23,0.85)' : 'rgba(0,188,212,0.75)',
+              fontSize:     10,
+              fontWeight:   700,
+              letterSpacing: 0.4,
+              textTransform: 'uppercase',
+            }}>
+              {editLabel}
+            </span>
+          ) : null}
           {warn ? (
             <AlertTriangle size={13} color="#BA7517" style={{ flexShrink: 0 }} />
           ) : (
             <Wand2 size={13} color="#00BCD4" style={{ flexShrink: 0 }} />
           )}
-          <span style={{ color: warn ? '#BA7517' : '#00BCD4', fontSize: 12, fontWeight: 600 }}>
+          <span style={{ color: warn ? '#BA7517' : '#00BCD4', fontSize: 12, fontWeight: 600, flex: 1, minWidth: 0 }}>
             {summary}
           </span>
         </div>
-        <div style={{ color: '#555', fontSize: 11, fontStyle: 'italic' }}>
-          "{prompt}"
-        </div>
+        {prompt ? (
+          <div style={{ color: '#555', fontSize: 11, fontStyle: 'italic' }}>
+            {`"${prompt}"`}
+          </div>
+        ) : null}
       </motion.div>
     );
   }
@@ -160,15 +223,30 @@
   }
 
   // ── Main AgentPanel ──────────────────────────────────────────────────────
+  const pillBtn = {
+    fontSize:      11,
+    padding:       '4px 10px',
+    borderRadius:  999,
+    border:        '1px solid rgba(255,255,255,0.1)',
+    background:    'rgba(255,255,255,0.04)',
+    color:         '#888',
+    cursor:        'pointer',
+    lineHeight:    1.3,
+  };
+
   function AgentPanel({
     messages            = [],
     isProcessing        = false,
     currentFile         = null,
     hasPromptCheckpoint = false,
+    hasConversationHistory = false,
     onSubmitPrompt,
     onUndo,
     onRedo,
     onUndoLastPrompt,
+    onQuickUndoLastEdit,
+    onExplainLastChange,
+    onClearConversationHistory,
   }) {
     const [inputText,  setInputText]  = useState('');
     const [language,   setLanguage]   = useState('Auto');
@@ -210,6 +288,7 @@
       switch (msg.type) {
         case 'user':   return <UserBubble    key={msg.id} msg={msg} />;
         case 'status': return <StatusMessage key="status" msg={msg} />;
+        case 'info':   return <InfoMessage   key={msg.id} msg={msg} />;
         case 'error':  return <ErrorMessage  key={msg.id} msg={msg} />;
         case 'result': return <ResultMessage key={msg.id} msg={msg} />;
         default:       return null;
@@ -383,6 +462,41 @@
               display:     'block',
             }}
           />
+
+          {hasConversationHistory && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+              <button
+                type="button"
+                disabled={isProcessing}
+                onClick={() => onQuickUndoLastEdit && onQuickUndoLastEdit()}
+                style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
+                onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(0,188,212,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+              >
+                Undo last edit
+              </button>
+              <button
+                type="button"
+                disabled={isProcessing}
+                onClick={() => onExplainLastChange && onExplainLastChange()}
+                style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
+                onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(0,188,212,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+              >
+                Explain last change
+              </button>
+              <button
+                type="button"
+                disabled={isProcessing}
+                onClick={() => onClearConversationHistory && onClearConversationHistory()}
+                style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
+                onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(255,152,0,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+              >
+                Clear history
+              </button>
+            </div>
+          )}
 
           {/* Action bar */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>

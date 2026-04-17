@@ -12,7 +12,7 @@
  *   GET  /presets   → list style presets
  *   GET  /status    → health check (public)
  *   POST /api/auth/verify → validate JWT (requires Bearer token)
- *   Supabase JWT required on: /upload, /generate, /export, /download, /api/audio/*
+ *   Supabase JWT required on: /upload, /generate, /export, /download, /api/audio/*, /api/summarize-conversation
  */
 
 'use strict';
@@ -46,7 +46,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { extractAudio, convertImageToVideo, extractThumbnailAtPercent } = require('./video/extract');
 const { serializeToRemotion } = require('./video/serializeToRemotion');
 const { transcribeAudio }     = require('./transcription/transcribe');
-const { generateOperations }  = require('./claude/generate');
+const { generateOperations, summarizeEditingConversation } = require('./claude/generate');
 const { searchFreesound, searchJamendo, searchAudio } = require('./assets/audio');
 
 const supabaseAdmin =
@@ -357,6 +357,9 @@ async function deleteStorageFolder(bucket, folderPrefix) {
 }
 
 // --- Projects CRUD (requireAuth on each route) ---
+// Supabase migration (run once): store agent conversation without tracks snapshots:
+//   alter table projects
+//     add column if not exists conversation_history jsonb default '[]'::jsonb;
 
 app.post('/api/projects', requireAuth, async (req, res) => {
   try {
@@ -421,10 +424,11 @@ app.patch('/api/projects/:id', requireAuth, async (req, res) => {
     if (exErr || !existing) return res.status(404).json({ error: 'Project not found' });
     if (existing.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
-    const { timeline, transcript, name, video_path, duration, thumbnail_url } = req.body || {};
+    const { timeline, transcript, name, video_path, duration, thumbnail_url, conversation_history } = req.body || {};
     const patch = { updated_at: new Date().toISOString() };
     if (timeline !== undefined) patch.timeline = timeline;
     if (transcript !== undefined) patch.transcript = transcript;
+    if (conversation_history !== undefined) patch.conversation_history = conversation_history;
     if (name !== undefined) patch.name = String(name).trim() || 'Untitled Project';
     if (video_path !== undefined) patch.video_path = video_path;
     if (duration !== undefined) patch.duration = Number(duration) || 0;
@@ -641,11 +645,20 @@ app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
  *   transcript    {Array|null}    Cached transcript (skip transcription if provided)
  *   language      {string|null}   Optional Whisper language hint (e.g. "turkish")
  *   presetName    {string|null}   Optional preset (Stage 3)
+ *   conversationExchanges {Array<object>} Optional structured prior exchanges (see generate.js)
  *
- * Response: { operations: Array, transcript: Array }
+ * Response: { operations: Array, transcript: Array, warnings?: Array, isExplanation?: boolean }
  */
 app.post('/generate', requireAuth, async (req, res) => {
-  const { videoPath, prompt, currentTracks, transcript: providedTranscript, language, presetName } = req.body;
+  const {
+    videoPath,
+    prompt,
+    currentTracks,
+    transcript: providedTranscript,
+    language,
+    presetName,
+    conversationExchanges,
+  } = req.body;
 
   if (!videoPath)      return res.status(400).json({ error: 'videoPath is required' });
   if (!prompt)         return res.status(400).json({ error: 'prompt is required' });
@@ -694,17 +707,29 @@ app.post('/generate', requireAuth, async (req, res) => {
     // ── Step 3: Generate operations via Claude ───────────────────────────────
     log('Generating operations with Claude...');
     const uploadedAudioFiles = scanUploadedAudio();
-    const result = await generateOperations(prompt, currentTracks, transcript, sourceDuration, uploadedAudioFiles);
-    const { operations, warnings } = result;
+    const priorEx = Array.isArray(conversationExchanges) ? conversationExchanges : [];
+    const result = await generateOperations(
+      prompt,
+      currentTracks,
+      transcript,
+      sourceDuration,
+      uploadedAudioFiles,
+      priorEx
+    );
+    const { operations, warnings, isExplanation } = result;
     log(`Operations generated — ${operations.length} operation(s)`);
     if (warnings && warnings.length > 0) {
       log(`Warnings: ${warnings.join('; ')}`);
     }
+    if (isExplanation) {
+      log('Response classified as explanation (no operations)');
+    }
 
     res.json({
-      operations: operations || [],
+      operations:     operations || [],
       transcript,
-      warnings: warnings != null && Array.isArray(warnings) ? warnings : [],
+      warnings:       warnings != null && Array.isArray(warnings) ? warnings : [],
+      isExplanation:  !!isExplanation,
     });
 
   } catch (err) {
@@ -714,6 +739,27 @@ app.post('/generate', requireAuth, async (req, res) => {
     if (tmpVideoPath) {
       try { if (fs.existsSync(tmpVideoPath)) fs.unlinkSync(tmpVideoPath); } catch (_) { /* ignore */ }
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/summarize-conversation
+// Compresses up to 10 editing exchanges via a separate Claude call (after edits complete).
+// ---------------------------------------------------------------------------
+app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
+  try {
+    const { exchanges } = req.body || {};
+    if (!Array.isArray(exchanges) || exchanges.length === 0) {
+      return res.status(400).json({ error: 'exchanges must be a non-empty array' });
+    }
+    if (exchanges.length > 10) {
+      return res.status(400).json({ error: 'exchanges must contain at most 10 items' });
+    }
+    const text = await summarizeEditingConversation(exchanges);
+    res.json({ summary: text });
+  } catch (err) {
+    log(`summarize-conversation error: ${err.message}`);
+    res.status(500).json({ error: err.message || 'Summarization failed' });
   }
 });
 
