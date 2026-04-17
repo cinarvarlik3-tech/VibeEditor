@@ -108,6 +108,8 @@ async function extractFrames(videoPath, count = 5) {
 /**
  * convertImageToVideo
  * Converts a static image (jpg/png/gif/webp) to a looping mp4 video clip.
+ * Uses 1 fps, ultrafast preset, CRF 28, and caps fit to 1920 on the longest edge
+ * so encoding stays fast for large screenshots.
  * Output path = inputBasename + '.mp4' (multer already timestamps the filename,
  * so e.g. "1234567890-logo.png" → "1234567890-logo.mp4").
  *
@@ -131,17 +133,37 @@ async function convertImageToVideo(imagePath, duration = 10) {
       const width  = videoStream ? videoStream.width  : 0;
       const height = videoStream ? videoStream.height : 0;
 
+      // Fit inside 1920×1920 (longest edge ≤ 1920), then force even sizes for H.264.
+      const vf =
+        'scale=1920:1920:force_original_aspect_ratio=decrease,'
+        + 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+
       ffmpeg(imagePath)
         .inputOptions(['-loop 1'])
         .videoCodec('libx264')
         .outputOptions([
           `-t ${duration}`,
+          '-r 1',
           '-pix_fmt yuv420p',
-          // Ensure dimensions are divisible by 2 (H.264 requirement)
-          '-vf scale=trunc(iw/2)*2:trunc(ih/2)*2',
+          '-vf',
+          vf,
+          '-preset',
+          'ultrafast',
+          '-crf',
+          '28',
         ])
         .output(outputPath)
-        .on('end', () => resolve({ outputPath, duration, width, height }))
+        .on('end', () => {
+          ffmpeg.ffprobe(outputPath, (probeOutErr, outMeta) => {
+            if (probeOutErr) {
+              return resolve({ outputPath, duration, width, height });
+            }
+            const outVs = (outMeta.streams || []).find(s => s.codec_type === 'video');
+            const ow = outVs ? outVs.width : width;
+            const oh = outVs ? outVs.height : height;
+            resolve({ outputPath, duration, width: ow, height: oh });
+          });
+        })
         .on('error', err =>
           reject(new Error(`convertImageToVideo: ffmpeg failed — ${err.message}`))
         )

@@ -468,10 +468,9 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Accepts multipart "video" file; mirrors to local /uploads and uploads to Supabase Storage.
+ * Accepts multipart "video" file; multer saves to /uploads; response returns local URLs immediately.
+ * Supabase Storage upload and project row thumbnail/video_path run in the background (non-blocking).
  * Optional form field projectId — if omitted, creates a new project row first.
- *
- * Response adds: permanentUrl, storageRef, projectId, thumbnailUrl (when applicable)
  */
 app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
   if (!req.file) {
@@ -545,79 +544,81 @@ app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
     }
 
     const isAudio = mimetype.startsWith('audio/') && !isImageOut;
-    const bucket = isAudio ? 'audio' : 'videos';
-    const storagePath = `${userId}/${projectId}/${finalFilename}`;
-    const buf = fs.readFileSync(finalPath);
-    const contentType = isAudio ? mimetype : 'video/mp4';
+    const localUrl = '/uploads/' + finalFilename;
 
-    let permanentUrl = null;
-    let sp = storagePath;
-    let bkt = bucket;
-    let storageRef = null;
-
-    try {
-      const up = await uploadBufferToSupabase(bucket, storagePath, buf, contentType);
-      permanentUrl = up.permanentUrl;
-      sp = up.storagePath;
-      bkt = up.bucket;
-      storageRef = { bucket: bkt, path: sp };
-      log(`Uploaded to Supabase Storage: ${bkt}/${sp}`);
-    } catch (storageErr) {
-      log(`Storage upload failed (falling back to local): ${storageErr.message}`);
-      permanentUrl = '/uploads/' + finalFilename;
-      storageRef = null;
-    }
-
-    let thumbnailUrl = null;
-
-    if (!isAudio) {
-      try {
-        const thumbLocal = path.join(os.tmpdir(), `thumb-${Date.now()}.jpg`);
-        await extractThumbnailAtPercent(finalPath, 10, thumbLocal);
-        const thumbBuf = fs.readFileSync(thumbLocal);
-        const thumbPath = `${userId}/${projectId}/poster.jpg`;
-        try {
-          const upThumb = await uploadBufferToSupabase('thumbnails', thumbPath, thumbBuf, 'image/jpeg');
-          thumbnailUrl = upThumb.permanentUrl;
-        } catch (thumbStorageErr) {
-          log(`Thumbnail storage upload failed (non-fatal): ${thumbStorageErr.message}`);
-        }
-        try { fs.unlinkSync(thumbLocal); } catch (_) { /* ignore */ }
-      } catch (te) {
-        log(`Thumbnail extraction skipped: ${te.message}`);
-      }
-    }
-
-    try {
-      await supabaseAdmin
-        .from('projects')
-        .update({
-          duration: duration || 0,
-          thumbnail_url: thumbnailUrl,
-          video_path: storageRef
-            ? `storage:${bkt}:${sp}`
-            : '/uploads/' + finalFilename,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', projectId);
-    } catch (dbErr) {
-      log('Project update after upload failed (non-fatal): ' + dbErr.message);
-    }
-
-    log(`Upload complete (${duration.toFixed ? duration.toFixed(1) : duration}s) — ${storageRef ? `storage:${bkt}/${sp}` : 'local /uploads'}`);
-
+    // ── Step 1: fast local processing (multer has already saved the file) ──
     res.json({
       filename: finalFilename,
-      path: '/uploads/' + finalFilename,
-      permanentUrl,
-      storageRef,
+      path: localUrl,
+      permanentUrl: localUrl,
+      storageRef: null,
       projectId,
       duration,
       originalFilename: originalname,
       isImage: isImageOut,
       width,
       height,
-      thumbnailUrl,
+      thumbnailUrl: null,
+    });
+
+    // ── Step 2: background Supabase work (does not block response) ─────────
+    setImmediate(() => {
+      void (async () => {
+        try {
+          const bucket = isAudio ? 'audio' : 'videos';
+          const storagePath = `${userId}/${projectId}/${finalFilename}`;
+          const buf = fs.readFileSync(finalPath);
+          const contentType = isAudio ? mimetype : 'video/mp4';
+
+          await uploadBufferToSupabase(bucket, storagePath, buf, contentType);
+
+          let thumbnailUrl = null;
+          if (!isAudio) {
+            try {
+              const thumbLocal = path.join(os.tmpdir(), `thumb-${Date.now()}.jpg`);
+              await extractThumbnailAtPercent(finalPath, 10, thumbLocal);
+              const thumbBuf = fs.readFileSync(thumbLocal);
+              const thumbPath = `${userId}/${projectId}/poster.jpg`;
+              try {
+                const upThumb = await uploadBufferToSupabase(
+                  'thumbnails',
+                  thumbPath,
+                  thumbBuf,
+                  'image/jpeg',
+                );
+                thumbnailUrl = upThumb.permanentUrl;
+              } catch (thumbStorageErr) {
+                log(`Thumbnail storage upload failed (non-fatal): ${thumbStorageErr.message}`);
+              }
+              try {
+                fs.unlinkSync(thumbLocal);
+              } catch (_) {
+                /* ignore */
+              }
+            } catch (te) {
+              log(`Thumbnail extraction skipped: ${te.message}`);
+            }
+          }
+
+          try {
+            await supabaseAdmin
+              .from('projects')
+              .update({
+                duration: duration || 0,
+                thumbnail_url: thumbnailUrl,
+                video_path: `storage:${bucket}:${storagePath}`,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', projectId);
+          } catch (dbErr) {
+            log('Project update after background upload failed (non-fatal): ' + dbErr.message);
+          }
+
+          log(`Background storage upload complete: ${bucket}/${storagePath}`);
+        } catch (err) {
+          log(`Background storage upload failed (non-fatal): ${err.message}`);
+        }
+      })();
     });
   } catch (err) {
     res.status(500).json({ error: `Failed to process upload: ${err.message}` });
