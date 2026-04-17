@@ -44,6 +44,30 @@
       onSubmit && onSubmit({ format, quality, outputFilename });
     }
 
+    function handleDownloadClick(e) {
+      e.preventDefault();
+      if (!job || !job.filename) return;
+      var fn = job.filename;
+      var token = window.Auth && window.Auth.getToken && window.Auth.getToken();
+      var headers = token ? { Authorization: 'Bearer ' + token } : {};
+      fetch('/download/' + encodeURIComponent(fn), { headers: headers })
+        .then(function (r) {
+          if (!r.ok) throw new Error('Download failed');
+          return r.blob();
+        })
+        .then(function (blob) {
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = fn;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        })
+        .catch(function () { /* silent */ });
+    }
+
     return (
       <div
         style={{
@@ -185,13 +209,23 @@
                 <div style={{ color: '#00BCD4', fontSize: 11, marginTop: 6, display: 'flex', alignItems: 'center', gap: 4 }}>
                   <CheckCircle size={11} />
                   Saved as {job.filename}
-                  <a
-                    href={'/download/' + job.filename}
-                    download={job.filename}
-                    style={{ color: '#00BCD4', marginLeft: 8, textDecoration: 'underline', fontSize: 11 }}
+                  <button
+                    type="button"
+                    onClick={handleDownloadClick}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      color: '#00BCD4',
+                      marginLeft: 8,
+                      textDecoration: 'underline',
+                      fontSize: 11,
+                      cursor: 'pointer',
+                      padding: 0,
+                      fontFamily: 'inherit',
+                    }}
                   >
                     Download
-                  </a>
+                  </button>
                 </div>
               )}
             </div>

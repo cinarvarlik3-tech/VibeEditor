@@ -18,6 +18,103 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { SYSTEM_PROMPT } = require('./systemPrompt');
 const { searchAudio }   = require('../assets/audio');
 
+/**
+ * buildClipSummary
+ * Numbered reference for every videoClip on the timeline (by startTime order).
+ * Injected into the Claude user message so the model can resolve clip references.
+ *
+ * @param {object} tracks  Timeline tracks object { video, subtitle, audio }
+ * @returns {string}
+ */
+function buildClipSummary(tracks) {
+  const allClips = [];
+  for (const track of tracks.video || []) {
+    for (const el of track.elements || []) {
+      if (el.type === 'videoClip') {
+        allClips.push({ ...el, trackId: track.id, trackIndex: track.index });
+      }
+    }
+  }
+
+  allClips.sort((a, b) => a.startTime - b.startTime);
+
+  if (allClips.length === 0) return 'CLIP_SUMMARY: No video clips on timeline.';
+
+  const lines = allClips.map((clip, i) => {
+    const num = i + 1;
+    const filename = clip.originalFilename || (clip.src && clip.src.split('/').pop()) || 'unknown';
+    const startSec = Number(clip.startTime).toFixed(2);
+    const endSec = Number(clip.endTime).toFixed(2);
+    const duration = (Number(clip.endTime) - Number(clip.startTime)).toFixed(2);
+    const sourceIn = clip.sourceStart != null ? Number(clip.sourceStart).toFixed(2) : '0.00';
+    const sourceOut = clip.sourceEnd != null ? Number(clip.sourceEnd).toFixed(2) : duration;
+    const speed = clip.playbackRate != null && Number(clip.playbackRate) !== 1.0
+      ? ` | speed ${clip.playbackRate}x`
+      : '';
+    const isImg = clip.isImage ? ' | IMAGE' : '';
+    return `Clip ${num}: ${filename} | timeline ${startSec}s–${endSec}s | duration ${duration}s | source ${sourceIn}s–${sourceOut}s | id:${clip.id} | track:${clip.trackId}${speed}${isImg}`;
+  });
+
+  return 'CLIP_SUMMARY:\n' + lines.join('\n');
+}
+
+/**
+ * collectAllElementIds — every element id on the timeline (all track types).
+ *
+ * @param {object} tracks
+ * @returns {Set<string>}
+ */
+function collectAllElementIds(tracks) {
+  const ids = new Set();
+  for (const trackType of Object.keys(tracks)) {
+    for (const track of tracks[trackType] || []) {
+      for (const el of track.elements || []) {
+        if (el && el.id) ids.add(el.id);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * If any operation references a missing elementId, return a warning payload
+ * (empty operations). Otherwise null.
+ *
+ * @param {Array} operations
+ * @param {object} currentTracks
+ * @returns {{ operations: [], warnings: string[] }|null}
+ */
+function validateOperationElementRefs(operations, currentTracks) {
+  const validIds = collectAllElementIds(currentTracks);
+  const OPS_THAT_REFERENCE_ELEMENTS = [
+    'UPDATE', 'DELETE', 'ADD_KEYFRAME', 'UPDATE_KEYFRAME',
+    'DELETE_KEYFRAME', 'SPLIT_ELEMENT', 'DUPLICATE_ELEMENT',
+  ];
+
+  const invalidRefs = [];
+  for (const op of operations) {
+    if (OPS_THAT_REFERENCE_ELEMENTS.includes(op.op)) {
+      const id = op.elementId;
+      if (id && !validIds.has(id)) {
+        invalidRefs.push({ op: op.op, elementId: id });
+      }
+    }
+  }
+
+  if (invalidRefs.length > 0) {
+    const details = invalidRefs
+      .map(r => `${r.op} on "${r.elementId}"`)
+      .join(', ');
+    return {
+      operations: [],
+      warnings: [
+        `Claude referenced clip IDs that don't exist on the timeline: ${details}. This can happen if you described a clip by number or name and Claude misidentified it. Try rephrasing with the exact filename or clip number from the timeline.`,
+      ],
+    };
+  }
+  return null;
+}
+
 // Initialise Anthropic client once at module load.
 const client = new Anthropic.default({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -164,6 +261,7 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
     'PROMPT: ' + userPrompt + '\n\n' +
     'CURRENT_TRACKS: ' + JSON.stringify(currentTracks) + '\n\n' +
     'TRANSCRIPT: ' + (transcript ? JSON.stringify(transcript) : 'null') + '\n\n' +
+    buildClipSummary(currentTracks) + '\n\n' +
     'SOURCE_DURATION: ' + (sourceDuration || 0) + '\n\n' +
     'CURRENT_UPLOADS: ' + JSON.stringify(uploadedAudioFiles || []);
 
@@ -204,8 +302,20 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
     );
   }
 
+  if (!Array.isArray(operations)) {
+    throw new Error(
+      'generateOperations: Claude response parsed as JSON but is not an array. ' +
+      'Got: ' + typeof operations
+    );
+  }
+
   // Expand any CREATE_SUBTITLES operations into BATCH_CREATE server-side.
   operations = expandSubtitleOps(operations, transcript);
+
+  const refInvalid = validateOperationElementRefs(operations, currentTracks);
+  if (refInvalid) {
+    return refInvalid;
+  }
 
   // Validate BATCH_CREATE operations before dispatching to reducer.
   for (let i = 0; i < operations.length; i++) {
@@ -234,13 +344,6 @@ async function generateOperations(userPrompt, currentTracks, transcript, sourceD
       if (elem.endTime === undefined)   throw new Error('generateOperations: BATCH_CREATE[' + i + '].elements[' + j + '] missing endTime');
       if (elem.text === undefined)      throw new Error('generateOperations: BATCH_CREATE[' + i + '].elements[' + j + '] missing text');
     }
-  }
-
-  if (!Array.isArray(operations)) {
-    throw new Error(
-      'generateOperations: Claude response parsed as JSON but is not an array. ' +
-      'Got: ' + typeof operations
-    );
   }
 
   // Validate keyframe and split operations produced by Claude.

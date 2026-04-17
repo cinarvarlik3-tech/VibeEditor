@@ -150,4 +150,39 @@ async function convertImageToVideo(imagePath, duration = 10) {
   });
 }
 
-module.exports = { extractAudio, extractFrames, convertImageToVideo };
+/**
+ * Extracts a single JPEG thumbnail at a given percent of the video duration (0–100).
+ * @param {string} videoPath  Absolute path to video
+ * @param {number} percent    e.g. 10 for 10% into the file
+ * @param {string} outputPath Absolute path for output .jpg
+ * @returns {Promise<void>}
+ */
+async function extractThumbnailAtPercent(videoPath, percent, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(videoPath, (probeErr, metadata) => {
+      if (probeErr) {
+        return reject(new Error(`extractThumbnailAtPercent: ffprobe failed — ${probeErr.message}`));
+      }
+      const duration = metadata.format.duration || 0;
+      if (duration <= 0) {
+        return reject(new Error('extractThumbnailAtPercent: could not determine duration'));
+      }
+      const t = Math.max(0, Math.min((percent / 100) * duration, duration - 0.05));
+      const folder = path.dirname(outputPath);
+      const filename = path.basename(outputPath);
+      ffmpeg(videoPath)
+        .screenshots({
+          count: 1,
+          timemarks: [t],
+          folder,
+          filename,
+        })
+        .on('end', () => resolve())
+        .on('error', err =>
+          reject(new Error(`extractThumbnailAtPercent: ffmpeg failed — ${err.message}`))
+        );
+    });
+  });
+}
+
+module.exports = { extractAudio, extractFrames, convertImageToVideo, extractThumbnailAtPercent };

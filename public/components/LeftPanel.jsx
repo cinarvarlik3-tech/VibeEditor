@@ -20,6 +20,11 @@
     Search, X, ChevronRight,
   } = LucideReact;
 
+  function authFetchHeaders() {
+    const t = window.Auth && typeof window.Auth.getToken === 'function' && window.Auth.getToken();
+    return t ? { Authorization: 'Bearer ' + t } : {};
+  }
+
   // ── Tab bar ────────────────────────────────────────────────────────────────
   function TabBar({ tabs, activeTab, onTabChange }) {
     return (
@@ -125,7 +130,8 @@
               {mediaItems.map(item => (
                 <div
                   key={item.id}
-                  onClick={() => onSetCurrentFile(item)}
+                  title="Click for preview / AI source. Shift+click to add another copy to the timeline."
+                  onClick={(e) => onSetCurrentFile(item, { forceNewClip: e.shiftKey })}
                   style={{
                     display:     'flex',
                     alignItems:  'center',
@@ -196,7 +202,7 @@
 
     // ── Fetch uploaded audio on mount ──────────────────────────────────────
     useEffect(() => {
-      fetch('/api/audio/uploads')
+      fetch('/api/audio/uploads', { headers: authFetchHeaders() })
         .then(r => r.json())
         .then(data => setUploadedAudio(data.uploads || []))
         .catch(() => {});
@@ -212,7 +218,7 @@
       }
       debounceRef.current = setTimeout(() => {
         setIsSearching(true);
-        fetch('/api/audio/search?q=' + encodeURIComponent(searchQuery.trim()))
+        fetch('/api/audio/search?q=' + encodeURIComponent(searchQuery.trim()), { headers: authFetchHeaders() })
           .then(r => r.json())
           .then(data => setSearchResults(data.results || []))
           .catch(() => setSearchResults([]))
@@ -266,7 +272,7 @@
       onAudioImport && onAudioImport(file);
       // Re-fetch uploads list after a brief delay for the server to process
       setTimeout(() => {
-        fetch('/api/audio/uploads')
+        fetch('/api/audio/uploads', { headers: authFetchHeaders() })
           .then(r => r.json())
           .then(data => setUploadedAudio(data.uploads || []))
           .catch(() => {});
@@ -1068,8 +1074,9 @@
       onUpdateElement({ elementId, changes: { [dotPath]: value } });
     }
 
+    // key={elementId} remounts the form so defaultValue inputs reflect the newly selected element
     return (
-      <div style={{ padding: '12px 16px', overflowY: 'auto', height: '100%' }}>
+      <div key={elementId} style={{ padding: '12px 16px', overflowY: 'auto', height: '100%' }}>
 
         {/* Element type badge + delete button */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>

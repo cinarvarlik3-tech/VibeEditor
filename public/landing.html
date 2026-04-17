@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!--VIBE_SUPABASE_CONFIG-->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Your Projects — Vibe Editor</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #111111; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    .ve-landing { min-height: 100vh; display: flex; flex-direction: column; color: #fff; }
+    .ve-landing-header {
+      height: 40px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px; background: #0d0d0d; border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+    .ve-landing-brand { color: #00BCD4; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; }
+    .ve-landing-logout {
+      background: none; border: 1px solid rgba(255,255,255,0.12); border-radius: 5px; color: #888;
+      font-size: 11px; font-weight: 600; padding: 5px 12px; cursor: pointer;
+    }
+    .ve-landing-logout:hover { border-color: rgba(29,158,117,0.45); color: #ccc; }
+    .ve-landing-main { flex: 1; max-width: 1200px; width: 100%; margin: 0 auto; padding: 40px 24px 48px; box-sizing: border-box; }
+    .ve-landing-title-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-bottom: 28px; }
+    .ve-landing-title { font-size: 24px; font-weight: 500; color: #fff; margin: 0; }
+    .ve-landing-new {
+      background: #1D9E75; color: #fff; border: none; border-radius: 8px; height: 40px; padding: 0 20px;
+      font-size: 14px; font-weight: 500; cursor: pointer;
+    }
+    .ve-landing-new:hover { background: #0F6E56; }
+    .ve-landing-new:disabled { opacity: 0.5; cursor: default; }
+    .ve-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px;
+    }
+    .ve-card {
+      background: #1A1A1A; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; overflow: hidden;
+      position: relative; transition: border-color 0.15s, transform 0.15s;
+    }
+    .ve-card:hover { border-color: rgba(255,255,255,0.16); transform: translateY(-2px); }
+    .ve-card-menu-btn {
+      position: absolute; top: 8px; right: 8px; z-index: 2; opacity: 0; transition: opacity 0.15s;
+      background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; color: #ccc;
+      width: 28px; height: 28px; cursor: pointer; font-size: 16px; line-height: 1; padding: 0;
+    }
+    .ve-card:hover .ve-card-menu-btn { opacity: 1; }
+    .ve-card-menu {
+      position: absolute; top: 38px; right: 8px; z-index: 3; background: #222; border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px; min-width: 120px; display: none; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .ve-card-menu.open { display: block; }
+    .ve-card-menu button {
+      display: block; width: 100%; text-align: left; padding: 8px 12px; border: none; background: none;
+      color: #ddd; font-size: 13px; cursor: pointer;
+    }
+    .ve-card-menu button:hover { background: rgba(255,255,255,0.06); }
+    .ve-thumb-wrap {
+      aspect-ratio: 16 / 9; background: #222; display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+    }
+    .ve-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .ve-card-body { padding: 16px; }
+    .ve-card-name { font-size: 15px; font-weight: 500; color: #fff; margin: 0 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ve-card-name-input {
+      width: 100%; box-sizing: border-box; background: #2a2a2a; border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 4px; color: #fff; font-size: 15px; padding: 4px 8px; margin-bottom: 8px;
+    }
+    .ve-card-meta { font-size: 12px; color: #5F5E5A; }
+    .ve-empty { grid-column: 1 / -1; text-align: center; padding: 60px 20px; color: #5F5E5A; }
+    .ve-empty h2 { color: #888; font-size: 18px; font-weight: 500; margin: 16px 0 8px; }
+    .ve-empty p { margin: 0 0 24px; font-size: 14px; }
+    .ve-err { color: #E24B4A; font-size: 13px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <div class="ve-landing">
+    <header class="ve-landing-header">
+      <span class="ve-landing-brand">VIBE</span>
+      <button type="button" class="ve-landing-logout" id="ve-landing-logout">Log out</button>
+    </header>
+    <main class="ve-landing-main">
+      <div class="ve-landing-title-row">
+        <h1 class="ve-landing-title">Your Projects</h1>
+        <button type="button" class="ve-landing-new" id="ve-landing-new">New Project</button>
+      </div>
+      <div id="ve-landing-err" class="ve-err" style="display:none;"></div>
+      <div class="ve-grid" id="ve-landing-grid"></div>
+    </main>
+  </div>
+
+  <script src="/auth.js"></script>
+  <script>
+    (function () {
+      function authHeaders() {
+        var t = window.Auth && window.Auth.getToken && window.Auth.getToken();
+        return t ? { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+      }
+
+      function fmtDur(sec) {
+        if (sec == null || !isFinite(sec)) return '—';
+        var s = Math.max(0, Math.floor(Number(sec)));
+        var m = Math.floor(s / 60);
+        var r = s % 60;
+        return m + ':' + String(r).padStart(2, '0');
+      }
+
+      function relTime(iso) {
+        if (!iso) return '—';
+        var d = new Date(iso);
+        var diff = (Date.now() - d.getTime()) / 1000;
+        if (diff < 60) return 'just now';
+        if (diff < 3600) return Math.floor(diff / 60) + ' min ago';
+        if (diff < 86400) return Math.floor(diff / 3600) + ' hours ago';
+        if (diff < 86400 * 14) return Math.floor(diff / 86400) + ' days ago';
+        return d.toLocaleDateString();
+      }
+
+      function goLogin() { window.location.href = '/login.html'; }
+
+      function openEditor(id) {
+        window.location.href = '/editor?project=' + encodeURIComponent(id);
+      }
+
+      function filmSvg() {
+        return '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#444" stroke-width="1.2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M8 4v16M16 4v16M2 10h20M2 14h20"/></svg>';
+      }
+
+      function renderCard(p) {
+        var wrap = document.createElement('div');
+        wrap.className = 've-card';
+        wrap.dataset.id = p.id;
+
+        var menuBtn = document.createElement('button');
+        menuBtn.type = 'button';
+        menuBtn.className = 've-card-menu-btn';
+        menuBtn.textContent = '⋯';
+        menuBtn.setAttribute('aria-label', 'Menu');
+
+        var menu = document.createElement('div');
+        menu.className = 've-card-menu';
+        menu.innerHTML = '<button type="button" data-act="rename">Rename</button><button type="button" data-act="delete">Delete</button>';
+
+        var thumb = document.createElement('div');
+        thumb.className = 've-thumb-wrap';
+        if (p.thumbnail_url) {
+          var img = document.createElement('img');
+          img.src = p.thumbnail_url;
+          img.alt = '';
+          thumb.appendChild(img);
+        } else {
+          thumb.innerHTML = filmSvg();
+        }
+        thumb.addEventListener('click', function () { openEditor(p.id); });
+
+        var body = document.createElement('div');
+        body.className = 've-card-body';
+        var title = document.createElement('div');
+        title.className = 've-card-name';
+        title.textContent = p.name || 'Untitled Project';
+        var meta = document.createElement('div');
+        meta.className = 've-card-meta';
+        meta.textContent = fmtDur(p.duration) + ' · ' + relTime(p.updated_at);
+
+        body.appendChild(title);
+        body.appendChild(meta);
+
+        menuBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          menu.classList.toggle('open');
+        });
+        menu.addEventListener('click', function (e) {
+          var act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
+          menu.classList.remove('open');
+          if (act === 'rename') {
+            var prevName = title.textContent;
+            var inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 've-card-name-input';
+            inp.value = title.textContent;
+            title.replaceWith(inp);
+            inp.focus();
+            inp.select();
+            function patchName() {
+              var nm = inp.value.trim() || 'Untitled Project';
+              fetch('/api/projects/' + encodeURIComponent(p.id), {
+                method: 'PATCH',
+                headers: authHeaders(),
+                body: JSON.stringify({ name: nm }),
+              }).then(function (r) {
+                if (!r.ok) throw new Error();
+                var t2 = document.createElement('div');
+                t2.className = 've-card-name';
+                t2.textContent = nm;
+                inp.replaceWith(t2);
+              }).catch(function () {
+                var t2 = document.createElement('div');
+                t2.className = 've-card-name';
+                t2.textContent = prevName;
+                inp.replaceWith(t2);
+              });
+            }
+            inp.addEventListener('blur', patchName);
+            inp.addEventListener('keydown', function (ev) {
+              if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
+            });
+          }
+          if (act === 'delete') {
+            if (!confirm('Delete this project? This cannot be undone.')) return;
+            fetch('/api/projects/' + encodeURIComponent(p.id), { method: 'DELETE', headers: authHeaders() })
+              .then(function (r) {
+                if (!r.ok) throw new Error();
+                wrap.remove();
+                if (!document.querySelector('.ve-card')) renderEmpty();
+              })
+              .catch(function () { alert('Delete failed'); });
+          }
+        });
+        document.addEventListener('click', function () { menu.classList.remove('open'); });
+
+        wrap.appendChild(menuBtn);
+        wrap.appendChild(menu);
+        wrap.appendChild(thumb);
+        wrap.appendChild(body);
+        return wrap;
+      }
+
+      function renderEmpty() {
+        var grid = document.getElementById('ve-landing-grid');
+        grid.innerHTML =
+          '<div class="ve-empty">' +
+          filmSvg() +
+          '<h2>No projects yet</h2>' +
+          '<p>Upload a video to get started</p>' +
+          '<button type="button" class="ve-landing-new" id="ve-landing-new-empty">New Project</button>' +
+          '</div>';
+        document.getElementById('ve-landing-new-empty').addEventListener('click', createProject);
+      }
+
+      function loadProjects() {
+        var errEl = document.getElementById('ve-landing-err');
+        errEl.style.display = 'none';
+        fetch('/api/projects', { headers: authHeaders() })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+          .then(function (x) {
+            if (!x.ok) throw new Error(x.j.error || 'Failed to load');
+            var list = (x.j.projects || []);
+            var grid = document.getElementById('ve-landing-grid');
+            grid.innerHTML = '';
+            if (!list.length) {
+              renderEmpty();
+              return;
+            }
+            list.forEach(function (p) {
+              grid.appendChild(renderCard(p));
+            });
+          })
+          .catch(function (e) {
+            errEl.textContent = e.message || 'Failed to load projects';
+            errEl.style.display = 'block';
+          });
+      }
+
+      function createProject() {
+        var btn = document.getElementById('ve-landing-new');
+        if (btn) btn.disabled = true;
+        fetch('/api/projects', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ name: 'Untitled Project' }) })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+          .then(function (x) {
+            if (!x.ok || !x.j.id) throw new Error(x.j.error || 'Create failed');
+            openEditor(x.j.id);
+          })
+          .catch(function () {
+            if (btn) btn.disabled = false;
+            document.getElementById('ve-landing-err').textContent = 'Could not create project';
+            document.getElementById('ve-landing-err').style.display = 'block';
+          });
+      }
+
+      document.getElementById('ve-landing-logout').addEventListener('click', function () {
+        window.Auth && window.Auth.signOut && window.Auth.signOut();
+      });
+      document.getElementById('ve-landing-new').addEventListener('click', createProject);
+
+      if (!window.Auth) { goLogin(); }
+      else {
+        window.Auth.verifySession().then(function (user) {
+          if (!user) goLogin();
+          else loadProjects();
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

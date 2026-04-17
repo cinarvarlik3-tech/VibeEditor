@@ -10,26 +10,136 @@
  *   GET  /renders/*          → serve rendered output as streamable video (for VideoPreview)
  *   GET  /state/*            → serve state JS files to browser (schema, reducer)
  *   GET  /presets   → list style presets
- *   GET  /status    → health check
+ *   GET  /status    → health check (public)
+ *   POST /api/auth/verify → validate JWT (requires Bearer token)
+ *   Supabase JWT required on: /upload, /generate, /export, /download, /api/audio/*
  */
 
 'use strict';
 
 require('dotenv').config();
 
+/**
+ * Max multipart upload size (video / audio / image).
+ * Default 10240 MB (10 GiB); set MAX_UPLOAD_MB in .env to override.
+ */
+const MAX_UPLOAD_BYTES = (() => {
+  const raw = process.env.MAX_UPLOAD_MB;
+  if (raw !== undefined && raw !== '') {
+    const mb = Number(raw);
+    if (Number.isFinite(mb) && mb > 0) return Math.floor(mb * 1024 * 1024);
+  }
+  return 10240 * 1024 * 1024;
+})();
+
 const express = require('express');
 const multer  = require('multer');
 const cors    = require('cors');
 const path    = require('path');
 const fs      = require('fs');
+const os      = require('os');
+const axios   = require('axios');
 const ffmpeg  = require('fluent-ffmpeg');
 const { spawn } = require('child_process');
+const { createClient } = require('@supabase/supabase-js');
 
-const { extractAudio, convertImageToVideo } = require('./video/extract');
+const { extractAudio, convertImageToVideo, extractThumbnailAtPercent } = require('./video/extract');
 const { serializeToRemotion } = require('./video/serializeToRemotion');
 const { transcribeAudio }     = require('./transcription/transcribe');
 const { generateOperations }  = require('./claude/generate');
 const { searchFreesound, searchJamendo, searchAudio } = require('./assets/audio');
+
+const supabaseAdmin =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      })
+    : null;
+
+/*
+  Run in Supabase SQL editor (Storage + projects):
+
+  -- Storage policies
+  create policy "users manage own videos" on storage.objects
+    for all using (
+      bucket_id = 'videos' AND
+      auth.uid()::text = (storage.foldername(name))[1]
+    );
+
+  create policy "users manage own audio" on storage.objects
+    for all using (
+      bucket_id = 'audio' AND
+      auth.uid()::text = (storage.foldername(name))[1]
+    );
+
+  create policy "thumbnails are public" on storage.objects
+    for select using (bucket_id = 'thumbnails');
+
+  create policy "users manage own thumbnails" on storage.objects
+    for insert with check (
+      bucket_id = 'thumbnails' AND
+      auth.uid()::text = (storage.foldername(name))[1]
+    );
+
+  alter table projects add column if not exists thumbnail_url text;
+  alter table projects add column if not exists duration numeric default 0;
+  alter table projects add column if not exists transcript jsonb;
+  alter table projects add column if not exists timeline jsonb default '{}'::jsonb;
+  alter table projects add column if not exists video_path text;
+
+  -- If projects table does not exist yet:
+  -- create table if not exists projects (
+  --   id uuid primary key default gen_random_uuid(),
+  --   user_id uuid not null references auth.users (id) on delete cascade,
+  --   name text,
+  --   timeline jsonb default '{}'::jsonb,
+  --   transcript jsonb,
+  --   video_path text,
+  --   thumbnail_url text,
+  --   duration numeric default 0,
+  --   created_at timestamptz default now(),
+  --   updated_at timestamptz default now()
+  -- );
+*/
+
+const SIGNED_URL_TTL_SEC = 60 * 60 * 24 * 7; // 7 days (Supabase typical max)
+
+/**
+ * requireAuth — validates Supabase JWT from Authorization: Bearer <token>.
+ */
+async function requireAuth(req, res, next) {
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'Supabase auth is not configured on the server' });
+  }
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !user) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+  req.user = user;
+  next();
+}
+
+/**
+ * Injects window.SUPABASE_URL / window.SUPABASE_ANON_KEY into HTML served to the browser.
+ */
+function injectSupabaseConfig(html) {
+  const inj = `<script>window.SUPABASE_URL=${JSON.stringify(process.env.SUPABASE_URL || '')};window.SUPABASE_ANON_KEY=${JSON.stringify(process.env.SUPABASE_ANON_KEY || '')};</script>`;
+  if (html.includes('<!--VIBE_SUPABASE_CONFIG-->')) {
+    return html.replace('<!--VIBE_SUPABASE_CONFIG-->', inj);
+  }
+  return html.replace('<head>', '<head>\n' + inj + '\n');
+}
+
+function sendInjectedHtml(res, publicFilename) {
+  const abs = path.join(__dirname, '..', 'public', publicFilename);
+  const html = injectSupabaseConfig(fs.readFileSync(abs, 'utf8'));
+  res.type('html').send(html);
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -39,7 +149,48 @@ const PORT = process.env.PORT || 3000;
 // ---------------------------------------------------------------------------
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ---------------------------------------------------------------------------
+// Health + HTML entry (before static /public so / is not shadowed)
+// ---------------------------------------------------------------------------
+
+app.get('/status', (req, res) => {
+  res.json({ status: 'ok', version: '0.2.0' });
+});
+
+app.get('/', (req, res) => {
+  res.redirect(302, '/landing.html');
+});
+
+app.get('/landing', (req, res) => {
+  sendInjectedHtml(res, 'landing.html');
+});
+
+app.get('/landing.html', (req, res) => {
+  sendInjectedHtml(res, 'landing.html');
+});
+
+app.get('/editor', (req, res) => {
+  sendInjectedHtml(res, 'index.html');
+});
+
+app.get('/index.html', (req, res) => {
+  res.redirect(302, '/landing.html');
+});
+
+app.get('/login', (req, res) => {
+  sendInjectedHtml(res, 'login.html');
+});
+
+app.get('/login.html', (req, res) => {
+  sendInjectedHtml(res, 'login.html');
+});
+
+app.post('/api/auth/verify', requireAuth, (req, res) => {
+  res.json({ user: { id: req.user.id, email: req.user.email } });
+});
 
 // Serve state files (schema.js, timelineReducer.js) to the browser.
 app.use('/state', express.static(path.join(__dirname, 'state')));
@@ -52,9 +203,6 @@ app.use('/audio', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Serve all uploaded files (video, image-derived mp4) via /uploads/filename.
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
-
-// Serve the static frontend from /public.
-app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // ---------------------------------------------------------------------------
 // Multer — video upload storage
@@ -76,7 +224,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB — covers large audio files
+  limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (req, file, cb) => {
     const allowed = [
       // Video types
@@ -124,74 +272,353 @@ function getVideoDuration(filePath) {
 }
 
 // ---------------------------------------------------------------------------
+// Supabase Storage + Projects API
+// ---------------------------------------------------------------------------
+
+async function ensureStorageBuckets() {
+  if (!supabaseAdmin) return;
+  const buckets = ['videos', 'thumbnails', 'audio'];
+  for (const bucket of buckets) {
+    const { error } = await supabaseAdmin.storage.createBucket(bucket, {
+      public: bucket === 'thumbnails',
+      fileSizeLimit: 524288000,
+    });
+    if (error && !/already exists|duplicate/i.test(String(error.message || error))) {
+      console.error('Bucket creation error:', bucket, error);
+    }
+  }
+}
+
+async function signStoragePath(bucket, storagePath) {
+  if (!supabaseAdmin || !bucket || !storagePath) return null;
+  const { data, error } = await supabaseAdmin.storage
+    .from(bucket)
+    .createSignedUrl(storagePath, SIGNED_URL_TTL_SEC);
+  if (error || !data) return null;
+  return data.signedUrl;
+}
+
+/**
+ * Upload buffer to Supabase; returns signed URL (private buckets) or public URL (thumbnails).
+ */
+async function uploadBufferToSupabase(bucket, storagePath, buffer, contentType) {
+  const { error } = await supabaseAdmin.storage.from(bucket).upload(storagePath, buffer, {
+    upsert: true,
+    contentType: contentType || 'application/octet-stream',
+  });
+  if (error) throw new Error('Storage upload failed: ' + error.message);
+  if (bucket === 'thumbnails') {
+    const { data } = supabaseAdmin.storage.from(bucket).getPublicUrl(storagePath);
+    return { permanentUrl: data.publicUrl, storagePath, bucket };
+  }
+  const signed = await signStoragePath(bucket, storagePath);
+  return { permanentUrl: signed, storagePath, bucket };
+}
+
+async function hydrateTimelineMediaUrlsAsync(timeline) {
+  if (!timeline || typeof timeline !== 'object' || !timeline.tracks) return timeline;
+  const out = JSON.parse(JSON.stringify(timeline));
+  const types = ['video', 'audio'];
+  for (const tt of types) {
+    const rows = out.tracks[tt];
+    if (!Array.isArray(rows)) continue;
+    for (const track of rows) {
+      if (!track.elements) continue;
+      for (const el of track.elements) {
+        const ref = el.storageRef;
+        if (ref && ref.bucket && ref.path) {
+          const u = await signStoragePath(ref.bucket, ref.path);
+          if (u) el.src = u;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+async function signVideoPathField(videoPath) {
+  if (!videoPath || typeof videoPath !== 'string') return videoPath;
+  if (!videoPath.startsWith('storage:')) return videoPath;
+  const rest = videoPath.slice('storage:'.length);
+  const idx = rest.indexOf(':');
+  if (idx === -1) return videoPath;
+  const bucket = rest.slice(0, idx);
+  const storagePath = rest.slice(idx + 1);
+  const signed = await signStoragePath(bucket, storagePath);
+  return signed || videoPath;
+}
+
+async function deleteStorageFolder(bucket, folderPrefix) {
+  if (!supabaseAdmin) return;
+  const { data: entries, error } = await supabaseAdmin.storage.from(bucket).list(folderPrefix, { limit: 1000 });
+  if (error || !entries || !entries.length) return;
+  const paths = entries.map(e => `${folderPrefix}/${e.name}`);
+  await supabaseAdmin.storage.from(bucket).remove(paths);
+}
+
+// --- Projects CRUD (requireAuth on each route) ---
+
+app.post('/api/projects', requireAuth, async (req, res) => {
+  try {
+    const { name, videoPath, duration } = req.body || {};
+    const row = {
+      user_id: req.user.id,
+      name: name && String(name).trim() ? String(name).trim() : 'Untitled Project',
+      timeline: {},
+      duration: Number(duration) || 0,
+      video_path: videoPath || null,
+      updated_at: new Date().toISOString(),
+    };
+    const { data, error } = await supabaseAdmin.from('projects').insert(row).select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to create project' });
+  }
+});
+
+app.get('/api/projects', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('projects')
+      .select('id, name, thumbnail_url, duration, created_at, updated_at')
+      .eq('user_id', req.user.id)
+      .order('updated_at', { ascending: false });
+    if (error) throw error;
+    res.json({ projects: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to list projects' });
+  }
+});
+
+app.get('/api/projects/:id', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('projects')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (error || !data) return res.status(404).json({ error: 'Project not found' });
+    if (data.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    let timeline = data.timeline;
+    if (timeline && typeof timeline === 'object') {
+      timeline = await hydrateTimelineMediaUrlsAsync(timeline);
+    }
+    const video_path = await signVideoPathField(data.video_path);
+    res.json({ ...data, timeline, video_path });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to load project' });
+  }
+});
+
+app.patch('/api/projects/:id', requireAuth, async (req, res) => {
+  try {
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from('projects')
+      .select('user_id')
+      .eq('id', req.params.id)
+      .single();
+    if (exErr || !existing) return res.status(404).json({ error: 'Project not found' });
+    if (existing.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const { timeline, transcript, name, video_path, duration, thumbnail_url } = req.body || {};
+    const patch = { updated_at: new Date().toISOString() };
+    if (timeline !== undefined) patch.timeline = timeline;
+    if (transcript !== undefined) patch.transcript = transcript;
+    if (name !== undefined) patch.name = String(name).trim() || 'Untitled Project';
+    if (video_path !== undefined) patch.video_path = video_path;
+    if (duration !== undefined) patch.duration = Number(duration) || 0;
+    if (thumbnail_url !== undefined) patch.thumbnail_url = thumbnail_url;
+
+    const { error } = await supabaseAdmin.from('projects').update(patch).eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to save project' });
+  }
+});
+
+app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+  try {
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from('projects')
+      .select('user_id, id')
+      .eq('id', req.params.id)
+      .single();
+    if (exErr || !existing) return res.status(404).json({ error: 'Project not found' });
+    if (existing.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const uid = req.user.id;
+    const pid = req.params.id;
+    const prefix = `${uid}/${pid}`;
+    await deleteStorageFolder('videos', prefix);
+    await deleteStorageFolder('audio', prefix);
+    await deleteStorageFolder('thumbnails', prefix);
+
+    const { error } = await supabaseAdmin.from('projects').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to delete project' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /upload
 // ---------------------------------------------------------------------------
 
 /**
- * Accepts a single video, audio, or image file upload.
- * Images (jpg/png/gif/webp) are auto-converted to a 10-second mp4 via ffmpeg.
+ * Accepts multipart "video" file; mirrors to local /uploads and uploads to Supabase Storage.
+ * Optional form field projectId — if omitted, creates a new project row first.
  *
- * Request:  multipart/form-data, field name: "video"
- * Response: {
- *   filename,                  // saved filename in /uploads (may be .mp4 for images)
- *   path,                      // served URL path: '/uploads/<filename>'
- *   duration,                  // seconds
- *   originalFilename,          // user's original filename (e.g. "logo.png")
- *   isImage,                   // true if source was an image
- *   width,                     // video width in px (0 for audio)
- *   height,                    // video height in px (0 for audio)
- * }
+ * Response adds: permanentUrl, storageRef, projectId, thumbnailUrl (when applicable)
  */
-app.post('/upload', upload.single('video'), async (req, res) => {
+app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'Supabase is not configured' });
+  }
 
+  const userId = req.user.id;
+  let projectId = req.body.projectId || req.body.project_id || null;
   const { filename, path: filePath, mimetype, originalname } = req.file;
 
   try {
+    if (!projectId) {
+      const { data: proj, error: pErr } = await supabaseAdmin
+        .from('projects')
+        .insert({
+          user_id: userId,
+          name: 'Untitled Project',
+          timeline: {},
+          duration: 0,
+          updated_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+      if (pErr || !proj) throw new Error(pErr ? pErr.message : 'Could not create project');
+      projectId = proj.id;
+    } else {
+      const { data: chk, error: cErr } = await supabaseAdmin
+        .from('projects')
+        .select('user_id')
+        .eq('id', projectId)
+        .single();
+      if (cErr || !chk || chk.user_id !== userId) {
+        return res.status(403).json({ error: 'Invalid or forbidden projectId' });
+      }
+    }
+
     const isImage = mimetype.startsWith('image/');
+    let finalPath = filePath;
+    let finalFilename = filename;
+    let duration = 0;
+    let width = 0;
+    let height = 0;
+    let isImageOut = false;
 
     if (isImage) {
-      // Convert image → mp4, then return mp4 metadata
       log(`Image upload received: ${filename} — converting to mp4...`);
-      const { outputPath, duration, width, height } = await convertImageToVideo(filePath, 10);
-      const mp4Filename = path.basename(outputPath);
-      log(`Image converted → ${mp4Filename} (${width}x${height}, ${duration}s)`);
-      res.json({
-        filename:         mp4Filename,
-        path:             '/uploads/' + mp4Filename,
-        duration,
-        originalFilename: originalname,
-        isImage:          true,
-        width,
-        height,
-      });
+      const conv = await convertImageToVideo(filePath, 10);
+      finalPath = conv.outputPath;
+      finalFilename = path.basename(finalPath);
+      duration = conv.duration;
+      width = conv.width;
+      height = conv.height;
+      isImageOut = true;
     } else {
-      // Video or audio — probe metadata directly
-      const duration = await getVideoDuration(filePath);
-      let width = 0, height = 0;
-      // Probe width/height for video files
+      duration = await getVideoDuration(filePath);
       if (mimetype.startsWith('video/')) {
         try {
           const meta = await new Promise((resolve, reject) => {
-            ffmpeg.ffprobe(filePath, (err, m) => err ? reject(err) : resolve(m));
+            ffmpeg.ffprobe(filePath, (err, m) => (err ? reject(err) : resolve(m)));
           });
           const vs = (meta.streams || []).find(s => s.codec_type === 'video');
-          if (vs) { width = vs.width || 0; height = vs.height || 0; }
+          if (vs) {
+            width = vs.width || 0;
+            height = vs.height || 0;
+          }
         } catch (_) { /* non-fatal */ }
       }
-      log(`Upload received: ${filename} (${duration.toFixed(1)}s)`);
-      res.json({
-        filename,
-        path:             '/uploads/' + filename,
-        duration,
-        originalFilename: originalname,
-        isImage:          false,
-        width,
-        height,
-      });
     }
+
+    const isAudio = mimetype.startsWith('audio/') && !isImageOut;
+    const bucket = isAudio ? 'audio' : 'videos';
+    const storagePath = `${userId}/${projectId}/${finalFilename}`;
+    const buf = fs.readFileSync(finalPath);
+    const contentType = isAudio ? mimetype : 'video/mp4';
+
+    let permanentUrl = null;
+    let sp = storagePath;
+    let bkt = bucket;
+    let storageRef = null;
+
+    try {
+      const up = await uploadBufferToSupabase(bucket, storagePath, buf, contentType);
+      permanentUrl = up.permanentUrl;
+      sp = up.storagePath;
+      bkt = up.bucket;
+      storageRef = { bucket: bkt, path: sp };
+      log(`Uploaded to Supabase Storage: ${bkt}/${sp}`);
+    } catch (storageErr) {
+      log(`Storage upload failed (falling back to local): ${storageErr.message}`);
+      permanentUrl = '/uploads/' + finalFilename;
+      storageRef = null;
+    }
+
+    let thumbnailUrl = null;
+
+    if (!isAudio) {
+      try {
+        const thumbLocal = path.join(os.tmpdir(), `thumb-${Date.now()}.jpg`);
+        await extractThumbnailAtPercent(finalPath, 10, thumbLocal);
+        const thumbBuf = fs.readFileSync(thumbLocal);
+        const thumbPath = `${userId}/${projectId}/poster.jpg`;
+        try {
+          const upThumb = await uploadBufferToSupabase('thumbnails', thumbPath, thumbBuf, 'image/jpeg');
+          thumbnailUrl = upThumb.permanentUrl;
+        } catch (thumbStorageErr) {
+          log(`Thumbnail storage upload failed (non-fatal): ${thumbStorageErr.message}`);
+        }
+        try { fs.unlinkSync(thumbLocal); } catch (_) { /* ignore */ }
+      } catch (te) {
+        log(`Thumbnail extraction skipped: ${te.message}`);
+      }
+    }
+
+    try {
+      await supabaseAdmin
+        .from('projects')
+        .update({
+          duration: duration || 0,
+          thumbnail_url: thumbnailUrl,
+          video_path: storageRef
+            ? `storage:${bkt}:${sp}`
+            : '/uploads/' + finalFilename,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', projectId);
+    } catch (dbErr) {
+      log('Project update after upload failed (non-fatal): ' + dbErr.message);
+    }
+
+    log(`Upload complete (${duration.toFixed ? duration.toFixed(1) : duration}s) — ${storageRef ? `storage:${bkt}/${sp}` : 'local /uploads'}`);
+
+    res.json({
+      filename: finalFilename,
+      path: '/uploads/' + finalFilename,
+      permanentUrl,
+      storageRef,
+      projectId,
+      duration,
+      originalFilename: originalname,
+      isImage: isImageOut,
+      width,
+      height,
+      thumbnailUrl,
+    });
   } catch (err) {
     res.status(500).json({ error: `Failed to process upload: ${err.message}` });
   }
@@ -216,17 +643,30 @@ app.post('/upload', upload.single('video'), async (req, res) => {
  *
  * Response: { operations: Array, transcript: Array }
  */
-app.post('/generate', async (req, res) => {
+app.post('/generate', requireAuth, async (req, res) => {
   const { videoPath, prompt, currentTracks, transcript: providedTranscript, language, presetName } = req.body;
 
   if (!videoPath)      return res.status(400).json({ error: 'videoPath is required' });
   if (!prompt)         return res.status(400).json({ error: 'prompt is required' });
   if (!currentTracks)  return res.status(400).json({ error: 'currentTracks is required' });
 
-  // Resolve served URL paths (e.g. '/uploads/foo.mp4') to absolute filesystem paths
-  const resolvedVideoPath = videoPath.startsWith('/')
-    ? path.join(__dirname, '..', videoPath.replace(/^\//, ''))
-    : videoPath;
+  let tmpVideoPath = null;
+  let resolvedVideoPath;
+
+  if (/^https?:\/\//i.test(String(videoPath))) {
+    try {
+      tmpVideoPath = path.join(os.tmpdir(), `vibe-gen-${Date.now()}.mp4`);
+      const resp = await axios.get(videoPath, { responseType: 'arraybuffer', maxContentLength: MAX_UPLOAD_BYTES });
+      fs.writeFileSync(tmpVideoPath, Buffer.from(resp.data));
+      resolvedVideoPath = tmpVideoPath;
+    } catch (e) {
+      return res.status(400).json({ error: `Could not download video for transcription: ${e.message}` });
+    }
+  } else {
+    resolvedVideoPath = videoPath.startsWith('/')
+      ? path.join(__dirname, '..', videoPath.replace(/^\//, ''))
+      : videoPath;
+  }
 
   if (!fs.existsSync(resolvedVideoPath)) {
     return res.status(400).json({ error: `Video file not found: ${resolvedVideoPath}` });
@@ -240,7 +680,7 @@ app.post('/generate', async (req, res) => {
       const audioPath = await extractAudio(resolvedVideoPath);
       log(`Audio extracted → ${audioPath}`);
 
-      log('Step 2/2 — Transcribing with Whisper...');
+      log('Step 2/2 — Transcribing with OpenAI (whisper-1)...');
       transcript = await transcribeAudio(audioPath, language || null);
       log(`Transcription complete — ${transcript.length} segments`);
     } else {
@@ -260,11 +700,19 @@ app.post('/generate', async (req, res) => {
       log(`Warnings: ${warnings.join('; ')}`);
     }
 
-    res.json({ operations, transcript, warnings: warnings || [] });
+    res.json({
+      operations: operations || [],
+      transcript,
+      warnings: warnings != null && Array.isArray(warnings) ? warnings : [],
+    });
 
   } catch (err) {
     log(`Pipeline error: ${err.message}`);
     res.status(500).json({ error: err.message });
+  } finally {
+    if (tmpVideoPath) {
+      try { if (fs.existsSync(tmpVideoPath)) fs.unlinkSync(tmpVideoPath); } catch (_) { /* ignore */ }
+    }
   }
 });
 
@@ -436,7 +884,7 @@ async function runExportJob(jobId, timelineState, outputFilename, format, qualit
  *   format         {string}  'mp4' | 'mov'
  *   quality        {string}  '720p' | '1080p' | '4k'
  */
-app.post('/export', (req, res) => {
+app.post('/export', requireAuth, (req, res) => {
   const { timelineState, outputFilename, format, quality } = req.body;
   if (!timelineState) return res.status(400).json({ error: 'timelineState is required' });
 
@@ -466,7 +914,7 @@ app.post('/export', (req, res) => {
  * Returns the current status of a render job.
  * Response: { status, progress, filename, error? }
  */
-app.get('/export/status/:jobId', (req, res) => {
+app.get('/export/status/:jobId', requireAuth, (req, res) => {
   const job = exportJobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
@@ -480,7 +928,7 @@ app.get('/export/status/:jobId', (req, res) => {
  * Serves a rendered MP4 from the /output directory as a file download.
  * @param filename  The output filename from POST /export (when implemented)
  */
-app.get('/download/:filename', (req, res) => {
+app.get('/download/:filename', requireAuth, (req, res) => {
   const filePath = path.join(__dirname, '..', 'output', req.params.filename);
 
   if (!fs.existsSync(filePath)) {
@@ -526,7 +974,7 @@ function scanUploadedAudio() {
  * Returns metadata for every audio file in the uploads/ directory.
  * Used by the Audio tab to populate the Uploads filter on mount.
  */
-app.get('/api/audio/uploads', (req, res) => {
+app.get('/api/audio/uploads', requireAuth, (req, res) => {
   const uploadsDir = path.join(__dirname, '..', 'uploads');
   const audioExts  = new Set(['.mp3', '.wav', '.aac', '.ogg', '.m4a']);
   try {
@@ -558,7 +1006,7 @@ app.get('/api/audio/uploads', (req, res) => {
  * Searches Freesound for CC0 audio.
  * Query params: q (required), page_size (default 6)
  */
-app.get('/api/audio/search/freesound', async (req, res) => {
+app.get('/api/audio/search/freesound', requireAuth, async (req, res) => {
   const { q, page_size } = req.query;
   if (!q) return res.status(400).json({ error: 'q parameter is required' });
 
@@ -578,7 +1026,7 @@ app.get('/api/audio/search/freesound', async (req, res) => {
  * Searches Jamendo music API.
  * Query params: q (required), page_size (default 6)
  */
-app.get('/api/audio/search/jamendo', async (req, res) => {
+app.get('/api/audio/search/jamendo', requireAuth, async (req, res) => {
   const { q, page_size } = req.query;
   if (!q) return res.status(400).json({ error: 'q parameter is required' });
 
@@ -599,7 +1047,7 @@ app.get('/api/audio/search/jamendo', async (req, res) => {
  * Query params: q (required), sources (comma-separated, default "freesound,pixabay")
  * Response: { results, query, warning? }
  */
-app.get('/api/audio/search', async (req, res) => {
+app.get('/api/audio/search', requireAuth, async (req, res) => {
   const { q, sources } = req.query;
   if (!q) return res.status(400).json({ error: 'q parameter is required' });
 
@@ -627,21 +1075,23 @@ app.get('/presets', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /status
+// Static frontend (/public) — must be after API routes; does not use requireAuth
 // ---------------------------------------------------------------------------
 
-/**
- * Health check — confirms the server is running.
- */
-app.get('/status', (req, res) => {
-  res.json({ status: 'ok', version: '0.2.0' });
-});
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // ---------------------------------------------------------------------------
 // Global error handler — always returns JSON
 // ---------------------------------------------------------------------------
 
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    const maxMb = Math.round(MAX_UPLOAD_BYTES / (1024 * 1024));
+    log(`Upload rejected: file exceeds ${maxMb} MB limit`);
+    return res.status(413).json({
+      error: `File too large (max ${maxMb} MB). Increase MAX_UPLOAD_MB in .env and restart the server.`,
+    });
+  }
   log(`Unhandled error: ${err.message}`);
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
@@ -650,13 +1100,26 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
 // Start
 // ---------------------------------------------------------------------------
 
-const server = app.listen(PORT, () => {
-  log(`Vibe Editor server running at http://localhost:${PORT}`);
-});
+let httpServer;
+
+function startListening() {
+  httpServer = app.listen(PORT, () => {
+    log(`Vibe Editor server running at http://localhost:${PORT}`);
+    log(`Max upload size: ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB`);
+  });
+}
+
+ensureStorageBuckets()
+  .then(startListening)
+  .catch((e) => {
+    console.error('ensureStorageBuckets failed:', e);
+    startListening();
+  });
 
 process.on('SIGTERM', () => {
   log('[server] SIGTERM received — closing HTTP server');
-  server.close(() => {
+  if (!httpServer) return process.exit(0);
+  httpServer.close(() => {
     log('[server] HTTP server closed');
     process.exit(0);
   });
@@ -668,6 +1131,7 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   log('[server] SIGINT received — closing HTTP server');
-  server.close(() => { process.exit(0); });
+  if (!httpServer) return process.exit(0);
+  httpServer.close(() => { process.exit(0); });
   setTimeout(() => { process.exit(1); }, 5000);
 });

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!--VIBE_SUPABASE_CONFIG-->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in — Vibe Editor</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    .ve-login-wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #111111;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+    .ve-login-inner { width: 100%; max-width: 420px; padding: 24px; box-sizing: border-box; }
+    .ve-login-brand {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .ve-login-brand h1 {
+      margin: 0;
+      color: #FFFFFF;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+    }
+    .ve-login-brand p {
+      margin: 8px 0 0;
+      color: #5F5E5A;
+      font-size: 12px;
+    }
+    .ve-login-card {
+      background: #1A1A1A;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 380px;
+      margin: 0 auto;
+      box-sizing: border-box;
+    }
+    .ve-login-card label {
+      display: block;
+      color: #888;
+      font-size: 11px;
+      margin-bottom: 6px;
+      letter-spacing: 0.03em;
+    }
+    .ve-login-card input {
+      width: 100%;
+      box-sizing: border-box;
+      height: 44px;
+      padding: 0 16px;
+      margin-bottom: 16px;
+      background: #222222;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      color: #fff;
+      font-size: 14px;
+      outline: none;
+    }
+    .ve-login-card input:focus {
+      border-color: rgba(29,158,117,0.5);
+    }
+    .ve-login-card button[type="submit"] {
+      width: 100%;
+      height: 44px;
+      margin-top: 8px;
+      background: #1D9E75;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .ve-login-card button[type="submit"]:hover:not(:disabled) {
+      background: #0F6E56;
+    }
+    .ve-login-card button[type="submit"]:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+    .ve-login-error {
+      margin-top: 14px;
+      color: #E24B4A;
+      font-size: 13px;
+      min-height: 1.2em;
+    }
+  </style>
+</head>
+<body>
+  <div class="ve-login-wrap">
+    <div class="ve-login-inner">
+      <div class="ve-login-brand">
+        <h1>VIBE</h1>
+        <p>Video Editing Intelligence</p>
+      </div>
+      <form class="ve-login-card" id="ve-login-form" autocomplete="on">
+        <label for="ve-email">Email</label>
+        <input id="ve-email" name="email" type="email" required placeholder="you@company.com" />
+
+        <label for="ve-password">Password</label>
+        <input id="ve-password" name="password" type="password" required placeholder="Password" />
+
+        <button type="submit" id="ve-login-btn">Sign in</button>
+        <div class="ve-login-error" id="ve-login-error" aria-live="polite"></div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/auth.js"></script>
+  <script>
+    (function () {
+      var form = document.getElementById('ve-login-form');
+      var btn = document.getElementById('ve-login-btn');
+      var errEl = document.getElementById('ve-login-error');
+      var emailEl = document.getElementById('ve-email');
+      var passEl = document.getElementById('ve-password');
+
+      function setLoading(loading) {
+        btn.disabled = !!loading;
+        btn.textContent = loading ? 'Signing in…' : 'Sign in';
+      }
+
+      if (window.Auth && window.Auth.getToken()) {
+        window.Auth.verifySession().then(function (user) {
+          if (user) {
+            window.location.href = '/landing.html';
+          }
+        });
+      }
+
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        errEl.textContent = '';
+        setLoading(true);
+        window.Auth.signIn(emailEl.value, passEl.value)
+          .then(function (res) {
+            window.Auth.setToken(res.token);
+            window.location.href = '/landing.html';
+          })
+          .catch(function (er) {
+            errEl.textContent = er && er.message ? er.message : 'Sign in failed';
+          })
+          .finally(function () {
+            setLoading(false);
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <!--VIBE_SUPABASE_CONFIG-->
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Vibe Editor</title>
   <link rel="stylesheet" href="/styles.css" />
@@ -27,6 +28,7 @@
 </head>
 
 <body style="background:#111111; margin:0; padding:0; overflow:hidden;">
+  <script src="/auth.js"></script>
   <div id="root"></div>
 
   <!-- ── CDN Libraries (load order is critical) ──────────────── -->
@@ -82,7 +84,47 @@
   <!-- 14. ContextMenu — window.ContextMenu -->
   <script type="text/babel" src="/components/ContextMenu.jsx"></script>
 
-  <!-- 15. App — root component, mounts to #root -->
-  <script type="text/babel" src="/App.jsx"></script>
+  <!-- 15. App — loaded after session check (see bootstrap below) -->
+
+  <script>
+    (function () {
+      function goLogin() {
+        window.location.href = '/login.html';
+      }
+      if (!window.Auth) {
+        goLogin();
+        return;
+      }
+      window.Auth.verifySession()
+        .then(function (user) {
+          if (!user) {
+            goLogin();
+            return Promise.reject(new Error('Not authenticated'));
+          }
+          var params = new URLSearchParams(window.location.search);
+          var projectId = params.get('project');
+          if (!projectId) {
+            window.location.href = '/landing.html';
+            return Promise.reject(new Error('No project'));
+          }
+          window.CURRENT_PROJECT_ID = projectId;
+          return fetch('/App.jsx').then(function (r) {
+            if (!r.ok) throw new Error('Failed to load app');
+            return r.text();
+          });
+        })
+        .then(function (src) {
+          if (!src) return;
+          if (!window.Babel || typeof window.Babel.transform !== 'function') {
+            throw new Error('Babel not available');
+          }
+          var out = window.Babel.transform(src, { presets: ['react'], filename: 'App.jsx' }).code;
+          (0, eval)(out);
+        })
+        .catch(function () {
+          goLogin();
+        });
+    })();
+  </script>
 </body>
 </html>

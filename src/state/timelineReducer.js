@@ -16,7 +16,7 @@
  *
  * Operations handled inside APPLY_OPERATIONS (via applyOperation):
  *   CREATE, UPDATE, DELETE, CREATE_TRACK, DELETE_TRACK, BATCH_CREATE,
- *   ADD_KEYFRAME, UPDATE_KEYFRAME, DELETE_KEYFRAME, REORDER_TRACK
+ *   ADD_KEYFRAME, UPDATE_KEYFRAME, DELETE_KEYFRAME, REORDER_TRACK, SPLIT_ELEMENT
  *
  * Exported helpers:
  *   generateId, deepClone, applyDotNotation,
@@ -85,8 +85,8 @@
   function findElementById(tracks, elementId) {
     const trackTypes = Object.keys(tracks);
     for (const trackType of trackTypes) {
-      for (const track of tracks[trackType]) {
-        for (const element of track.elements) {
+      for (const track of tracks[trackType] || []) {
+        for (const element of track.elements || []) {
           if (element.id === elementId) {
             return { element, track, trackType };
           }
@@ -94,6 +94,17 @@
       }
     }
     return null;
+  }
+
+  /**
+   * listAllElementIdsForLog — flat list of element ids (for console diagnostics).
+   */
+  function listAllElementIdsForLog(tracks) {
+    return Object.keys(tracks).flatMap(function (k) {
+      return (tracks[k] || []).flatMap(function (t) {
+        return (t.elements || []).map(function (e) { return e.id; });
+      });
+    });
   }
 
   /**
@@ -107,7 +118,7 @@
   function findTrackById(tracks, trackId) {
     const trackTypes = Object.keys(tracks);
     for (const trackType of trackTypes) {
-      for (const track of tracks[trackType]) {
+      for (const track of tracks[trackType] || []) {
         if (track.id === trackId) {
           return { track, trackType };
         }
@@ -165,6 +176,86 @@
     };
   }
 
+  /**
+   * applySplitElementOp
+   * Mutates tracks in place — SPLIT_ELEMENT from AI operation batch.
+   * Mirrors SPLIT_ELEMENT reducer logic (same track, two elements).
+   */
+  function applySplitElementOp(tracks, operation) {
+    const elementId = operation.elementId;
+    const splitTime = operation.splitTime;
+    const result = findElementById(tracks, elementId);
+    if (!result) {
+      console.warn(
+        '[Vibe] SPLIT_ELEMENT skipped — elementId not found:', elementId,
+        '| Available IDs:', listAllElementIdsForLog(tracks)
+      );
+      return;
+    }
+    const element = result.element;
+    if (splitTime <= element.startTime || splitTime >= element.endTime) {
+      console.warn(
+        '[Vibe] SPLIT_ELEMENT skipped — splitTime outside clip bounds:',
+        splitTime, 'elementId:', elementId
+      );
+      return;
+    }
+
+    const localSplitTime = splitTime - element.startTime;
+
+    const elementA = deepClone(element);
+    elementA.id = generateId('elem_' + element.type[0]);
+    elementA.endTime = splitTime;
+
+    const elementB = deepClone(element);
+    elementB.id = generateId('elem_' + element.type[0]);
+    elementB.startTime = splitTime;
+
+    if (element.type === 'videoClip') {
+      const rate = element.playbackRate || 1;
+      const sourceSplitTime = element.sourceStart + (localSplitTime * rate);
+
+      elementA.sourceEnd = sourceSplitTime;
+      elementB.sourceStart = sourceSplitTime;
+
+      elementA.playbackRate = element.playbackRate || 1.0;
+      elementA.volume = element.volume !== undefined ? element.volume : 1.0;
+      elementB.playbackRate = element.playbackRate || 1.0;
+      elementB.volume = element.volume !== undefined ? element.volume : 1.0;
+
+      if (element.keyframes) {
+        const TRACK_DEFAULTS = { scale: 1.0, opacity: 1.0 };
+        const kfTracks = ['scale', 'opacity'];
+
+        for (let ki = 0; ki < kfTracks.length; ki++) {
+          const trackName = kfTracks[ki];
+          const kfArray = element.keyframes[trackName];
+          if (!kfArray || kfArray.length === 0) continue;
+
+          const keptA = kfArray.filter(function (kf) { return kf.time <= localSplitTime; });
+          if (keptA.length > 0 && keptA[keptA.length - 1].time < localSplitTime) {
+            const interpVal = interpolateKeyframes(kfArray, localSplitTime);
+            keptA.push({ time: localSplitTime, value: interpVal, easing: 'linear' });
+          }
+          if (keptA.length === 0) {
+            keptA = [{ time: 0, value: TRACK_DEFAULTS[trackName] || 1.0, easing: 'linear' }];
+          }
+          elementA.keyframes[trackName] = keptA;
+
+          elementB.keyframes[trackName] = [{ time: 0, value: TRACK_DEFAULTS[trackName] || 1.0, easing: 'linear' }];
+        }
+      }
+    }
+
+    if (element.type === 'audioClip') {
+      elementB.volume = 1.0;
+    }
+
+    const idx = result.track.elements.findIndex(function (e) { return e.id === elementId; });
+    if (idx < 0) return;
+    result.track.elements.splice(idx, 1, elementA, elementB);
+  }
+
   // ---------------------------------------------------------------------------
   // Operation applicator (used by APPLY_OPERATIONS)
   // ---------------------------------------------------------------------------
@@ -196,7 +287,10 @@
       case 'UPDATE': {
         const result = findElementById(tracks, operation.elementId);
         if (!result) {
-          console.warn('APPLY_OPERATIONS UPDATE: elementId not found:', operation.elementId);
+          console.warn(
+            '[Vibe] UPDATE skipped — elementId not found:', operation.elementId,
+            '| Available IDs:', listAllElementIdsForLog(tracks)
+          );
           break;
         }
         const changes = operation.changes || {};
@@ -209,7 +303,10 @@
       case 'DELETE': {
         const result = findElementById(tracks, operation.elementId);
         if (!result) {
-          console.warn('APPLY_OPERATIONS DELETE: elementId not found:', operation.elementId);
+          console.warn(
+            '[Vibe] DELETE skipped — elementId not found:', operation.elementId,
+            '| Available IDs:', listAllElementIdsForLog(tracks)
+          );
           break;
         }
         result.track.elements = result.track.elements.filter(
@@ -284,7 +381,10 @@
       case 'ADD_KEYFRAME': {
         var addResult = findElementById(tracks, operation.elementId);
         if (!addResult) {
-          console.warn('ADD_KEYFRAME: elementId not found:', operation.elementId);
+          console.warn(
+            '[Vibe] ADD_KEYFRAME skipped — elementId not found:', operation.elementId,
+            '| Available IDs:', listAllElementIdsForLog(tracks)
+          );
           break;
         }
         var addTrack = operation.trackName;
@@ -306,7 +406,10 @@
       case 'UPDATE_KEYFRAME': {
         var updResult = findElementById(tracks, operation.elementId);
         if (!updResult) {
-          console.warn('UPDATE_KEYFRAME: elementId not found:', operation.elementId);
+          console.warn(
+            '[Vibe] UPDATE_KEYFRAME skipped — elementId not found:', operation.elementId,
+            '| Available IDs:', listAllElementIdsForLog(tracks)
+          );
           break;
         }
         var updTrack = operation.trackName;
@@ -330,7 +433,10 @@
         var KFDEFAULTS = { scale: 1.0, opacity: 1.0 };
         var delResult  = findElementById(tracks, operation.elementId);
         if (!delResult) {
-          console.warn('DELETE_KEYFRAME: elementId not found:', operation.elementId);
+          console.warn(
+            '[Vibe] DELETE_KEYFRAME skipped — elementId not found:', operation.elementId,
+            '| Available IDs:', listAllElementIdsForLog(tracks)
+          );
           break;
         }
         var delTrack = operation.trackName;
@@ -346,6 +452,12 @@
         if (delArr.length === 0) {
           delArr.push({ time: 0, value: KFDEFAULTS[delTrack] !== undefined ? KFDEFAULTS[delTrack] : 1.0, easing: 'linear' });
         }
+        break;
+      }
+
+      // ── SPLIT_ELEMENT (AI batch — same logic as SPLIT_ELEMENT action) ─────
+      case 'SPLIT_ELEMENT': {
+        applySplitElementOp(tracks, operation);
         break;
       }
 
@@ -416,6 +528,16 @@
    */
   function timelineReducer(state, action) {
     switch (action.type) {
+
+      // ── SET_STATE — replace entire timeline document (project load / hydration)
+      case 'SET_STATE': {
+        if (!action.payload || typeof action.payload !== 'object') return state;
+        const p = action.payload;
+        return {
+          ...p,
+          playback: { ...(p.playback || {}), isPlaying: false },
+        };
+      }
 
       // ── LOAD_SOURCE ────────────────────────────────────────────────────────
       // Sets source metadata only. Does NOT create or modify any track elements.

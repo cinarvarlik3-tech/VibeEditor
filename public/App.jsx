@@ -13,6 +13,28 @@
 (function () {
   const { useState, useReducer, useCallback, useEffect, useRef, useMemo } = React;
 
+  /** Authorization + JSON for protected API routes */
+  function authHeadersJson() {
+    const t = window.Auth && typeof window.Auth.getToken === 'function' && window.Auth.getToken();
+    const h = { 'Content-Type': 'application/json' };
+    if (t) h.Authorization = 'Bearer ' + t;
+    return h;
+  }
+
+  /** Authorization only (e.g. multipart upload — do not set Content-Type) */
+  function authHeadersUpload() {
+    const t = window.Auth && typeof window.Auth.getToken === 'function' && window.Auth.getToken();
+    const h = {};
+    if (t) h.Authorization = 'Bearer ' + t;
+    return h;
+  }
+
+  /** Bearer only (e.g. GET requests) */
+  function authHeadersBearer() {
+    const t = window.Auth && typeof window.Auth.getToken === 'function' && window.Auth.getToken();
+    return t ? { Authorization: 'Bearer ' + t } : {};
+  }
+
   const { initialTimelineState } = window.TimelineSchema;
   const { timelineReducer }      = window.TimelineReducer;
 
@@ -23,6 +45,49 @@
   const ContextMenu  = window.ContextMenu;
   const Header       = window.Header;
   const ExportModal  = window.ExportModal;
+
+  /**
+   * Merges persisted reducer snapshot with schema defaults and migrates clips.
+   * @param {object|null} persisted
+   * @param {object} fallback  initialTimelineState
+   */
+  /** Prefer Supabase signed/public URL from POST /upload; fall back to local /uploads path. */
+  function uploadResponsePrimaryUrl(data) {
+    if (!data) return '';
+    return data.permanentUrl || data.path || '';
+  }
+
+  function mergePersistedTimelineState(persisted, fallback) {
+    if (!persisted || typeof persisted !== 'object') return fallback;
+    const tracks = migrateTracksSchema(persisted.tracks || {});
+    if (tracks.video) {
+      tracks.video = tracks.video.map(track => ({
+        ...track,
+        elements: (track.elements || []).map(el =>
+          el && el.type === 'videoClip' ? migrateVideoClipElement(el) : el
+        ),
+      }));
+    }
+    return {
+      ...fallback,
+      ...persisted,
+      project: { ...fallback.project, ...(persisted.project || {}) },
+      source: { ...fallback.source, ...(persisted.source || {}) },
+      tracks,
+      history: persisted.history && Array.isArray(persisted.history.past)
+        ? {
+            past:   persisted.history.past,
+            future: Array.isArray(persisted.history.future) ? persisted.history.future : [],
+            maxEntries: persisted.history.maxEntries || fallback.history.maxEntries,
+          }
+        : fallback.history,
+      playback: {
+        ...fallback.playback,
+        ...(persisted.playback || {}),
+        isPlaying: false,
+      },
+    };
+  }
 
   // ── Migrate tracks schema — remove invalid track types, ensure required ones exist ──
   function migrateTracksSchema(tracks) {
@@ -95,6 +160,18 @@
       }
     }
     return max;
+  }
+
+  /** How many timeline video clips use this server URL (e.g. /uploads/…). */
+  function countVideoClipsWithSrc(tracks, src) {
+    if (!src || !tracks || !tracks.video) return 0;
+    let n = 0;
+    for (const track of tracks.video) {
+      for (const el of track.elements || []) {
+        if (el.type === 'videoClip' && el.src === src) n++;
+      }
+    }
+    return n;
   }
 
   // ── File-size formatter ──────────────────────────────────────────────────
@@ -170,23 +247,29 @@
   // ── Root App component ───────────────────────────────────────────────────
   function App() {
 
-    // ── Timeline state (via reducer) ───────────────────────────────────────
+    // ── Timeline state — loaded from Supabase per project ───────────────────
     const [state, dispatch] = useReducer(timelineReducer, initialTimelineState);
+
+    const [projectId] = useState(() => window.CURRENT_PROJECT_ID || null);
+    const [projectLoaded, setProjectLoaded] = useState(false);
 
     // ── UI-only state (not in reducer) ────────────────────────────────────
     const [selectedElementId, setSelectedElementId] = useState(null);
-    const [timelineZoom,      setTimelineZoom]       = useState(80);   // px per second
+    const [timelineZoom,      setTimelineZoom]       = useState(80);
     const [agentMessages,     setAgentMessages]      = useState([]);
     const [isProcessing,      setIsProcessing]       = useState(false);
     const [cachedTranscript,  setCachedTranscript]   = useState(null);
 
-    // Uploaded file tracking (File object + server-side path from /upload response)
-    const [uploadedFile,      setUploadedFile]       = useState(null);  // File object
-    const [uploadedVideoPath, setUploadedVideoPath]  = useState(null);  // server path string
-    const [previewSrc,        setPreviewSrc]         = useState(null);  // blob URL for preview
+    // Uploaded file tracking (File object + path/URL for /generate — prefer Supabase signed URL)
+    const [uploadedFile,      setUploadedFile]       = useState(null);
+    const [uploadedVideoPath, setUploadedVideoPath]  = useState(null);
+    const [previewSrc,        setPreviewSrc]         = useState(null);
 
-    // Uploaded audio files (refreshed after each audio upload; Audio tab fetches its own list)
     const [audioFiles, setAudioFiles] = useState([]);
+
+    const [saveStatus, setSaveStatus] = useState('saved'); // 'saved' | 'saving' | 'error'
+    const saveTimeoutRef = useRef(null);
+    const skipHydrateAutosaveRef = useRef(true);
 
     // Real-time position preview while typing in Properties panel
     // Shape: { elementId, x, y } in video space (0-1080 / 0-1920), or null
@@ -196,8 +279,145 @@
     // Shape: { elementId, trackName, index } or null
     const [selectedKeyframe, setSelectedKeyframe] = useState(null);
 
-    // Media items shown in LeftPanel Media tab
+    // Media items shown in LeftPanel Media tab (without _file after refresh — re-import to edit raw file)
     const [mediaItems, setMediaItems] = useState([]);
+
+    // ── Load project from Supabase (once) ───────────────────────────────────
+    useEffect(() => {
+      let cancelled = false;
+      async function loadProject() {
+        const pid = window.CURRENT_PROJECT_ID;
+        if (!pid) {
+          window.location.href = '/landing.html';
+          return;
+        }
+        try {
+          const res = await fetch('/api/projects/' + encodeURIComponent(pid), {
+            headers: { Authorization: 'Bearer ' + (window.Auth && window.Auth.getToken && window.Auth.getToken()) },
+          });
+          if (!res.ok) {
+            window.location.href = '/landing.html';
+            return;
+          }
+          const project = await res.json();
+          if (cancelled) return;
+
+          const tl = project.timeline && typeof project.timeline === 'object' && Object.keys(project.timeline).length
+            ? project.timeline
+            : null;
+          const merged = mergePersistedTimelineState(tl, initialTimelineState);
+          if (project.name) {
+            merged.project = { ...merged.project, name: project.name };
+          }
+          dispatch({ type: 'SET_STATE', payload: merged });
+
+          if (merged && merged.tracks && merged.tracks.video) {
+            const restoredItems = [];
+            for (const track of merged.tracks.video) {
+              for (const el of (track.elements || [])) {
+                if (el.type === 'videoClip' && el.src) {
+                  restoredItems.push({
+                    id: 'media-restored-' + el.id,
+                    filename: el.originalFilename || el.src.split('/').pop(),
+                    path: el.src,
+                    duration: el.sourceEnd || (el.endTime - el.startTime),
+                    thumbnailUrl: null,
+                    fileSize: '—',
+                    resolution: '—',
+                    isImage: el.isImage || false,
+                    isAddedToTimeline: true,
+                    uploadedServerPath: el.src,
+                    uploadedDuration: el.sourceEnd || (el.endTime - el.startTime),
+                    uploadedIsImage: el.isImage || false,
+                    uploadedOriginalFilename: el.originalFilename || null,
+                    _file: null,
+                  });
+                }
+              }
+            }
+            if (restoredItems.length > 0) setMediaItems(restoredItems);
+          }
+
+          setCachedTranscript(project.transcript != null ? project.transcript : null);
+
+          const vp = project.video_path;
+          if (vp) {
+            setUploadedVideoPath(vp);
+            if (/^https?:\/\//i.test(vp)) setPreviewSrc(vp);
+            else if (vp.startsWith('/uploads/') || vp.startsWith('/audio/')) setPreviewSrc(vp);
+          }
+        } catch (e) {
+          window.location.href = '/landing.html';
+          return;
+        }
+        if (!cancelled) setProjectLoaded(true);
+      }
+      loadProject();
+      return () => { cancelled = true; };
+    }, []);
+
+    // ── Auto-save project to Supabase (debounced) ─────────────────────────
+    useEffect(() => {
+      if (!projectLoaded || !projectId) return;
+      if (skipHydrateAutosaveRef.current) {
+        skipHydrateAutosaveRef.current = false;
+        return;
+      }
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+      setSaveStatus('saving');
+      saveTimeoutRef.current = setTimeout(async () => {
+        try {
+          const timelineToSave = {
+            ...state,
+            history: { past: [], future: [], maxEntries: state.history.maxEntries },
+          };
+          const res = await fetch('/api/projects/' + encodeURIComponent(projectId), {
+            method: 'PATCH',
+            headers: authHeadersJson(),
+            body: JSON.stringify({
+              timeline: timelineToSave,
+              transcript: cachedTranscript,
+              name: state.project && state.project.name,
+              duration: state.source && state.source.duration,
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'Save failed');
+          setSaveStatus('saved');
+        } catch (err) {
+          setSaveStatus('error');
+        }
+      }, 2000);
+      return () => {
+        if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+      };
+    }, [state, cachedTranscript, projectLoaded, projectId]);
+
+    const handleRetrySave = useCallback(async () => {
+      if (!projectId) return;
+      setSaveStatus('saving');
+      try {
+        const timelineToSave = {
+          ...state,
+          history: { past: [], future: [], maxEntries: state.history.maxEntries },
+        };
+        const res = await fetch('/api/projects/' + encodeURIComponent(projectId), {
+          method: 'PATCH',
+          headers: authHeadersJson(),
+          body: JSON.stringify({
+            timeline: timelineToSave,
+            transcript: cachedTranscript,
+            name: state.project && state.project.name,
+            duration: state.source && state.source.duration,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Save failed');
+        setSaveStatus('saved');
+      } catch (err) {
+        setSaveStatus('error');
+      }
+    }, [projectId, state, cachedTranscript]);
 
     // ── Clear preview position and selected keyframe when element changes ─
     useEffect(() => {
@@ -327,18 +547,37 @@
       for (const item of items) {
         const formData = new FormData();
         formData.append('video', item._file);
+        if (projectId) formData.append('projectId', projectId);
         try {
-          const res  = await fetch('/upload', { method: 'POST', body: formData });
+          const res  = await fetch('/upload', { method: 'POST', headers: authHeadersUpload(), body: formData });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Upload failed');
 
-          // Always track the most recently uploaded file as the generate source
-          setUploadedVideoPath(data.path);
+          const primary = uploadResponsePrimaryUrl(data);
 
-          // Correction 1: dispatch LOAD_SOURCE only once to set project source metadata
+          setMediaItems(prev =>
+            prev.map(m =>
+              m.id === item.id
+                ? {
+                    ...m,
+                    uploadedServerPath:       primary,
+                    uploadedDuration:         data.duration || item.duration || 10,
+                    uploadedWidth:            data.width  || 1080,
+                    uploadedHeight:           data.height || 1920,
+                    uploadedIsImage:          !!data.isImage,
+                    uploadedOriginalFilename: data.originalFilename || item.filename,
+                  }
+                : m
+            )
+          );
+
+          setUploadedVideoPath(primary);
+
           if (!state.source.filename) {
             setUploadedFile(item._file);
-            if (!item.isImage) {
+            if (data.permanentUrl) {
+              setPreviewSrc(data.permanentUrl);
+            } else if (!item.isImage) {
               setPreviewSrc(URL.createObjectURL(item._file));
             }
             dispatch({
@@ -355,36 +594,30 @@
             });
           }
 
-          // Place videoClip on timeline for all video and image files
           const clipDuration = data.duration || 10;
           const newId = 'elem_v_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const clip = {
+            id:               newId,
+            type:             'videoClip',
+            startTime:        nextStart,
+            endTime:          nextStart + clipDuration,
+            sourceStart:      0,
+            sourceEnd:        clipDuration,
+            playbackRate:     1.0,
+            volume:           1.0,
+            src:              primary,
+            originalFilename: data.originalFilename || item.filename,
+            isImage:          data.isImage || false,
+            imageDuration:    data.isImage ? clipDuration : null,
+            keyframes: {
+              scale:   [{ time: 0, value: 1.0, easing: 'linear' }],
+              opacity: [{ time: 0, value: 1.0, easing: 'linear' }],
+            },
+          };
+          if (data.storageRef) clip.storageRef = data.storageRef;
           dispatch({
             type:    'APPLY_OPERATIONS',
-            payload: {
-              operations: [{
-                op:      'CREATE',
-                trackId: 'track_video_0',
-                element: {
-                  id:               newId,
-                  type:             'videoClip',
-                  startTime:        nextStart,
-                  endTime:          nextStart + clipDuration,
-                  sourceStart:      0,
-                  sourceEnd:        clipDuration,
-                  playbackRate:     1.0,
-                  volume:           1.0,
-                  src:              data.path,
-                  originalFilename: data.originalFilename || item.filename,
-                  isImage:          data.isImage || false,
-                  imageDuration:    data.isImage ? clipDuration : null,
-                  keyframes: {
-                    scale:   [{ time: 0, value: 1.0, easing: 'linear' }],
-                    opacity: [{ time: 0, value: 1.0, easing: 'linear' }],
-                  },
-                },
-              }],
-              promptText: null,
-            },
+            payload: { operations: [{ op: 'CREATE', trackId: 'track_video_0', element: clip }], promptText: null },
           });
           nextStart += clipDuration;
 
@@ -392,7 +625,7 @@
           console.error('Upload error:', err);
         }
       }
-    }, [state.source.filename, state.tracks.video]);
+    }, [state.source.filename, state.tracks.video, projectId]);
 
     const handleMediaRemove = useCallback((id) => {
       setMediaItems(prev => prev.filter(m => m.id !== id));
@@ -405,8 +638,9 @@
     const handleAudioImport = useCallback(async (file) => {
       const formData = new FormData();
       formData.append('video', file); // multer field name is 'video' — works for audio too
+      if (projectId) formData.append('projectId', projectId);
       try {
-        const res  = await fetch('/upload', { method: 'POST', body: formData });
+        const res  = await fetch('/upload', { method: 'POST', headers: authHeadersUpload(), body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Upload failed');
         // Signal the Audio tab that a new file exists (triggers a re-fetch there)
@@ -414,7 +648,7 @@
       } catch (err) {
         console.error('Audio upload error:', err);
       }
-    }, []);
+    }, [projectId]);
 
     // ── Add audio to timeline handler ──────────────────────────────────────
     // Called when the user clicks + on an Audio tab result or drags to timeline.
@@ -444,39 +678,119 @@
       });
     }, [state.source.duration]);
 
-    const handleSetCurrentFile = useCallback(async (item) => {
-      // Revoke any previous blob URL to avoid memory leaks
+    /**
+     * Library media row: preview + LOAD_SOURCE + /generate path always.
+     * Appends a timeline clip when no clip uses this file yet (re-add after delete), or when
+     * Shift+click forces another instance (two copies of the same asset). A plain click after
+     * import does not duplicate the clip import already created.
+     */
+    const handleSetCurrentFile = useCallback(async (item, options = {}) => {
+      const forceNewClip = options.forceNewClip === true;
+
       if (previewSrc && previewSrc.startsWith('blob:')) {
         URL.revokeObjectURL(previewSrc);
       }
-      const blobUrl = URL.createObjectURL(item._file);
-      setPreviewSrc(blobUrl);
-      setUploadedFile(item._file);
+      if (!item.uploadedServerPath && item._file) {
+        const blobUrl = URL.createObjectURL(item._file);
+        setPreviewSrc(blobUrl);
+        setUploadedFile(item._file);
+      }
+
+      function syncSourceAndMaybeAppendClip(data) {
+        const clipDuration = data.duration || item.duration || 10;
+        const primary = uploadResponsePrimaryUrl(data);
+        setUploadedVideoPath(primary);
+        dispatch({
+          type: 'LOAD_SOURCE',
+          payload: {
+            filename:   item.filename,
+            duration:   data.duration || item.duration,
+            width:      data.width  || 1080,
+            height:     data.height || 1920,
+            fps:        30,
+            fileSize:   item._file.size,
+            thumbnails: item.thumbnailUrl ? [item.thumbnailUrl] : [],
+          },
+        });
+
+        const existing = countVideoClipsWithSrc(stateTracksRef.current, primary);
+        if (!forceNewClip && existing > 0) return;
+
+        const nextStart = findNextAvailableTime(stateTracksRef.current.video);
+        const newId     = 'elem_v_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+        const el = {
+          id:               newId,
+          type:             'videoClip',
+          startTime:        nextStart,
+          endTime:          nextStart + clipDuration,
+          sourceStart:      0,
+          sourceEnd:        clipDuration,
+          playbackRate:     1.0,
+          volume:           1.0,
+          src:              primary,
+          originalFilename: data.originalFilename || item.filename,
+          isImage:          data.isImage || false,
+          imageDuration:    data.isImage ? clipDuration : null,
+          keyframes: {
+            scale:   [{ time: 0, value: 1.0, easing: 'linear' }],
+            opacity: [{ time: 0, value: 1.0, easing: 'linear' }],
+          },
+        };
+        if (data.storageRef) el.storageRef = data.storageRef;
+        dispatch({
+          type:    'APPLY_OPERATIONS',
+          payload: {
+            operations: [{ op: 'CREATE', trackId: 'track_video_0', element: el }],
+            promptText: null,
+          },
+        });
+      }
+
+      if (item.uploadedServerPath) {
+        const p = item.uploadedServerPath;
+        syncSourceAndMaybeAppendClip({
+          path:             p,
+          permanentUrl:     /^https?:\/\//i.test(p) ? p : null,
+          duration:         item.uploadedDuration,
+          width:            item.uploadedWidth,
+          height:           item.uploadedHeight,
+          isImage:          item.uploadedIsImage,
+          originalFilename: item.uploadedOriginalFilename,
+        });
+        if (/^https?:\/\//i.test(p)) setPreviewSrc(p);
+        return;
+      }
 
       const formData = new FormData();
       formData.append('video', item._file);
+      if (projectId) formData.append('projectId', projectId);
       try {
-        const res  = await fetch('/upload', { method: 'POST', body: formData });
+        const res  = await fetch('/upload', { method: 'POST', headers: authHeadersUpload(), body: formData });
         const data = await res.json();
         if (res.ok) {
-          setUploadedVideoPath(data.path);
-          dispatch({
-            type: 'LOAD_SOURCE',
-            payload: {
-              filename:   item.filename,
-              duration:   data.duration || item.duration,
-              width:      data.width  || 1080,
-              height:     data.height || 1920,
-              fps:        30,
-              fileSize:   item._file.size,
-              thumbnails: item.thumbnailUrl ? [item.thumbnailUrl] : [],
-            },
-          });
+          const primary = uploadResponsePrimaryUrl(data);
+          setMediaItems(prev =>
+            prev.map(m =>
+              m.id === item.id
+                ? {
+                    ...m,
+                    uploadedServerPath:       primary,
+                    uploadedDuration:         data.duration || item.duration || 10,
+                    uploadedWidth:            data.width  || 1080,
+                    uploadedHeight:           data.height || 1920,
+                    uploadedIsImage:          !!data.isImage,
+                    uploadedOriginalFilename: data.originalFilename || item.filename,
+                  }
+                : m
+            )
+          );
+          if (data.permanentUrl) setPreviewSrc(data.permanentUrl);
+          syncSourceAndMaybeAppendClip(data);
         }
       } catch (err) {
         console.error('Upload error:', err);
       }
-    }, [previewSrc]);
+    }, [previewSrc, projectId]);
 
     // ── Playback handlers ──────────────────────────────────────────────────
     const handlePlayPause = useCallback(() => {
@@ -560,7 +874,7 @@
 
         const res  = await fetch('/generate', {
           method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeadersJson(),
           body:    JSON.stringify({
             videoPath:     uploadedVideoPath,
             prompt,
@@ -572,34 +886,51 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Generation failed');
 
+        const ops = Array.isArray(data.operations) ? data.operations : [];
+        const warnList = data.warnings != null && Array.isArray(data.warnings) ? data.warnings : [];
+
         // Cache the transcript for future prompts (avoid re-transcribing)
         if (data.transcript && !cachedTranscript) {
           setCachedTranscript(data.transcript);
         }
 
-        // Apply the returned operations to the timeline
-        dispatch({
-          type:    'APPLY_OPERATIONS',
-          payload: { operations: data.operations, promptText: prompt },
-        });
+        if (ops.length === 0 && warnList.length > 0) {
+          setAgentMessages(prev => [
+            ...prev.filter(m => m.type !== 'status'),
+            {
+              id:        `r-${Date.now()}`,
+              role:      'system',
+              type:      'result',
+              content:   {
+                summary: warnList.join(' '),
+                prompt,
+                isWarning: true,
+              },
+              timestamp: new Date(),
+            },
+          ]);
+        } else {
+          dispatch({
+            type:    'APPLY_OPERATIONS',
+            payload: { operations: ops, promptText: prompt },
+          });
 
-        // Build summary, appending any warnings from failed audio searches
-        let summary = summarizeOperations(data.operations);
-        if (data.warnings && data.warnings.length > 0) {
-          summary += ' (' + data.warnings.join('; ') + ')';
+          let summary = summarizeOperations(ops);
+          if (warnList.length > 0) {
+            summary += ' (' + warnList.join('; ') + ')';
+          }
+
+          setAgentMessages(prev => [
+            ...prev.filter(m => m.type !== 'status'),
+            {
+              id:        `r-${Date.now()}`,
+              role:      'system',
+              type:      'result',
+              content:   { summary, prompt },
+              timestamp: new Date(),
+            },
+          ]);
         }
-
-        // Remove status bubble, add success bubble
-        setAgentMessages(prev => [
-          ...prev.filter(m => m.type !== 'status'),
-          {
-            id:        `r-${Date.now()}`,
-            role:      'system',
-            type:      'result',
-            content:   { summary, prompt },
-            timestamp: new Date(),
-          },
-        ]);
 
       } catch (err) {
         setAgentMessages(prev => [
@@ -746,7 +1077,7 @@
         setExportJob({ status: 'queued', progress: 0, filename: outputFilename });
         const res  = await fetch('/export', {
           method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeadersJson(),
           body:    JSON.stringify({ timelineState: state, outputFilename, format, quality }),
         });
         const data = await res.json();
@@ -758,7 +1089,7 @@
         // Poll for job status every 500 ms
         const poll = setInterval(async () => {
           try {
-            const sr   = await fetch('/export/status/' + jobId);
+            const sr   = await fetch('/export/status/' + jobId, { headers: authHeadersBearer() });
             const sd   = await sr.json();
             if (sd.status === 'done') {
               clearInterval(poll);
@@ -808,6 +1139,23 @@
     // ── Check if any prompt checkpoint exists (for Undo Last Prompt button) ─
     const hasPromptCheckpoint = state.history.past.some(e => e.isPromptCheckpoint);
 
+    if (!projectLoaded) {
+      return (
+        <div style={{
+          width:          '100vw',
+          height:         '100vh',
+          background:     '#111111',
+          color:          '#888',
+          display:        'flex',
+          alignItems:     'center',
+          justifyContent: 'center',
+          fontSize:       14,
+        }}>
+          Loading project…
+        </div>
+      );
+    }
+
     // ── Render ─────────────────────────────────────────────────────────────
     return (
       <div style={{
@@ -827,6 +1175,10 @@
               projectName={state.project.name || 'Untitled Project'}
               onRenameProject={(name) => dispatch({ type: 'UPDATE_PROJECT_NAME', payload: { name } })}
               onExport={handleExportStart}
+              onLogout={() => window.Auth && window.Auth.signOut && window.Auth.signOut()}
+              onBackToProjects={() => { window.location.href = '/landing.html'; }}
+              saveStatus={saveStatus}
+              onRetrySave={handleRetrySave}
             />
           </div>
         )}
@@ -923,7 +1275,11 @@
           <AgentPanel
             messages={agentMessages}
             isProcessing={isProcessing}
-            currentFile={uploadedFile ? { filename: uploadedFile.name } : null}
+            currentFile={
+              uploadedFile
+                ? { filename: uploadedFile.name }
+                : (state.source && state.source.filename ? { filename: state.source.filename } : null)
+            }
             hasPromptCheckpoint={hasPromptCheckpoint}
             onSubmitPrompt={handleSubmitPrompt}
             onUndo={handleUndo}

@@ -11,7 +11,7 @@
 (function () {
   const { useState, useEffect, useRef } = React;
   const { motion, AnimatePresence }     = Motion;
-  const { ArrowUp, Loader, AlertCircle, Undo2, Redo2, RotateCcw, Wand2 } = LucideReact;
+  const { ArrowUp, Loader, AlertCircle, Undo2, Redo2, RotateCcw, Wand2, AlertTriangle } = LucideReact;
 
   // ── Timestamp formatter ──────────────────────────────────────────────────
   function fmtTime(date) {
@@ -97,22 +97,27 @@
   }
 
   function ResultMessage({ msg }) {
-    const { summary, prompt } = msg.content;
+    const { summary, prompt, isWarning } = msg.content || {};
+    const warn = !!isWarning;
     return (
       <motion.div
         initial={{ opacity: 0, y: 6 }}
         animate={{ opacity: 1, y: 0 }}
         style={{
-          background:   'rgba(0,137,123,0.10)',
-          border:       '1px solid rgba(0,188,212,0.25)',
+          background:   warn ? 'rgba(186,117,23,0.08)' : 'rgba(0,137,123,0.10)',
+          border:       warn ? '1px solid rgba(186,117,23,0.45)' : '1px solid rgba(0,188,212,0.25)',
           borderRadius: 8,
           padding:      '10px 12px',
           marginBottom: 12,
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-          <Wand2 size={13} color="#00BCD4" />
-          <span style={{ color: '#00BCD4', fontSize: 12, fontWeight: 600 }}>
+          {warn ? (
+            <AlertTriangle size={13} color="#BA7517" style={{ flexShrink: 0 }} />
+          ) : (
+            <Wand2 size={13} color="#00BCD4" style={{ flexShrink: 0 }} />
+          )}
+          <span style={{ color: warn ? '#BA7517' : '#00BCD4', fontSize: 12, fontWeight: 600 }}>
             {summary}
           </span>
         </div>
