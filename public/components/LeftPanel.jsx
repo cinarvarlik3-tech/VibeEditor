@@ -621,6 +621,9 @@
 
   // ── SubtitleProps (module scope) ───────────────────────────────────────────
   function SubtitleProps({ element, elementId, update, onPreviewPosition }) {
+    const [localText, setLocalText] = useState(element.text || '');
+    const [localColor, setLocalColor] = useState(element.style.color || '#ffffff');
+    const [localFontSize, setLocalFontSize] = useState(element.style.fontSize || 52);
     const [localX, setLocalX] = useState(
       typeof element.position.x === 'number' ? element.position.x : 0
     );
@@ -628,11 +631,25 @@
       typeof element.position.y === 'number' ? element.position.y : 0
     );
 
-    // Sync local state when switching to a different element
     useEffect(() => {
+      setLocalText(element.text || '');
+      setLocalColor(element.style.color || '#ffffff');
+      setLocalFontSize(element.style.fontSize || 52);
       setLocalX(typeof element.position.x === 'number' ? element.position.x : 0);
       setLocalY(typeof element.position.y === 'number' ? element.position.y : 0);
-    }, [elementId]);
+    }, [
+      elementId,
+      element.style.color,
+      element.style.fontSize,
+      element.style.fontFamily,
+      element.style.fontWeight,
+      element.style.fontStyle,
+      element.text,
+      element.animation && element.animation.in && element.animation.in.type,
+      element.animation && element.animation.out && element.animation.out.type,
+      element.position.x,
+      element.position.y,
+    ]);
 
     // Drive VideoPreview in real-time while typing (no undo entry)
     useEffect(() => {
@@ -643,8 +660,9 @@
       <div>
         <PropRow label="TEXT">
           <textarea
-            defaultValue={element.text}
-            onBlur={e => update('text', e.target.value)}
+            value={localText}
+            onChange={e => setLocalText(e.target.value)}
+            onBlur={() => update('text', localText)}
             style={{ ...inputStyle(), resize: 'vertical', minHeight: 60, fontFamily: 'inherit' }}
           />
         </PropRow>
@@ -653,14 +671,15 @@
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <input
                 type="color"
-                defaultValue={element.style.color || '#ffffff'}
+                value={element.style.color || '#ffffff'}
                 onChange={e => update('style.color', e.target.value)}
                 style={{ width: 32, height: 28, border: 'none', borderRadius: 4, cursor: 'pointer', background: 'none' }}
               />
               <input
                 type="text"
-                defaultValue={element.style.color || '#ffffff'}
-                onBlur={e => update('style.color', e.target.value)}
+                value={localColor}
+                onChange={e => setLocalColor(e.target.value)}
+                onBlur={() => update('style.color', localColor)}
                 style={{ ...inputStyle(), width: 80 }}
               />
             </div>
@@ -668,8 +687,9 @@
           <PropRow label="FONT SIZE">
             <input
               type="number"
-              defaultValue={element.style.fontSize || 52}
+              value={localFontSize}
               min={10} max={200}
+              onChange={e => setLocalFontSize(Number(e.target.value))}
               onBlur={e => update('style.fontSize', Number(e.target.value))}
               style={inputStyle(70)}
             />
@@ -677,7 +697,7 @@
         </div>
         <PropRow label="FONT FAMILY">
           <select
-            defaultValue={element.style.fontFamily || 'Arial'}
+            value={element.style.fontFamily || 'Arial'}
             onChange={e => update('style.fontFamily', e.target.value)}
             style={{ ...inputStyle(), cursor: 'pointer' }}
           >
@@ -688,13 +708,13 @@
         </PropRow>
         <div style={{ display: 'flex', gap: 8 }}>
           <PropRow label="WEIGHT">
-            <select defaultValue={element.style.fontWeight || 'normal'} onChange={e => update('style.fontWeight', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
+            <select value={element.style.fontWeight || 'normal'} onChange={e => update('style.fontWeight', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
               <option value="normal">Normal</option>
               <option value="bold">Bold</option>
             </select>
           </PropRow>
           <PropRow label="STYLE">
-            <select defaultValue={element.style.fontStyle || 'normal'} onChange={e => update('style.fontStyle', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
+            <select value={element.style.fontStyle || 'normal'} onChange={e => update('style.fontStyle', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
               <option value="normal">Normal</option>
               <option value="italic">Italic</option>
             </select>
@@ -769,12 +789,12 @@
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <PropRow label="ANIM IN">
-            <select defaultValue={element.animation && element.animation.in ? element.animation.in.type : 'none'} onChange={e => update('animation.in.type', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
+            <select value={element.animation && element.animation.in ? element.animation.in.type : 'none'} onChange={e => update('animation.in.type', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
               {['none','fade','slideUp','slideDown','pop','typewriter','wordByWord'].map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </PropRow>
           <PropRow label="ANIM OUT">
-            <select defaultValue={element.animation && element.animation.out ? element.animation.out.type : 'none'} onChange={e => update('animation.out.type', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
+            <select value={element.animation && element.animation.out ? element.animation.out.type : 'none'} onChange={e => update('animation.out.type', e.target.value)} style={{ ...inputStyle(), cursor: 'pointer' }}>
               {['none','fade','slideUp','slideDown','pop'].map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </PropRow>
@@ -787,8 +807,17 @@
   // Shows clip-level speed, volume, and source cut-point controls.
   // Scale and opacity are keyframe-animated — select a diamond on the timeline.
   function VideoClipProps({ element, elementId, update }) {
-    const playbackRate = element.playbackRate !== undefined ? element.playbackRate : 1.0;
-    const volume       = element.volume       !== undefined ? element.volume       : 1.0;
+    const [localRate, setLocalRate] = useState(element.playbackRate !== undefined ? element.playbackRate : 1.0);
+    const [localVol, setLocalVol] = useState(element.volume !== undefined ? element.volume : 1.0);
+    const [localSrcStart, setLocalSrcStart] = useState(Number(element.sourceStart) || 0);
+    const [localSrcEnd, setLocalSrcEnd] = useState(Number(element.sourceEnd) || 0);
+
+    useEffect(() => {
+      setLocalRate(element.playbackRate !== undefined ? element.playbackRate : 1.0);
+      setLocalVol(element.volume !== undefined ? element.volume : 1.0);
+      setLocalSrcStart(Number(element.sourceStart) || 0);
+      setLocalSrcEnd(Number(element.sourceEnd) || 0);
+    }, [elementId, element.playbackRate, element.volume, element.sourceStart, element.sourceEnd]);
 
     return (
       <div>
@@ -820,12 +849,16 @@
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <input
               type="range" min={0.25} max={4} step={0.25}
-              value={playbackRate}
-              onChange={e => update('playbackRate', Number(e.target.value))}
+              value={localRate}
+              onChange={e => {
+                const v = Number(e.target.value);
+                setLocalRate(v);
+                update('playbackRate', v);
+              }}
               style={{ flex: 1 }}
             />
             <span style={{ color: '#888', fontSize: 11, minWidth: 32, textAlign: 'right' }}>
-              {playbackRate.toFixed(2)}x
+              {localRate.toFixed(2)}x
             </span>
           </div>
         </PropRow>
@@ -835,12 +868,16 @@
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <input
               type="range" min={0} max={1} step={0.05}
-              value={volume}
-              onChange={e => update('volume', Number(e.target.value))}
+              value={localVol}
+              onChange={e => {
+                const v = Number(e.target.value);
+                setLocalVol(v);
+                update('volume', v);
+              }}
               style={{ flex: 1 }}
             />
             <span style={{ color: '#888', fontSize: 11, minWidth: 32, textAlign: 'right' }}>
-              {Math.round(volume * 100)}%
+              {Math.round(localVol * 100)}%
             </span>
           </div>
         </PropRow>
@@ -850,8 +887,9 @@
           <PropRow label="SOURCE IN (s)">
             <input
               type="number" step={0.1} min={0}
-              defaultValue={(element.sourceStart || 0).toFixed(2)}
-              key={elementId + '_srcStart'}
+              key={elementId + '_srcStart_' + String(element.sourceStart)}
+              value={localSrcStart}
+              onChange={e => setLocalSrcStart(Number(e.target.value))}
               onBlur={e => update('sourceStart', Number(e.target.value))}
               style={inputStyle(80)}
             />
@@ -859,8 +897,9 @@
           <PropRow label="SOURCE OUT (s)">
             <input
               type="number" step={0.1} min={0}
-              defaultValue={(element.sourceEnd || 0).toFixed(2)}
-              key={elementId + '_srcEnd'}
+              key={elementId + '_srcEnd_' + String(element.sourceEnd)}
+              value={localSrcEnd}
+              onChange={e => setLocalSrcEnd(Number(e.target.value))}
               onBlur={e => update('sourceEnd', Number(e.target.value))}
               style={inputStyle(80)}
             />
@@ -989,7 +1028,16 @@
       jamendo:   { label: 'JAMENDO',  bg: 'rgba(230,81,0,0.2)',   color: '#FF6E40' },
     };
     const badge = SOURCE_BADGE[element.sourceType] || SOURCE_BADGE.upload;
-    const vol   = element.volume !== undefined ? element.volume : 1;
+
+    const [localVol, setLocalVol] = useState(element.volume !== undefined ? element.volume : 1);
+    const [localFadeIn, setLocalFadeIn] = useState(element.fadeIn !== undefined ? element.fadeIn : 0);
+    const [localFadeOut, setLocalFadeOut] = useState(element.fadeOut !== undefined ? element.fadeOut : 0);
+
+    useEffect(() => {
+      setLocalVol(element.volume !== undefined ? element.volume : 1);
+      setLocalFadeIn(element.fadeIn !== undefined ? element.fadeIn : 0);
+      setLocalFadeOut(element.fadeOut !== undefined ? element.fadeOut : 0);
+    }, [elementId, element.volume, element.fadeIn, element.fadeOut]);
 
     return (
       <div>
@@ -1019,12 +1067,16 @@
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <input
               type="range" min={0} max={1} step={0.01}
-              defaultValue={vol}
-              onMouseUp={e => update('volume', Number(e.target.value))}
+              value={localVol}
+              onChange={e => {
+                const v = Number(e.target.value);
+                setLocalVol(v);
+                update('volume', v);
+              }}
               style={{ flex: 1 }}
             />
             <span style={{ color: '#888', fontSize: 11, minWidth: 32 }}>
-              {Math.round(vol * 100)}%
+              {Math.round(localVol * 100)}%
             </span>
           </div>
         </PropRow>
@@ -1035,7 +1087,8 @@
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <input
                 type="number" min={0} max={30} step={0.1}
-                defaultValue={(element.fadeIn || 0).toFixed(1)}
+                value={localFadeIn}
+                onChange={e => setLocalFadeIn(Number(e.target.value))}
                 onBlur={e => update('fadeIn', Number(e.target.value))}
                 style={{ ...inputStyle(60) }}
               />
@@ -1046,7 +1099,8 @@
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <input
                 type="number" min={0} max={30} step={0.1}
-                defaultValue={(element.fadeOut || 0).toFixed(1)}
+                value={localFadeOut}
+                onChange={e => setLocalFadeOut(Number(e.target.value))}
                 onBlur={e => update('fadeOut', Number(e.target.value))}
                 style={{ ...inputStyle(60) }}
               />
