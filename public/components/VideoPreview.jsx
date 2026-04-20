@@ -299,6 +299,76 @@
     return src.slice('native://'.length) || null;
   }
 
+  function defaultImageLayoutRead() {
+    return window.TimelineSchema && typeof window.TimelineSchema.defaultImageClipLayout === 'function'
+      ? window.TimelineSchema.defaultImageClipLayout()
+      : { layoutMode: 'fullscreen', anchor: { x: 0, y: 0 }, box: { width: 1080, height: 1920 }, lockAspect: false };
+  }
+
+  function mergeImageLayout(el) {
+    var d = defaultImageLayoutRead();
+    var il = el && el.imageLayout && typeof el.imageLayout === 'object' ? el.imageLayout : {};
+    var ax = il.anchor && typeof il.anchor.x === 'number' ? il.anchor.x : d.anchor.x;
+    var ay = il.anchor && typeof il.anchor.y === 'number' ? il.anchor.y : d.anchor.y;
+    var bw = il.box && typeof il.box.width === 'number' ? il.box.width : d.box.width;
+    var bh = il.box && typeof il.box.height === 'number' ? il.box.height : d.box.height;
+    return {
+      layoutMode: il.layoutMode === 'custom' ? 'custom' : 'fullscreen',
+      anchor:     { x: ax, y: ay },
+      box:        { width: bw, height: bh },
+      lockAspect: !!il.lockAspect,
+    };
+  }
+
+  /**
+   * Effective layout for preview (committed state + in-progress drag / properties typing).
+   */
+  function effectiveImageLayout(el, previewPosition, previewDrag) {
+    var base = mergeImageLayout(el);
+    if (previewDrag && previewDrag.dragKind === 'imageAnchor' && previewDrag.elementId === el.id) {
+      return {
+        layoutMode: 'custom',
+        anchor:     { x: previewDrag.currentPosX, y: previewDrag.currentPosY },
+        box:        { width: base.box.width, height: base.box.height },
+        lockAspect: base.lockAspect,
+      };
+    }
+    if (previewPosition && previewPosition.elementId === el.id
+        && typeof previewPosition.x === 'number' && typeof previewPosition.y === 'number') {
+      return {
+        layoutMode: 'custom',
+        anchor:     { x: previewPosition.x, y: previewPosition.y },
+        box:        {
+          width:  typeof previewPosition.w === 'number' ? previewPosition.w : base.box.width,
+          height: typeof previewPosition.h === 'number' ? previewPosition.h : base.box.height,
+        },
+        lockAspect: base.lockAspect,
+      };
+    }
+    return base;
+  }
+
+  /** Position/size of image wrapper in % of preview frame (composition 1080×1920 space). */
+  function imageBoxWrapperStyle(layout) {
+    if (!layout || layout.layoutMode !== 'custom') {
+      return { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' };
+    }
+    var ax = layout.anchor.x;
+    var ay = layout.anchor.y;
+    var bw = layout.box.width;
+    var bh = layout.box.height;
+    var xtl = ax - bw / 2;
+    var ytl = ay - bh / 2;
+    return {
+      position: 'absolute',
+      left:   ((xtl + VIDEO_W / 2) / VIDEO_W) * 100 + '%',
+      top:    ((ytl + VIDEO_H / 2) / VIDEO_H) * 100 + '%',
+      width:  (bw / VIDEO_W) * 100 + '%',
+      height: (bh / VIDEO_H) * 100 + '%',
+      overflow: 'hidden',
+    };
+  }
+
   /** Active imageClip elements on visible image tracks at composition time `t`. */
   function getActiveImageClips(tracks, t) {
     var out = [];
@@ -562,13 +632,24 @@
       function handleMouseUp() {
         const drag = previewDragRef.current;
         if (!drag) return;
-        onUpdateElementRef.current && onUpdateElementRef.current({
-          elementId: drag.elementId,
-          changes: {
-            'position.x': Math.round(drag.currentPosX),
-            'position.y': Math.round(drag.currentPosY),
-          },
-        });
+        if (drag.dragKind === 'imageAnchor') {
+          onUpdateElementRef.current && onUpdateElementRef.current({
+            elementId: drag.elementId,
+            changes: {
+              'imageLayout.anchor.x': Math.round(drag.currentPosX),
+              'imageLayout.anchor.y': Math.round(drag.currentPosY),
+              'imageLayout.layoutMode': 'custom',
+            },
+          });
+        } else {
+          onUpdateElementRef.current && onUpdateElementRef.current({
+            elementId: drag.elementId,
+            changes: {
+              'position.x': Math.round(drag.currentPosX),
+              'position.y': Math.round(drag.currentPosY),
+            },
+          });
+        }
         previewDragRef.current = null;
         setPreviewDrag(null);
       }
@@ -1024,6 +1105,31 @@
     const hasVideoClips = tracks && tracks.video &&
       tracks.video.some(t => t.elements && t.elements.length > 0);
 
+    function bindImageClipDrag(el, effLayout) {
+      return function (e) {
+        if (effLayout.layoutMode !== 'custom') return;
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onElementSelect && onElementSelect(el.id);
+        var container = overlayRef.current;
+        if (!container) return;
+        var rect = container.getBoundingClientRect();
+        var startVideoX = ((e.clientX - rect.left) / rect.width) * VIDEO_W - VIDEO_W / 2;
+        var startVideoY = ((e.clientY - rect.top) / rect.height) * VIDEO_H - VIDEO_H / 2;
+        handleOverlayDragStart({
+          dragKind:    'imageAnchor',
+          elementId:   el.id,
+          startVideoX: startVideoX,
+          startVideoY: startVideoY,
+          origX:       effLayout.anchor.x,
+          origY:       effLayout.anchor.y,
+          currentPosX: effLayout.anchor.x,
+          currentPosY: effLayout.anchor.y,
+        });
+      };
+    }
+
     var imageLayerNodes = null;
     if (tracks && tracks.image) {
       var activeImg = getActiveImageClips(tracks, currentTime);
@@ -1033,23 +1139,42 @@
           var op = row.opacity;
           var fit = el.fitMode || 'cover';
           var vol = el.volume !== undefined ? el.volume : 0;
+          var eff = effectiveImageLayout(el, previewPosition, previewDrag);
+          var wrapStyle = imageBoxWrapperStyle(eff);
+          var sel = selectedElementId === el.id;
+          var pe = eff.layoutMode === 'custom' ? 'auto' : 'none';
+          var outline = sel && eff.layoutMode === 'custom' ? '1px solid rgba(45,212,191,0.85)' : 'none';
+          var onImgMouseDown = bindImageClipDrag(el, eff);
+
+          function wrapInner(innerReactEl) {
+            return React.createElement('div', {
+              key: el.id + '-ilwrap',
+              style: Object.assign({}, wrapStyle, {
+                pointerEvents: pe,
+                outline: outline,
+                outlineOffset: -1,
+              }),
+              onMouseDown: onImgMouseDown,
+            }, innerReactEl);
+          }
+
           if (el.sourceType === 'native') {
-            return renderNativeVisual(el, op);
+            return wrapInner(renderNativeVisual(el, op));
           }
           if (looksLikeImageFile(el.src, el.isImage)) {
-            return React.createElement('img', {
-              key: el.id,
+            return wrapInner(React.createElement('img', {
+              key: el.id + '-img',
               src: el.src,
               alt: '',
               draggable: false,
               style: {
                 position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
-                objectFit: fit, pointerEvents: 'none', opacity: op,
+                objectFit: fit, pointerEvents: 'none', opacity: op, display: 'block',
               },
-            });
+            }));
           }
-          return React.createElement('video', {
-            key: el.id,
+          return wrapInner(React.createElement('video', {
+            key: el.id + '-vid',
             ref: function(node) {
               if (node) imageBrollVideoRefs.current.set(el.id, node);
               else imageBrollVideoRefs.current.delete(el.id);
@@ -1060,9 +1185,9 @@
             loop: false,
             style: {
               position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
-              objectFit: fit, pointerEvents: 'none', opacity: op,
+              objectFit: fit, pointerEvents: 'none', opacity: op, display: 'block',
             },
-          });
+          }));
         });
       }
     }

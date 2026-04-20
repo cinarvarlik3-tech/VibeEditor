@@ -243,18 +243,35 @@
     fitMode:          "cover" | "contain" | "fill",
     nativePayload:    object | undefined, // when sourceType === "native", shape depends on native type
     keyframes:        { opacity: [{ time: 0, value: 1.0, easing: "linear" }] }
+    imageLayout:      // optional — merged with defaultImageClipLayout() at runtime
+    {
+      layoutMode:  "fullscreen" | "custom",
+      anchor:      { x: number, y: number },   // video space, origin at frame center (see VideoPreview VIDEO_W/H)
+      box:         { width: number, height: number },
+      lockAspect:  boolean,
+    }
+    intrinsicAspect: number | null,  // width/height for lockAspect (optional)
   }
   */
+
+  function defaultImageClipLayout() {
+    return {
+      layoutMode: 'fullscreen',
+      anchor:     { x: 0, y: 0 },
+      box:        { width: 1080, height: 1920 },
+      lockAspect: false,
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Dual export: CommonJS (Node) + browser global
   // ---------------------------------------------------------------------------
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { initialTimelineState };
+    module.exports = { initialTimelineState, defaultImageClipLayout };
   }
   if (typeof window !== 'undefined') {
-    window.TimelineSchema = { initialTimelineState };
+    window.TimelineSchema = { initialTimelineState, defaultImageClipLayout };
   }
 
 })();

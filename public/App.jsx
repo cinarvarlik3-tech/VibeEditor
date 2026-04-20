@@ -102,7 +102,49 @@
     }
     if (!cleaned.video)    cleaned.video    = [{ id: 'track_video_0',  index: 0, name: 'Video 1',    locked: false, visible: true, elements: [] }];
     if (!cleaned.audio)    cleaned.audio    = [{ id: 'track_audio_0', index: 0, name: 'Audio 1',    locked: false, visible: true, elements: [] }];
+    for (const tr of cleaned.image || []) {
+      for (const el of tr.elements || []) {
+        if (el.type === 'imageClip') ensureImageClipLayoutFields(el);
+      }
+    }
     return cleaned;
+  }
+
+  function defaultImageClipLayoutPayload() {
+    const fn = window.TimelineSchema && window.TimelineSchema.defaultImageClipLayout;
+    return fn ? fn() : {
+      layoutMode: 'fullscreen',
+      anchor:     { x: 0, y: 0 },
+      box:        { width: 1080, height: 1920 },
+      lockAspect: false,
+    };
+  }
+
+  /** Mutates imageClip in place so imageLayout always exists (project load / migration). */
+  function ensureImageClipLayoutFields(el) {
+    if (!el || el.type !== 'imageClip') return;
+    const def = defaultImageClipLayoutPayload();
+    const il = el.imageLayout && typeof el.imageLayout === 'object' ? el.imageLayout : {};
+    const ax = typeof il.anchor === 'object' && il.anchor && typeof il.anchor.x === 'number' ? il.anchor.x : def.anchor.x;
+    const ay = typeof il.anchor === 'object' && il.anchor && typeof il.anchor.y === 'number' ? il.anchor.y : def.anchor.y;
+    const bw = typeof il.box === 'object' && il.box && typeof il.box.width === 'number'
+      ? Math.max(0, Math.min(4000, il.box.width)) : def.box.width;
+    const bh = typeof il.box === 'object' && il.box && typeof il.box.height === 'number'
+      ? Math.max(0, Math.min(4000, il.box.height)) : def.box.height;
+    el.imageLayout = {
+      layoutMode: il.layoutMode === 'custom' ? 'custom' : 'fullscreen',
+      anchor:     { x: ax, y: ay },
+      box:        { width: bw, height: bh },
+      lockAspect: !!il.lockAspect,
+    };
+    if (el.intrinsicAspect === undefined) el.intrinsicAspect = null;
+  }
+
+  function migrateImageClipElement(el) {
+    if (!el || el.type !== 'imageClip') return el;
+    const copy = { ...el };
+    ensureImageClipLayoutFields(copy);
+    return copy;
   }
 
   // ── Migrate old-format videoClip elements ────────────────────────────
@@ -847,6 +889,8 @@
               volume:           0.0,
               fitMode:          'cover',
               keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+              imageLayout:      defaultImageClipLayoutPayload(),
+              intrinsicAspect:  (data.width && data.height) ? (data.width / data.height) : null,
             };
             if (data.storageRef) iclip.storageRef = data.storageRef;
             dispatch({
@@ -998,6 +1042,8 @@
             volume:           0.0,
             fitMode:          'cover',
             keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+            imageLayout:      defaultImageClipLayoutPayload(),
+            intrinsicAspect:  (data.width && data.height) ? (data.width / data.height) : null,
           };
           if (data.storageRef) el.storageRef = data.storageRef;
           dispatch({
@@ -1216,6 +1262,8 @@
         volume:           0.3,
         fitMode:          'cover',
         keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+        imageLayout:      defaultImageClipLayoutPayload(),
+        intrinsicAspect:  null,
       };
       if (storageRef) el.storageRef = storageRef;
       dispatch({
@@ -1253,7 +1301,9 @@
           fontWeight: '700',
           background: 'rgba(0,0,0,0.55)',
         },
-        keyframes: { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+        keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+        imageLayout:      defaultImageClipLayoutPayload(),
+        intrinsicAspect:  null,
       };
       dispatch({
         type:    'APPLY_OPERATIONS',
@@ -1485,12 +1535,19 @@
     }, [handleSubmitPrompt]);
 
     // ── Preview position handler (from Properties panel typing) ───────────
-    const handlePreviewPosition = useCallback(({ elementId, x, y }) => {
+    const handlePreviewPosition = useCallback(({ elementId, x, y, w, h }) => {
       setPreviewPosition(prev => {
-        if (prev && prev.elementId === elementId && prev.x === x && prev.y === y) {
-          return prev; // same values — same reference, no re-render triggered
+        const next = { elementId, x, y };
+        if (typeof w === 'number' && Number.isFinite(w)) next.w = w;
+        else if (prev && prev.elementId === elementId && typeof prev.w === 'number') next.w = prev.w;
+        if (typeof h === 'number' && Number.isFinite(h)) next.h = h;
+        else if (prev && prev.elementId === elementId && typeof prev.h === 'number') next.h = prev.h;
+        if (prev && prev.elementId === next.elementId
+            && prev.x === next.x && prev.y === next.y
+            && prev.w === next.w && prev.h === next.h) {
+          return prev;
         }
-        return { elementId, x, y };
+        return next;
       });
     }, []);
 
@@ -1730,7 +1787,12 @@
             mediaItems={mediaItems}
             source={state.source}
             project={state.project}
-            selectedElement={selectedElement ? migrateVideoClipElement(selectedElement.element) : null}
+            selectedElement={selectedElement ? (function() {
+              const raw = selectedElement.element;
+              if (raw.type === 'videoClip') return migrateVideoClipElement(raw);
+              if (raw.type === 'imageClip') return migrateImageClipElement(raw);
+              return raw;
+            })() : null}
             selectedElementId={selectedElementId}
             selectedKeyframe={selectedKeyframe}
             audioFiles={audioFiles}

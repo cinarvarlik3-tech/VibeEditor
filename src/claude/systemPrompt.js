@@ -90,6 +90,17 @@ AUDIOCLIP elements:
   sn  = sourceName
   st_ = sourceType
 
+IMAGECLIP elements (overlays on the image layer; tp is "imageClip"):
+  ii  = isImage
+  opv = opacity (clip-level scalar; keyframed opacity is in kf.op)
+  fm  = fitMode ("cover" | "contain" | "fill")
+  kf  = keyframes (same sc/op/ti/vl/ea shape as video; image clips typically use op only)
+  il  = imageLayout — position/size of the image in the 1080×1920 frame (center origin, like subtitles):
+    lm = "fullscreen" | "custom"  (fullscreen fills the frame; custom uses anchor + box)
+    ax, ay = anchor in pixels relative to frame center (0,0 = center; e.g. x −540…540, y −960…960)
+    bw, bh = box width and height in pixels when lm is "custom" (ignored for framing when fullscreen)
+    la = lockAspect (boolean, optional)
+
 TRACK SELECTION:
 CURRENT_TRACKS may contain only the track types relevant to your prompt.
 If subtitle tracks are absent, do not attempt to reference subtitle
@@ -107,8 +118,9 @@ track when your prompt mentions it.
 
 When you return UPDATE operations, use these same short keys in each
 changes object dot-path (for example s.fs for style.fontSize, p.x for
-position.x). The server expands them back to full reducer paths before
-applying edits.
+position.x, il.ax / il.ay for imageLayout.anchor on image clips). The server
+expands them back to full reducer paths before applying edits. You may also
+send a full "il" object in changes to replace imageLayout in one object.
 
 ---
 

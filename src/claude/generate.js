@@ -135,14 +135,56 @@ function compressAudioElement(el) {
   return out;
 }
 
+/**
+ * Compact imageLayout for Claude (CURRENT_TRACKS). Same coordinate space as UI:
+ * 1080×1920, origin at frame center; anchor is box center.
+ */
+function compressImageLayoutForClaude(il) {
+  const d = { layoutMode: 'fullscreen', anchor: { x: 0, y: 0 }, box: { width: 1080, height: 1920 }, lockAspect: false };
+  const src = il && typeof il === 'object' ? il : {};
+  const lm = src.layoutMode === 'custom' ? 'custom' : 'fullscreen';
+  const ax = src.anchor && typeof src.anchor.x === 'number' ? src.anchor.x : d.anchor.x;
+  const ay = src.anchor && typeof src.anchor.y === 'number' ? src.anchor.y : d.anchor.y;
+  const bw = src.box && typeof src.box.width === 'number' ? src.box.width : d.box.width;
+  const bh = src.box && typeof src.box.height === 'number' ? src.box.height : d.box.height;
+  const out = { lm, ax, ay, bw, bh };
+  if (src.lockAspect) out.la = true;
+  return out;
+}
+
+function decompressImageLayout(il) {
+  if (!il || typeof il !== 'object') return undefined;
+  const layoutMode = il.lm === 'custom' || il.layoutMode === 'custom' ? 'custom' : 'fullscreen';
+  return {
+    layoutMode,
+    anchor: {
+      x: typeof il.ax === 'number' ? il.ax : (il.anchor && typeof il.anchor.x === 'number' ? il.anchor.x : 0),
+      y: typeof il.ay === 'number' ? il.ay : (il.anchor && typeof il.anchor.y === 'number' ? il.anchor.y : 0),
+    },
+    box: {
+      width: typeof il.bw === 'number' ? il.bw : (il.box && typeof il.box.width === 'number' ? il.box.width : 1080),
+      height: typeof il.bh === 'number' ? il.bh : (il.box && typeof il.box.height === 'number' ? il.box.height : 1920),
+    },
+    lockAspect: !!(il.la || il.lockAspect),
+  };
+}
+
 function compressImageClipElement(el) {
-  const stripped = omitKeys(el, ['storageRef', 'pixabayId', 'nativePayload', 'src']);
+  const stripped = omitKeys(el, [
+    'storageRef',
+    'pixabayId',
+    'nativePayload',
+    'src',
+    'imageLayout',
+    'intrinsicAspect',
+  ]);
   const out = {
     id: stripped.id,
     st: stripped.startTime,
     et: stripped.endTime,
     tp: 'imageClip',
   };
+  out.il = compressImageLayoutForClaude(el.imageLayout);
   if (stripped.originalFilename !== undefined) out.fn = stripped.originalFilename;
   if (stripped.sourceName !== undefined) out.sn = stripped.sourceName;
   if (stripped.sourceType !== undefined) out.st_ = stripped.sourceType;
@@ -311,6 +353,12 @@ const UPDATE_CHANGE_KEY_MAP = {
   'fo': 'fadeOut',
   'sn': 'sourceName',
   'st_': 'sourceType',
+  'il.ax': 'imageLayout.anchor.x',
+  'il.ay': 'imageLayout.anchor.y',
+  'il.bw': 'imageLayout.box.width',
+  'il.bh': 'imageLayout.box.height',
+  'il.lm': 'imageLayout.layoutMode',
+  'il.la': 'imageLayout.lockAspect',
 };
 
 function mapUpdateChangeDotKey(key) {
@@ -330,6 +378,10 @@ function decompressUpdateChanges(changes) {
   if (!changes || typeof changes !== 'object') return changes;
   const out = {};
   for (const [k, v] of Object.entries(changes)) {
+    if (k === 'il' && v && typeof v === 'object' && !Array.isArray(v)) {
+      out.imageLayout = decompressImageLayout(v);
+      continue;
+    }
     out[mapUpdateChangeDotKey(k)] = v;
   }
   return out;
@@ -434,11 +486,59 @@ function decompressVideoLikeBody(obj) {
   return out;
 }
 
+function decompressImageClipLikeBody(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const t = obj.tp || obj.type;
+  if (t && t !== 'imageClip') return obj;
+  if (obj.type === 'imageClip' && obj.imageLayout && !obj.tp) return { ...obj };
+
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    if (['tp', 'st', 'et', 'ii', 'opv', 'v', 'fm', 'kf', 'fn', 'sn', 'st_', 'il'].includes(k)) continue;
+    out[k] = obj[k];
+  }
+  out.type = 'imageClip';
+  if (obj.id != null) out.id = obj.id;
+  if (obj.startTime != null || obj.st != null) {
+    out.startTime = obj.startTime != null ? obj.startTime : obj.st;
+  }
+  if (obj.endTime != null || obj.et != null) {
+    out.endTime = obj.endTime != null ? obj.endTime : obj.et;
+  }
+  if (obj.isImage != null || obj.ii != null) {
+    out.isImage = obj.isImage != null ? obj.isImage : obj.ii;
+  }
+  if (obj.opacity != null || obj.opv != null) {
+    out.opacity = obj.opacity != null ? obj.opacity : obj.opv;
+  }
+  if (obj.volume != null || obj.v != null) {
+    out.volume = obj.volume != null ? obj.volume : obj.v;
+  }
+  if (obj.fitMode != null || obj.fm != null) {
+    out.fitMode = obj.fitMode != null ? obj.fitMode : obj.fm;
+  }
+  if (obj.originalFilename || obj.fn) {
+    out.originalFilename = obj.originalFilename || obj.fn;
+  }
+  if (obj.sourceName || obj.sn) {
+    out.sourceName = obj.sourceName || obj.sn;
+  }
+  if (obj.sourceType != null || obj.st_ != null) {
+    out.sourceType = obj.sourceType != null ? obj.sourceType : obj.st_;
+  }
+  if (obj.kf) out.keyframes = decompressVideoKeyframes(obj.kf);
+  else if (obj.keyframes) out.keyframes = deepCloneJson(obj.keyframes);
+  if (obj.il || obj.imageLayout) {
+    out.imageLayout = decompressImageLayout(obj.il || obj.imageLayout);
+  }
+  return out;
+}
+
 function decompressAudioLikeBody(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const t = obj.tp || obj.type;
   if (t && t !== 'audioClip') return obj;
-  const compressed = obj.tp === 'audioClip' || obj.st_ !== undefined;
+  const compressed = obj.tp === 'audioClip' || (obj.st_ !== undefined && t !== 'imageClip');
   if (!compressed && obj.type === 'audioClip') return { ...obj };
 
   const out = {};
@@ -475,6 +575,7 @@ function decompressCreateElement(el) {
   if (!el || typeof el !== 'object') return el;
   const t = el.tp || el.type;
   if (t === 'subtitle' || (el.s && !el.style)) return decompressSubtitleLikeBody(el);
+  if (t === 'imageClip') return decompressImageClipLikeBody(el);
   if (t === 'videoClip' || (el.kf && !el.keyframes)) return decompressVideoLikeBody(el);
   if (t === 'audioClip' || el.st_ != null) return decompressAudioLikeBody(el);
   return el;

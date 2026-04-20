@@ -127,6 +127,20 @@ function serializeToRemotion(timelineState) {
     if (String(el.sourceType || '') === 'native' && typeof src === 'string' && src.startsWith('native://')) {
       nativeType = src.replace(/^native:\/\//, '');
     }
+    const defIL = { layoutMode: 'fullscreen', anchor: { x: 0, y: 0 }, box: { width: 1080, height: 1920 }, lockAspect: false };
+    const il = el.imageLayout && typeof el.imageLayout === 'object' ? el.imageLayout : {};
+    const imageLayout = {
+      layoutMode: il.layoutMode === 'custom' ? 'custom' : 'fullscreen',
+      anchor: {
+        x: il.anchor && typeof il.anchor.x === 'number' ? il.anchor.x : defIL.anchor.x,
+        y: il.anchor && typeof il.anchor.y === 'number' ? il.anchor.y : defIL.anchor.y,
+      },
+      box: {
+        width: il.box && typeof il.box.width === 'number' ? il.box.width : defIL.box.width,
+        height: il.box && typeof il.box.height === 'number' ? il.box.height : defIL.box.height,
+      },
+      lockAspect: !!il.lockAspect,
+    };
     return {
       id: el.id,
       absSrc: toAbsoluteUrl(src),
@@ -138,6 +152,7 @@ function serializeToRemotion(timelineState) {
       sourceType: el.sourceType || 'upload',
       nativeType,
       nativePayload: el.nativePayload && typeof el.nativePayload === 'object' ? el.nativePayload : {},
+      imageLayout,
       keyframes: {
         opacity: Array.isArray(el.keyframes && el.keyframes.opacity)
           ? el.keyframes.opacity
@@ -436,6 +451,28 @@ function VideoBlock(props) {
   );
 }
 
+/** Same geometry as preview imageBoxWrapperStyle (1080×1920, anchor = box center). */
+function imageClipLayoutStyle(clip) {
+  var il = clip.imageLayout;
+  if (!il || il.layoutMode !== 'custom') {
+    return { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' };
+  }
+  var ax = il.anchor && typeof il.anchor.x === 'number' ? il.anchor.x : 0;
+  var ay = il.anchor && typeof il.anchor.y === 'number' ? il.anchor.y : 0;
+  var bw = il.box && typeof il.box.width === 'number' ? il.box.width : VIDEO_W;
+  var bh = il.box && typeof il.box.height === 'number' ? il.box.height : VIDEO_H;
+  var xtl = ax - bw / 2;
+  var ytl = ay - bh / 2;
+  return {
+    position: 'absolute',
+    left: ((xtl + VIDEO_W / 2) / VIDEO_W) * 100 + '%',
+    top: ((ytl + VIDEO_H / 2) / VIDEO_H) * 100 + '%',
+    width: (bw / VIDEO_W) * 100 + '%',
+    height: (bh / VIDEO_H) * 100 + '%',
+    overflow: 'hidden',
+  };
+}
+
 function ImageClipBlock(props) {
   var clip = props.clip;
   var frame = useCurrentFrame();
@@ -444,21 +481,27 @@ function ImageClipBlock(props) {
   var op = interpolateKeyframes(opacityKF, localSec);
   var fit = clip.fitMode || 'cover';
   var p = clip.nativePayload || {};
+  var lw = imageClipLayoutStyle(clip);
+  var fill = { width: '100%', height: '100%', position: 'relative' };
 
   if (clip.sourceType === 'native' && clip.nativeType) {
     if (clip.nativeType === 'keyword_text') {
       return (
-        <AbsoluteFill style={{ zIndex: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
-          <div style={{
-            color: p.color || '#fff',
-            fontSize: (p.fontSize || 48) + 'px',
-            fontFamily: p.fontFamily || 'Arial',
-            fontWeight: p.fontWeight || '700',
-            background: p.background || 'rgba(0,0,0,0.55)',
-            padding: '8px 16px',
-            borderRadius: 4,
-            opacity: op,
-          }}>{p.text || ''}</div>
+        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+          <div style={lw}>
+            <div style={Object.assign({}, fill, { display: 'flex', alignItems: 'center', justifyContent: 'center' })}>
+              <div style={{
+                color: p.color || '#fff',
+                fontSize: (p.fontSize || 48) + 'px',
+                fontFamily: p.fontFamily || 'Arial',
+                fontWeight: p.fontWeight || '700',
+                background: p.background || 'rgba(0,0,0,0.55)',
+                padding: '8px 16px',
+                borderRadius: 4,
+                opacity: op,
+              }}>{p.text || ''}</div>
+            </div>
+          </div>
         </AbsoluteFill>
       );
     }
@@ -466,12 +509,16 @@ function ImageClipBlock(props) {
       var unit = p.unit != null ? String(p.unit) : '';
       return (
         <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
-          <div style={{
-            position: 'absolute', bottom: '20%', left: '50%', transform: 'translateX(-50%)',
-            background: 'rgba(0,0,0,0.75)', borderRadius: 8, padding: '16px 24px', textAlign: 'center', opacity: op,
-          }}>
-            <div style={{ fontSize: 48, fontWeight: 'bold', color: p.color || '#00BCD4' }}>{p.value || ''}{unit}</div>
-            <div style={{ fontSize: 16, color: '#ccc', marginTop: 4 }}>{p.label || ''}</div>
+          <div style={lw}>
+            <div style={fill}>
+              <div style={{
+                position: 'absolute', bottom: '20%', left: '50%', transform: 'translateX(-50%)',
+                background: 'rgba(0,0,0,0.75)', borderRadius: 8, padding: '16px 24px', textAlign: 'center', opacity: op,
+              }}>
+                <div style={{ fontSize: 48, fontWeight: 'bold', color: p.color || '#00BCD4' }}>{p.value || ''}{unit}</div>
+                <div style={{ fontSize: 16, color: '#ccc', marginTop: 4 }}>{p.label || ''}</div>
+              </div>
+            </div>
           </div>
         </AbsoluteFill>
       );
@@ -482,46 +529,64 @@ function ImageClipBlock(props) {
       var c = p.color || '#fff';
       var rot = dir === 'up' ? -90 : dir === 'down' ? 90 : dir === 'left' ? 180 : 0;
       return (
-        <AbsoluteFill style={{ zIndex: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none', opacity: op }}>
-          <svg width={sz * 2} height={sz * 2} viewBox="0 0 100 100" style={{ transform: 'rotate(' + rot + 'deg)' }}>
-            <polygon points="10,50 75,20 75,35 90,35 90,65 75,65 75,80" fill={c} />
-          </svg>
+        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+          <div style={lw}>
+            <div style={Object.assign({}, fill, { display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: op })}>
+              <svg width={sz * 2} height={sz * 2} viewBox="0 0 100 100" style={{ transform: 'rotate(' + rot + 'deg)' }}>
+                <polygon points="10,50 75,20 75,35 90,35 90,65 75,65 75,80" fill={c} />
+              </svg>
+            </div>
+          </div>
         </AbsoluteFill>
       );
     }
     if (clip.nativeType === 'highlight_box') {
       return (
-        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none', opacity: op }}>
-          <div style={{
-            position: 'absolute',
-            left: (p.x != null ? p.x : 0.2) * 100 + '%',
-            top: (p.y != null ? p.y : 0.35) * 100 + '%',
-            width: (p.width != null ? p.width : 0.6) * 100 + '%',
-            height: (p.height != null ? p.height : 0.25) * 100 + '%',
-            border: '3px solid ' + (p.color || '#00BCD4'),
-            opacity: p.opacity != null ? p.opacity : 1,
-            borderRadius: 4,
-          }} />
+        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+          <div style={lw}>
+            <div style={Object.assign({}, fill, { opacity: op })}>
+              <div style={{
+                position: 'absolute',
+                left: (p.x != null ? p.x : 0.2) * 100 + '%',
+                top: (p.y != null ? p.y : 0.35) * 100 + '%',
+                width: (p.width != null ? p.width : 0.6) * 100 + '%',
+                height: (p.height != null ? p.height : 0.25) * 100 + '%',
+                border: '3px solid ' + (p.color || '#00BCD4'),
+                opacity: p.opacity != null ? p.opacity : 1,
+                borderRadius: 4,
+              }} />
+            </div>
+          </div>
         </AbsoluteFill>
       );
     }
     if (clip.nativeType === 'callout') {
       return (
         <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
-          <div style={{
-            position: 'absolute', top: '12%', left: '8%',
-            background: 'rgba(0,0,0,0.82)', color: p.color || '#fff',
-            fontSize: (p.fontSize || 36) + 'px', padding: '12px 18px', borderRadius: 12,
-            border: '2px solid rgba(255,255,255,0.25)', maxWidth: '75%', opacity: op,
-          }}>
-            <div style={{ position: 'absolute', bottom: -10, left: 24, width: 0, height: 0,
-              borderLeft: '10px solid transparent', borderRight: '10px solid transparent', borderTop: '10px solid rgba(0,0,0,0.82)' }} />
-            {p.text || ''}
+          <div style={lw}>
+            <div style={fill}>
+              <div style={{
+                position: 'absolute', top: '12%', left: '8%',
+                background: 'rgba(0,0,0,0.82)', color: p.color || '#fff',
+                fontSize: (p.fontSize || 36) + 'px', padding: '12px 18px', borderRadius: 12,
+                border: '2px solid rgba(255,255,255,0.25)', maxWidth: '75%', opacity: op,
+              }}>
+                <div style={{ position: 'absolute', bottom: -10, left: 24, width: 0, height: 0,
+                  borderLeft: '10px solid transparent', borderRight: '10px solid transparent', borderTop: '10px solid rgba(0,0,0,0.82)' }} />
+                {p.text || ''}
+              </div>
+            </div>
           </div>
         </AbsoluteFill>
       );
     }
-    return <AbsoluteFill style={{ zIndex: 2, backgroundColor: 'rgba(0,0,0,0.4)', pointerEvents: 'none' }} />;
+    return (
+      <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+        <div style={lw}>
+          <div style={Object.assign({}, fill, { backgroundColor: 'rgba(0,0,0,0.4)' })} />
+        </div>
+      </AbsoluteFill>
+    );
   }
 
   var srcLower = String(clip.absSrc || '').toLowerCase();
@@ -529,10 +594,12 @@ function ImageClipBlock(props) {
   if (looksImage) {
     return (
       <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
-        <img
-          src={clip.absSrc}
-          style={{ width: '100%', height: '100%', objectFit: fit, opacity: op }}
-        />
+        <div style={lw}>
+          <img
+            src={clip.absSrc}
+            style={{ width: '100%', height: '100%', objectFit: fit, opacity: op }}
+          />
+        </div>
       </AbsoluteFill>
     );
   }
@@ -542,13 +609,15 @@ function ImageClipBlock(props) {
   var endAt = Math.max(startFrom + 1, Math.round(durSec * FPS));
   return (
     <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
-      <OffthreadVideo
-        src={clip.absSrc}
-        startFrom={startFrom}
-        endAt={endAt}
-        volume={clip.volume != null ? clip.volume : 0}
-        style={{ width: '100%', height: '100%', objectFit: fit, opacity: op }}
-      />
+      <div style={lw}>
+        <OffthreadVideo
+          src={clip.absSrc}
+          startFrom={startFrom}
+          endAt={endAt}
+          volume={clip.volume != null ? clip.volume : 0}
+          style={{ width: '100%', height: '100%', objectFit: fit, opacity: op }}
+        />
+      </div>
     </AbsoluteFill>
   );
 }

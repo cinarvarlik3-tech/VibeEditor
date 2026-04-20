@@ -1120,15 +1120,119 @@
   }
 
   // ── ImageClipProps (module scope) ─────────────────────────────────────────
-  function ImageClipProps({ element, elementId, update }) {
+  function ImageClipProps({ element, elementId, update, onPreviewPosition }) {
     const op = element.opacity != null ? element.opacity : 1;
     const [localOpacityPct, setLocalOpacityPct] = useState(Math.round(op * 100));
     const [localVol, setLocalVol] = useState(element.volume != null ? element.volume : 0);
+
+    const defLayout = window.TimelineSchema && window.TimelineSchema.defaultImageClipLayout
+      ? window.TimelineSchema.defaultImageClipLayout()
+      : { layoutMode: 'fullscreen', anchor: { x: 0, y: 0 }, box: { width: 1080, height: 1920 }, lockAspect: false };
+    const il = element.imageLayout && typeof element.imageLayout === 'object' ? element.imageLayout : {};
+    const merged = {
+      layoutMode: il.layoutMode === 'custom' ? 'custom' : 'fullscreen',
+      anchor: {
+        x: il.anchor && typeof il.anchor.x === 'number' ? il.anchor.x : defLayout.anchor.x,
+        y: il.anchor && typeof il.anchor.y === 'number' ? il.anchor.y : defLayout.anchor.y,
+      },
+      box: {
+        width: il.box && typeof il.box.width === 'number' ? il.box.width : defLayout.box.width,
+        height: il.box && typeof il.box.height === 'number' ? il.box.height : defLayout.box.height,
+      },
+      lockAspect: !!il.lockAspect,
+    };
+
+    const [localLayoutMode, setLocalLayoutMode] = useState(merged.layoutMode);
+    const [localAx, setLocalAx] = useState(merged.anchor.x);
+    const [localAy, setLocalAy] = useState(merged.anchor.y);
+    /** number while editing; '' = field cleared so user can type a new value (not committed until blur). */
+    const [localBw, setLocalBw] = useState(merged.box.width);
+    const [localBh, setLocalBh] = useState(merged.box.height);
+    const [localLock, setLocalLock] = useState(merged.lockAspect);
+
+    function resolveCommittedBoxDim(raw, fallback) {
+      if (raw === '') return fallback;
+      if (typeof raw === 'number' && Number.isFinite(raw)) return Math.max(0, Math.min(4000, raw));
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.max(0, Math.min(4000, n));
+    }
 
     useEffect(() => {
       setLocalOpacityPct(Math.round((element.opacity != null ? element.opacity : 1) * 100));
       setLocalVol(element.volume != null ? element.volume : 0);
     }, [elementId, element.opacity, element.volume]);
+
+    useEffect(() => {
+      const d = window.TimelineSchema && window.TimelineSchema.defaultImageClipLayout
+        ? window.TimelineSchema.defaultImageClipLayout()
+        : { layoutMode: 'fullscreen', anchor: { x: 0, y: 0 }, box: { width: 1080, height: 1920 }, lockAspect: false };
+      const m = element.imageLayout && typeof element.imageLayout === 'object' ? element.imageLayout : {};
+      setLocalLayoutMode(m.layoutMode === 'custom' ? 'custom' : 'fullscreen');
+      setLocalAx(m.anchor && typeof m.anchor.x === 'number' ? m.anchor.x : d.anchor.x);
+      setLocalAy(m.anchor && typeof m.anchor.y === 'number' ? m.anchor.y : d.anchor.y);
+      setLocalBw(m.box && typeof m.box.width === 'number' ? m.box.width : d.box.width);
+      setLocalBh(m.box && typeof m.box.height === 'number' ? m.box.height : d.box.height);
+      setLocalLock(!!m.lockAspect);
+    }, [
+      elementId,
+      element.imageLayout && element.imageLayout.layoutMode,
+      element.imageLayout && element.imageLayout.anchor && element.imageLayout.anchor.x,
+      element.imageLayout && element.imageLayout.anchor && element.imageLayout.anchor.y,
+      element.imageLayout && element.imageLayout.box && element.imageLayout.box.width,
+      element.imageLayout && element.imageLayout.box && element.imageLayout.box.height,
+      element.imageLayout && element.imageLayout.lockAspect,
+    ]);
+
+    useEffect(() => {
+      if (!onPreviewPosition || localLayoutMode !== 'custom') return;
+      const pw = typeof localBw === 'number' ? localBw : merged.box.width;
+      const ph = typeof localBh === 'number' ? localBh : merged.box.height;
+      onPreviewPosition({ elementId, x: localAx, y: localAy, w: pw, h: ph });
+    }, [elementId, localLayoutMode, localAx, localAy, localBw, localBh, merged.box.width, merged.box.height, onPreviewPosition]);
+
+    function commitLayoutFromLocals() {
+      const w = resolveCommittedBoxDim(localBw, merged.box.width);
+      const h = resolveCommittedBoxDim(localBh, merged.box.height);
+      setLocalBw(w);
+      setLocalBh(h);
+      update('imageLayout', {
+        layoutMode: localLayoutMode,
+        anchor:     { x: localAx, y: localAy },
+        box:        { width: w, height: h },
+        lockAspect: localLock,
+      });
+    }
+
+    function handleBoxWidthChange(v) {
+      if (v === '') {
+        setLocalBw('');
+        return;
+      }
+      const n = Number(v);
+      if (!Number.isFinite(n)) return;
+      const nw = Math.max(0, Math.min(4000, n));
+      setLocalBw(nw);
+      const ar = element.intrinsicAspect;
+      if (localLock && typeof ar === 'number' && ar > 0) {
+        setLocalBh(Math.max(0, Math.min(4000, Math.round(nw / ar))));
+      }
+    }
+
+    function handleBoxHeightChange(v) {
+      if (v === '') {
+        setLocalBh('');
+        return;
+      }
+      const n = Number(v);
+      if (!Number.isFinite(n)) return;
+      const nh = Math.max(0, Math.min(4000, n));
+      setLocalBh(nh);
+      const ar = element.intrinsicAspect;
+      if (localLock && typeof ar === 'number' && ar > 0) {
+        setLocalBw(Math.max(0, Math.min(4000, Math.round(nh * ar))));
+      }
+    }
 
     const SOURCE_BADGE = {
       upload:  { label: 'UPLOAD',  bg: 'rgba(0,137,123,0.2)',  color: '#00897B' },
@@ -1169,6 +1273,137 @@
             <option value="fill">Fill</option>
           </select>
         </PropRow>
+
+        <div style={{ width: '100%', height: 1, background: 'rgba(255,255,255,0.06)', margin: '12px 0' }} />
+
+        <PropRow label="LAYOUT">
+          <select
+            value={localLayoutMode}
+            onChange={e => {
+              const v = e.target.value;
+              setLocalLayoutMode(v);
+              if (v === 'fullscreen') {
+                const d = window.TimelineSchema.defaultImageClipLayout();
+                update('imageLayout', d);
+              } else {
+                update('imageLayout', {
+                  layoutMode: 'custom',
+                  anchor:     { x: localAx, y: localAy },
+                  box:        {
+                    width:  resolveCommittedBoxDim(localBw, merged.box.width),
+                    height: resolveCommittedBoxDim(localBh, merged.box.height),
+                  },
+                  lockAspect: localLock,
+                });
+              }
+            }}
+            style={{ ...inputStyle(), cursor: 'pointer' }}
+          >
+            <option value="fullscreen">Fullscreen (frame)</option>
+            <option value="custom">Custom box</option>
+          </select>
+        </PropRow>
+
+        {localLayoutMode === 'custom' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <PropRow label="ANCHOR X">
+                <input
+                  type="number"
+                  step={1}
+                  value={localAx}
+                  onChange={e => setLocalAx(Number(e.target.value))}
+                  onBlur={commitLayoutFromLocals}
+                  style={inputStyle(80)}
+                />
+              </PropRow>
+              <PropRow label="ANCHOR Y">
+                <input
+                  type="number"
+                  step={1}
+                  value={localAy}
+                  onChange={e => setLocalAy(Number(e.target.value))}
+                  onBlur={commitLayoutFromLocals}
+                  style={inputStyle(80)}
+                />
+              </PropRow>
+            </div>
+            <div style={{ color: '#555', fontSize: 9, marginTop: -4, marginBottom: 4 }}>
+              Origin at frame center (1080×1920 space): X −540…540, Y −960…960
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <PropRow label="BOX W">
+                <input
+                  type="number"
+                  step={1}
+                  min={0}
+                  max={4000}
+                  value={localBw === '' ? '' : localBw}
+                  onChange={e => handleBoxWidthChange(e.target.value)}
+                  onBlur={commitLayoutFromLocals}
+                  style={inputStyle(80)}
+                />
+              </PropRow>
+              <PropRow label="BOX H">
+                <input
+                  type="number"
+                  step={1}
+                  min={0}
+                  max={4000}
+                  value={localBh === '' ? '' : localBh}
+                  onChange={e => handleBoxHeightChange(e.target.value)}
+                  onBlur={commitLayoutFromLocals}
+                  style={inputStyle(80)}
+                />
+              </PropRow>
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: '#888', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={localLock}
+                onChange={e => {
+                  const checked = e.target.checked;
+                  setLocalLock(checked);
+                  update('imageLayout', {
+                    layoutMode: localLayoutMode,
+                    anchor:     { x: localAx, y: localAy },
+                    box:        {
+                      width:  resolveCommittedBoxDim(localBw, merged.box.width),
+                      height: resolveCommittedBoxDim(localBh, merged.box.height),
+                    },
+                    lockAspect: checked,
+                  });
+                }}
+              />
+              Lock aspect (needs intrinsic ratio from upload)
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                const d = window.TimelineSchema.defaultImageClipLayout();
+                setLocalLayoutMode('fullscreen');
+                setLocalAx(d.anchor.x);
+                setLocalAy(d.anchor.y);
+                setLocalBw(d.box.width);
+                setLocalBh(d.box.height);
+                setLocalLock(false);
+                update('imageLayout', d);
+              }}
+              style={{
+                alignSelf: 'flex-start',
+                fontSize: 11,
+                padding: '4px 10px',
+                borderRadius: 4,
+                border: '1px solid rgba(255,255,255,0.12)',
+                background: 'rgba(255,255,255,0.05)',
+                color: '#aaa',
+                cursor: 'pointer',
+              }}
+            >
+              Reset layout to fullscreen
+            </button>
+          </div>
+        )}
 
         {!element.isImage && (
           <PropRow label="VOLUME">
@@ -1499,7 +1734,9 @@
           />
         )}
         {element.type === 'videoClip' && <VideoClipProps element={element} elementId={elementId} update={update} />}
-        {element.type === 'imageClip' && <ImageClipProps element={element} elementId={elementId} update={update} />}
+        {element.type === 'imageClip' && (
+          <ImageClipProps element={element} elementId={elementId} update={update} onPreviewPosition={onPreviewPosition} />
+        )}
         {element.type === 'audioClip' && <AudioClipProps element={element} elementId={elementId} update={update} />}
       </div>
     );
