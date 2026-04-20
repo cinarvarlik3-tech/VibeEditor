@@ -288,6 +288,122 @@
     return best;
   }
 
+  function looksLikeImageFile(src, isImageFlag) {
+    if (isImageFlag) return true;
+    if (!src || typeof src !== 'string') return false;
+    return /\.(jpg|jpeg|png|gif|webp)(\?|#|$)/i.test(src);
+  }
+
+  function parseNativeVisualType(src) {
+    if (!src || typeof src !== 'string' || !src.startsWith('native://')) return null;
+    return src.slice('native://'.length) || null;
+  }
+
+  /** Active imageClip elements on visible image tracks at composition time `t`. */
+  function getActiveImageClips(tracks, t) {
+    var out = [];
+    if (!tracks || !tracks.image) return out;
+    var interpolate = window.TimelineReducer && window.TimelineReducer.interpolateKeyframes;
+    for (var ti = 0; ti < tracks.image.length; ti++) {
+      var tr = tracks.image[ti];
+      if (!tr.visible) continue;
+      for (var ei = 0; ei < tr.elements.length; ei++) {
+        var el = tr.elements[ei];
+        if (el.type !== 'imageClip' || !el.src) continue;
+        if (t < el.startTime || t >= el.endTime) continue;
+        var local = t - el.startTime;
+        var kf = el.keyframes && el.keyframes.opacity;
+        var op = interpolate && kf ? interpolate(kf, local) : (typeof el.opacity === 'number' ? el.opacity : 1);
+        out.push({ element: el, track: tr, localTime: local, opacity: op });
+      }
+    }
+    return out;
+  }
+
+  function renderNativeVisual(element, opacity) {
+    var p = element.nativePayload || {};
+    var t = parseNativeVisualType(element.src);
+    if (!t) return null;
+    var fit = element.fitMode || 'cover';
+    var base = {
+      position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+      pointerEvents: 'none', opacity: opacity,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    };
+    if (t === 'keyword_text') {
+      return React.createElement('div', { key: element.id + '-nt', style: base },
+        React.createElement('div', {
+          style: {
+            color: p.color || '#fff', fontSize: (p.fontSize || 48) + 'px',
+            fontFamily: p.fontFamily || 'Arial', fontWeight: p.fontWeight || '700',
+            background: p.background || 'rgba(0,0,0,0.55)', padding: '8px 16px', borderRadius: 4,
+          },
+        }, p.text || '')
+      );
+    }
+    if (t === 'stat_card') {
+      var unit = p.unit != null ? String(p.unit) : '';
+      return React.createElement('div', { key: element.id + '-sc', style: Object.assign({}, base, { alignItems: 'flex-end', paddingBottom: '18%' }) },
+        React.createElement('div', {
+          style: {
+            background: 'rgba(0,0,0,0.75)', borderRadius: 8, padding: '16px 24px', textAlign: 'center',
+          },
+        }, [
+          React.createElement('div', { key: 'v', style: { fontSize: 48, fontWeight: 'bold', color: p.color || '#00BCD4' } }, (p.value || '') + unit),
+          React.createElement('div', { key: 'l', style: { fontSize: 16, color: '#ccc', marginTop: 4 } }, p.label || ''),
+        ])
+      );
+    }
+    if (t === 'arrow') {
+      var dir = p.direction || 'right';
+      var sz = p.size || 64;
+      var c = p.color || '#fff';
+      var rot = dir === 'up' ? -90 : dir === 'down' ? 90 : dir === 'left' ? 180 : 0;
+      return React.createElement('div', { key: element.id + '-ar', style: base },
+        React.createElement('svg', { width: sz * 2, height: sz * 2, viewBox: '0 0 100 100', style: { transform: 'rotate(' + rot + 'deg)' } },
+          React.createElement('polygon', { points: '10,50 75,20 75,35 90,35 90,65 75,65 75,80', fill: c })
+        )
+      );
+    }
+    if (t === 'highlight_box') {
+      return React.createElement('div', { key: element.id + '-hb', style: Object.assign({}, base, { display: 'block' }) },
+        React.createElement('div', {
+          style: {
+            position: 'absolute',
+            left: ((p.x != null ? p.x : 0.2) * 100) + '%',
+            top: ((p.y != null ? p.y : 0.35) * 100) + '%',
+            width: ((p.width != null ? p.width : 0.6) * 100) + '%',
+            height: ((p.height != null ? p.height : 0.25) * 100) + '%',
+            border: '3px solid ' + (p.color || '#00BCD4'),
+            opacity: p.opacity != null ? p.opacity * opacity : opacity,
+            borderRadius: 4,
+          },
+        })
+      );
+    }
+    if (t === 'callout') {
+      return React.createElement('div', { key: element.id + '-co', style: Object.assign({}, base, { alignItems: 'flex-start', justifyContent: 'flex-start', padding: '10% 8%' }) },
+        React.createElement('div', {
+          style: {
+            position: 'relative', background: 'rgba(0,0,0,0.82)', color: p.color || '#fff',
+            fontSize: (p.fontSize || 36) + 'px', padding: '12px 18px', borderRadius: 12,
+            border: '2px solid rgba(255,255,255,0.25)', maxWidth: '75%',
+          },
+        }, [
+          React.createElement('div', {
+            key: 'tail',
+            style: {
+              position: 'absolute', bottom: -8, left: 24, width: 0, height: 0,
+              borderLeft: '8px solid transparent', borderRight: '8px solid transparent', borderTop: '8px solid rgba(0,0,0,0.82)',
+            },
+          }),
+          p.text || '',
+        ])
+      );
+    }
+    return null;
+  }
+
   // ── Overlay layer — memoized to decouple overlay renders from playback ──────
   // During playback the custom comparison skips re-renders as long as tracks,
   // previewDrag, and previewPosition are unchanged. React state updates at ~10fps
@@ -389,6 +505,7 @@
     const overlayRef  = useRef(null);
     const rafRef      = useRef(null);         // requestAnimationFrame id
     const audioRefs   = useRef(new Map());    // elementId → HTMLAudioElement
+    const imageBrollVideoRefs = useRef(new Map()); // elementId → HTMLVideoElement (image-track b-roll)
 
     // Refs for keyframe-based rAF property application
     const zoomWrapRef    = useRef(null);
@@ -578,6 +695,36 @@
               lastOpacityRef.current = opacity;
               if (zoomWrapRef.current) {
                 zoomWrapRef.current.style.opacity = String(opacity);
+              }
+            }
+          }
+
+          // 10b. Image-track b-roll <video> — keep in sync with composition clock
+          if (tracksRef.current && tracksRef.current.image) {
+            for (var ii = 0; ii < tracksRef.current.image.length; ii++) {
+              var imTr = tracksRef.current.image[ii];
+              if (!imTr.visible) continue;
+              for (var ij = 0; ij < imTr.elements.length; ij++) {
+                var imEl = imTr.elements[ij];
+                if (!imEl || imEl.type !== 'imageClip' || !imEl.src) continue;
+                var vel = imageBrollVideoRefs.current.get(imEl.id);
+                if (!vel) continue;
+                if (imEl.sourceType === 'native') {
+                  vel.pause();
+                  continue;
+                }
+                if (looksLikeImageFile(imEl.src, imEl.isImage)) {
+                  vel.pause();
+                  continue;
+                }
+                if (compTime < imEl.startTime || compTime >= imEl.endTime) {
+                  vel.pause();
+                  continue;
+                }
+                var iLocal = compTime - imEl.startTime;
+                if (Math.abs(vel.currentTime - iLocal) > 0.05) vel.currentTime = iLocal;
+                if (!video.paused && !video.ended) vel.play().catch(function() {});
+                else vel.pause();
               }
             }
           }
@@ -877,6 +1024,49 @@
     const hasVideoClips = tracks && tracks.video &&
       tracks.video.some(t => t.elements && t.elements.length > 0);
 
+    var imageLayerNodes = null;
+    if (tracks && tracks.image) {
+      var activeImg = getActiveImageClips(tracks, currentTime);
+      if (activeImg.length > 0) {
+        imageLayerNodes = activeImg.map(function(row) {
+          var el = row.element;
+          var op = row.opacity;
+          var fit = el.fitMode || 'cover';
+          var vol = el.volume !== undefined ? el.volume : 0;
+          if (el.sourceType === 'native') {
+            return renderNativeVisual(el, op);
+          }
+          if (looksLikeImageFile(el.src, el.isImage)) {
+            return React.createElement('img', {
+              key: el.id,
+              src: el.src,
+              alt: '',
+              draggable: false,
+              style: {
+                position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+                objectFit: fit, pointerEvents: 'none', opacity: op,
+              },
+            });
+          }
+          return React.createElement('video', {
+            key: el.id,
+            ref: function(node) {
+              if (node) imageBrollVideoRefs.current.set(el.id, node);
+              else imageBrollVideoRefs.current.delete(el.id);
+            },
+            src: el.src,
+            playsInline: true,
+            muted: !(vol > 0),
+            loop: false,
+            style: {
+              position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+              objectFit: fit, pointerEvents: 'none', opacity: op,
+            },
+          });
+        });
+      }
+    }
+
     return (
       <div style={{
         display:       'flex',
@@ -932,7 +1122,7 @@
               {/* Video layer — zoomWrapRef receives keyframe-interpolated transform/opacity from rAF */}
               <div
                 ref={zoomWrapRef}
-                style={{ width: '100%', height: '100%', transformOrigin: 'center center', overflow: 'hidden' }}
+                style={{ width: '100%', height: '100%', transformOrigin: 'center center', overflow: 'hidden', position: 'relative', zIndex: 1 }}
               >
                 <video
                   ref={videoRef}
@@ -942,10 +1132,14 @@
                 />
               </div>
 
-              {/* Coordinate grid — sits below element overlays (zIndex 1 vs elements' 10+) */}
-              {gridNode}
+              {/* Image layer — above source video, below subtitle overlay */}
+              {imageLayerNodes && imageLayerNodes.length > 0 ? (
+                <div style={{ position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', overflow: 'hidden' }}>
+                  {imageLayerNodes}
+                </div>
+              ) : null}
 
-              {/* DOM overlay layer — subtitles, effects, overlays, drag pill */}
+              {/* DOM overlay layer — grid, subtitles, drag pill */}
               <div
                 ref={overlayRef}
                 style={{
@@ -953,8 +1147,10 @@
                   inset:         0,
                   pointerEvents: 'none',
                   overflow:      'hidden',
+                  zIndex:        3,
                 }}
               >
+                {gridNode}
                 <OverlayLayer
                   tracks={tracks}
                   currentTime={currentTime}

@@ -127,11 +127,13 @@
         btn.textContent = loading ? 'Signing in…' : 'Sign in';
       }
 
-      if (window.Auth && window.Auth.getToken()) {
+      if (window.Auth && typeof window.Auth.verifySession === 'function') {
         window.Auth.verifySession().then(function (user) {
           if (user) {
             window.location.href = '/landing.html';
           }
+        }).catch(function () {
+          /* stay on login page; show form */
         });
       }
 

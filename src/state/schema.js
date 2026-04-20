@@ -29,13 +29,13 @@
  * This mirrors how CapCut handles effects: each clip has its own effects panel,
  * not a separate effects track.
  *
- * ARCHITECTURAL RULE — OVERLAYS AND IMAGES:
+ * ARCHITECTURAL RULE — IMAGE LAYER:
  *
- * Images and visual overlays are NOT a separate track type. When a user imports
- * an image (jpg/jpeg/png/gif/webp), the server automatically converts it to a
- * 10-second mp4 using ffmpeg. The resulting mp4 is treated identically to any
- * other video component — it becomes a videoClip element on the video track with
- * isImage: true.
+ * The image track sits above the video track and below subtitles in compositing
+ * order. imageClip elements overlay the source footage (b-roll / stills / native
+ * graphics). Uploaded raster images are still converted to mp4 server-side, but
+ * the frontend places them as imageClip on the image track when recommendedTrack
+ * is "image".
  *
  * ARCHITECTURAL RULE — MULTIPLE VIDEO COMPONENTS:
  *
@@ -71,21 +71,31 @@
     },
 
     tracks: {
-      video: [
-        {
-          id:       'track_video_0',
-          index:    0,
-          name:     'Video 1',
-          locked:   false,
-          visible:  true,
-          elements: [],
-        },
-      ],
       subtitle: [
         {
           id:       'track_sub_0',
           index:    0,
           name:     'Subtitle 1',
+          locked:   false,
+          visible:  true,
+          elements: [],
+        },
+      ],
+      image: [
+        {
+          id:       'track_image_0',
+          index:    0,
+          name:     'Image 1',
+          locked:   false,
+          visible:  true,
+          elements: [],
+        },
+      ],
+      video: [
+        {
+          id:       'track_video_0',
+          index:    0,
+          name:     'Video 1',
           locked:   false,
           visible:  true,
           elements: [],
@@ -214,6 +224,25 @@
     fadeOut:   number,   // seconds, default 0
     sourceName: string,  // display name: "lo-fi-chill.mp3" or "Freesound: Rain Ambience"
     sourceType: string,  // "upload" | "freesound" | "pixabay"
+  }
+
+  imageClip element:
+  {
+    id:               string,            // e.g. "elem_i_{ms}_{rand}"
+    type:             "imageClip",
+    startTime:        number,
+    endTime:          number,
+    src:              string,            // served URL — read-only after set (or "native://{type}")
+    originalFilename: string,
+    isImage:          boolean,           // true for PNG/JPG still pipeline; false for video b-roll mp4
+    sourceName:       string,            // display label
+    sourceType:       "upload" | "pixabay" | "native",
+    pixabayId:        number | null,
+    opacity:          number,            // 0.0–1.0 clip-level (keyframes.opacity also used in preview)
+    volume:           number,            // 0.0–1.0 for b-roll with audio
+    fitMode:          "cover" | "contain" | "fill",
+    nativePayload:    object | undefined, // when sourceType === "native", shape depends on native type
+    keyframes:        { opacity: [{ time: 0, value: 1.0, easing: "linear" }] }
   }
   */
 

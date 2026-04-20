@@ -135,10 +135,11 @@
     video:    'Video',
     subtitle: 'Subtitle',
     audio:    'Audio',
+    image:    'Image',
   };
 
   // Valid track types — effect and overlay are no longer supported
-  var VALID_TRACK_TYPES = new Set(['video', 'subtitle', 'audio']);
+  var VALID_TRACK_TYPES = new Set(['video', 'subtitle', 'audio', 'image']);
 
   // ---------------------------------------------------------------------------
   // History helpers
@@ -318,7 +319,7 @@
       case 'CREATE_TRACK': {
         const trackType = operation.trackType;
         if (!VALID_TRACK_TYPES.has(trackType)) {
-          console.warn('APPLY_OPERATIONS CREATE_TRACK: invalid trackType "' + trackType + '" — only video, subtitle, audio are supported');
+          console.warn('APPLY_OPERATIONS CREATE_TRACK: invalid trackType "' + trackType + '" — only video, subtitle, audio, image are supported');
           break;
         }
         if (!tracks[trackType]) {
@@ -659,6 +660,17 @@
           // Move to a different track
           let targetTrack = findTrackById(newTracks, newTrackId);
 
+          // Image layer: imageClip only on image tracks; no other element types on image tracks
+          if (result.element.type === 'imageClip') {
+            if (targetTrack && targetTrack.trackType !== 'image') {
+              console.warn('MOVE_ELEMENT: cannot move imageClip to a non-image track');
+              return state;
+            }
+          } else if (targetTrack && targetTrack.trackType === 'image') {
+            console.warn('MOVE_ELEMENT: cannot move non-imageClip element to the image track');
+            return state;
+          }
+
           // C1: Prevent cross-type moves (e.g. videoClip onto subtitle track)
           if (targetTrack && targetTrack.trackType !== result.trackType) {
             console.warn('MOVE_ELEMENT: cannot move element to a different track type');
@@ -984,6 +996,7 @@
           var pasteType = clipboardElement.type === 'videoClip' ? 'video'
             : clipboardElement.type === 'subtitle'  ? 'subtitle'
             : clipboardElement.type === 'audioClip' ? 'audio'
+            : clipboardElement.type === 'imageClip' ? 'image'
             : null;
           if (pasteType && newTracks[pasteType] && newTracks[pasteType].length > 0) {
             targetTrack = { track: newTracks[pasteType][0], trackType: pasteType };

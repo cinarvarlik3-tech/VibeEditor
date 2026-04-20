@@ -1243,4 +1243,6 @@ Scale: existing keyframe at time=0 value=1.0, new at time=4 value=1.3 → gradua
 Speed: playbackRate is a clip-level scalar updated via UPDATE, not keyframes.
 `;
 
-module.exports = { SYSTEM_PROMPT };
+const { VISUAL_COMPONENT_RULES } = require('./visualComponentRules');
+
+module.exports = { SYSTEM_PROMPT, VISUAL_COMPONENT_RULES };

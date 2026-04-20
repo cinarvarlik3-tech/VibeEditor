@@ -11,7 +11,7 @@
 (function () {
   const { useState, useEffect, useRef } = React;
   const { motion, AnimatePresence }     = Motion;
-  const { ArrowUp, Loader, AlertCircle, Undo2, Redo2, RotateCcw, Wand2, AlertTriangle, Info } = LucideReact;
+  const { ArrowUp, Loader, AlertCircle, Undo2, Redo2, RotateCcw, Wand2, AlertTriangle, Info, Image } = LucideReact;
 
   // ── Timestamp formatter ──────────────────────────────────────────────────
   function fmtTime(date) {
@@ -191,6 +191,242 @@
     );
   }
 
+  // ── Visual candidates (Pass 1) ───────────────────────────────────────────
+  function VisualCandidatesPanel({
+    msg,
+    onFindAssets,
+    onUseNative,
+    onCreateImageClip,
+    onClaudePickAsset,
+    projectId,
+  }) {
+    const [local, setLocal] = useState(function() {
+      var raw = (msg.content && msg.content.candidates) ? msg.content.candidates.slice() : [];
+      var list = raw.map(function(c, i) {
+        var uid = (c.candidate_id != null && c.candidate_id !== '')
+          ? ('cid_' + String(c.candidate_id))
+          : ('tmp_' + i + '_' + String(Date.now()) + '_' + Math.random().toString(36).slice(2, 8));
+        return Object.assign({}, c, { __vuid: uid });
+      });
+      return { list: list, expanded: {}, loading: {}, assets: {}, confirm: {}, warn: {} };
+    });
+
+    function fmtRange(c) {
+      var a = c.start_time != null ? c.start_time : c.startTime;
+      var b = c.end_time != null ? c.end_time : c.endTime;
+      return (Number(a) || 0).toFixed(1) + 's – ' + (Number(b) || 0).toFixed(1) + 's';
+    }
+
+    function priStyle(p) {
+      var x = String(p || '').toLowerCase();
+      if (x === 'critical') return { bg: 'rgba(239,68,68,0.2)', color: '#F87171', lab: 'CRITICAL' };
+      if (x === 'high') return { bg: 'rgba(249,115,22,0.2)', color: '#FB923C', lab: 'HIGH' };
+      if (x === 'medium') return { bg: 'rgba(234,179,8,0.2)', color: '#FACC15', lab: 'MEDIUM' };
+      return { bg: 'rgba(156,163,175,0.15)', color: '#9CA3AF', lab: 'LOW' };
+    }
+
+    function clsColor(mc) {
+      var palette = {
+        hook: '#22D3EE', explanation: '#A78BFA', proof: '#34D399', contrast: '#F472B6',
+        transition: '#94A3B8', example: '#FBBF24', instruction: '#60A5FA', entity_mention: '#C084FC',
+        emotional_peak: '#FB7185', payoff: '#4ADE80', CTA: '#38BDF8', retention_rescue: '#F97316',
+      };
+      return palette[mc] || '#64748B';
+    }
+
+    function vkey(cand) {
+      return cand.__vuid || String(cand.candidate_id != null ? cand.candidate_id : '');
+    }
+
+    async function onFindClick(cand) {
+      var k = vkey(cand);
+      setLocal(function(prev) {
+        var n = Object.assign({}, prev);
+        n.loading = Object.assign({}, n.loading, { [k]: true });
+        return n;
+      });
+      try {
+        var res = await onFindAssets(cand);
+        if (res.lowConfidence) {
+          setLocal(function(prev) {
+            var n = Object.assign({}, prev);
+            n.loading = Object.assign({}, n.loading, { [k]: false });
+            n.warn = Object.assign({}, n.warn, { [k]: 'Confidence too low for Pixabay retrieval. Use native component instead.' });
+            return n;
+          });
+          return;
+        }
+        if (res.searchError) {
+          setLocal(function(prev) {
+            var n = Object.assign({}, prev);
+            n.loading = Object.assign({}, n.loading, { [k]: false });
+            n.warn = Object.assign({}, n.warn, { [k]: String(res.searchError) });
+            return n;
+          });
+          return;
+        }
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.loading = Object.assign({}, n.loading, { [k]: false });
+          n.assets = Object.assign({}, n.assets, { [k]: res.assets || [] });
+          n.expanded = Object.assign({}, n.expanded, { [k]: true });
+          return n;
+        });
+      } catch (e) {
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.loading = Object.assign({}, n.loading, { [k]: false });
+          n.warn = Object.assign({}, n.warn, { [k]: String(e.message || e) });
+          return n;
+        });
+      }
+    }
+
+    async function onUseThis(cand, asset) {
+      try {
+        var hdr = { 'Content-Type': 'application/json' };
+        var tok = window.Auth && typeof window.Auth.getToken === 'function' && window.Auth.getToken();
+        if (tok) hdr.Authorization = 'Bearer ' + tok;
+        var r = await fetch('/api/pixabay/ingest', {
+          method:  'POST',
+          headers: hdr,
+          body: JSON.stringify({
+            assetId: asset.id,
+            assetType: asset.type,
+            downloadUrl: asset.downloadUrl,
+            projectId: projectId,
+            duration: asset.duration,
+          }),
+        });
+        var data = await r.json().catch(function() { return {}; });
+        if (!r.ok) throw new Error(data.error || 'Ingest failed');
+        var st = cand.start_time != null ? cand.start_time : cand.startTime;
+        var et = cand.end_time != null ? cand.end_time : cand.endTime;
+        onCreateImageClip({
+          src: data.permanentUrl,
+          storageRef: data.storageRef,
+          startTime: st,
+          endTime: et,
+          duration: data.duration,
+          sourceName: (function() {
+            var parts = [asset.contributor, asset.tags].filter(Boolean);
+            var s = parts.join(' · ');
+            return (s && s.slice(0, 120)) || 'Pixabay';
+          })(),
+          sourceType: 'pixabay',
+          pixabayId: asset.id,
+        });
+        var vk = vkey(cand);
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.confirm = Object.assign({}, n.confirm, { [vk]: 'Added to timeline' });
+          n.expanded = Object.assign({}, n.expanded, { [vk]: false });
+          return n;
+        });
+      } catch (e) {
+        window.alert(e.message || 'Ingest failed');
+      }
+    }
+
+    async function onClaudePick(cand, assets) {
+      var chosen = await onClaudePickAsset(cand, assets);
+      if (chosen) await onUseThis(cand, chosen);
+    }
+
+    function skipCand(vuid) {
+      setLocal(function(prev) {
+        var n = Object.assign({}, prev);
+        n.list = prev.list.filter(function(c) { return c.__vuid !== vuid; });
+        return n;
+      });
+    }
+
+    if (!local.list.length) {
+      return (
+        <div style={{ color: '#555', fontSize: 12, marginBottom: 12 }}>No visual candidates.</div>
+      );
+    }
+
+    return (
+      <div style={{ marginBottom: 14 }}>
+        {local.list.map(function(cand) {
+          var ps = priStyle(cand.priority);
+          var mc = cand.moment_class || '';
+          var vk = vkey(cand);
+          return (
+            <motion.div
+              key={vk}
+              layout
+              initial={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              style={{
+                background: '#1A1A1A',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: 8,
+                padding: 10,
+                marginBottom: 10,
+              }}
+            >
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+                <span style={{ fontSize: 10, color: '#888', fontFamily: 'monospace' }}>{fmtRange(cand)}</span>
+                <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 3, background: clsColor(mc) + '22', color: clsColor(mc) }}>{mc || '—'}</span>
+                <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 3, background: ps.bg, color: ps.color }}>{ps.lab}</span>
+              </div>
+              <div style={{ color: '#888', fontSize: 12, fontStyle: 'italic', marginBottom: 8 }}>{cand.reason || ''}</div>
+              {local.warn[vk] ? (
+                <div style={{ color: '#FBBF24', fontSize: 11, marginBottom: 6 }}>{local.warn[vk]}</div>
+              ) : null}
+              {local.confirm[vk] ? (
+                <div style={{ color: '#2DD4BF', fontSize: 11, marginBottom: 6 }}>{local.confirm[vk]}</div>
+              ) : null}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                <button type="button" onClick={function() { onFindClick(cand); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: 'none', background: '#0D9488', color: '#fff', cursor: 'pointer' }}>
+                  {local.loading[vk] ? 'Searching Pixabay…' : 'Find Components'}
+                </button>
+                <button type="button" onClick={function() { onUseNative(cand); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: '1px solid rgba(167,139,250,0.5)', background: 'rgba(139,92,246,0.15)', color: '#C4B5FD', cursor: 'pointer' }}>Native</button>
+                <button type="button" onClick={function() { skipCand(cand.__vuid); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#888', cursor: 'pointer' }}>Skip</button>
+              </div>
+              {local.expanded[vk] && local.assets[vk] && local.assets[vk].length > 0 ? (
+                <div style={{ marginTop: 10 }}>
+                  <button type="button" onClick={function() { onClaudePick(cand, local.assets[vk]); }} style={{ fontSize: 10, marginBottom: 8, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(45,212,191,0.4)', background: 'rgba(45,212,191,0.1)', color: '#5EEAD4', cursor: 'pointer' }}>Let Claude Pick</button>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6 }}>
+                    {local.assets[vk].slice(0, 9).map(function(asset) {
+                      var thumb = asset.thumbnailUrl || asset.previewUrl || '';
+                      return (
+                        <div
+                          key={asset.id}
+                          title={asset.contributor ? '© ' + asset.contributor : ''}
+                          style={{ position: 'relative', borderRadius: 6, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.06)', background: '#111' }}
+                        >
+                          {thumb ? (
+                            <img src={thumb} alt="" style={{ width: '100%', aspectRatio: '9/16', objectFit: 'cover', display: 'block' }} />
+                          ) : (
+                            <div style={{ width: '100%', aspectRatio: '9/16', background: '#222', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#555', fontSize: 10 }}>No preview</div>
+                          )}
+                          {asset.type === 'video' && asset.duration ? (
+                            <span style={{ position: 'absolute', top: 4, right: 4, fontSize: 9, background: 'rgba(0,0,0,0.65)', color: '#fff', padding: '1px 4px', borderRadius: 3 }}>{asset.duration}s</span>
+                          ) : null}
+                          <div style={{ padding: 4 }}>
+                            <button type="button" onClick={function() { onUseThis(cand, asset); }} style={{ width: '100%', fontSize: 10, padding: '3px 0', border: 'none', borderRadius: 4, background: '#0D9488', color: '#fff', cursor: 'pointer' }}>Use This</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 9, color: '#64748B', lineHeight: 1.4 }}>
+                    Photos and videos shown above are from{' '}
+                    <a href="https://pixabay.com/" target="_blank" rel="noopener noreferrer" style={{ color: '#5EEAD4' }}>Pixabay</a>
+                    {' '}(see Pixabay license for use).
+                  </div>
+                </div>
+              ) : null}
+            </motion.div>
+          );
+        })}
+      </div>
+    );
+  }
+
   // ── Empty state ──────────────────────────────────────────────────────────
   function EmptyState() {
     return (
@@ -247,6 +483,8 @@
     currentFile         = null,
     hasPromptCheckpoint = false,
     hasConversationHistory = false,
+    hasCachedTranscript = false,
+    projectId           = null,
     onSubmitPrompt,
     onUndo,
     onRedo,
@@ -254,6 +492,11 @@
     onQuickUndoLastEdit,
     onExplainLastChange,
     onClearConversationHistory,
+    onVisualScan,
+    onFindAssets,
+    onUseNative,
+    onCreateImageClip,
+    onClaudePickAsset,
   }) {
     const [inputText,  setInputText]  = useState('');
     const [language,   setLanguage]   = useState('Auto');
@@ -298,6 +541,18 @@
         case 'info':   return <InfoMessage   key={msg.id} msg={msg} />;
         case 'error':  return <ErrorMessage  key={msg.id} msg={msg} />;
         case 'result': return <ResultMessage key={msg.id} msg={msg} />;
+        case 'visual_candidates':
+          return (
+            <VisualCandidatesPanel
+              key={msg.id}
+              msg={msg}
+              projectId={projectId}
+              onFindAssets={onFindAssets}
+              onUseNative={onUseNative}
+              onCreateImageClip={onCreateImageClip}
+              onClaudePickAsset={onClaudePickAsset}
+            />
+          );
         default:       return null;
       }
     }
@@ -409,7 +664,6 @@
           padding:    '12px 16px',
         }}>
 
-          {/* Undo Last Prompt button — only shown when a prompt checkpoint exists */}
           {hasPromptCheckpoint && (
             <button
               onClick={onUndoLastPrompt}
@@ -490,38 +744,55 @@
             }}
           />
 
-          {hasConversationHistory && (
+          {(hasCachedTranscript || hasConversationHistory) && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
-              <button
-                type="button"
-                disabled={isProcessing}
-                onClick={() => onQuickUndoLastEdit && onQuickUndoLastEdit()}
-                style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
-                onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(0,188,212,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
-              >
-                Undo last edit
-              </button>
-              <button
-                type="button"
-                disabled={isProcessing}
-                onClick={() => onExplainLastChange && onExplainLastChange()}
-                style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
-                onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(0,188,212,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
-              >
-                Explain last change
-              </button>
-              <button
-                type="button"
-                disabled={isProcessing}
-                onClick={() => onClearConversationHistory && onClearConversationHistory()}
-                style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
-                onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(255,152,0,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
-              >
-                Clear history
-              </button>
+              {hasCachedTranscript && (
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => onVisualScan && onVisualScan()}
+                  style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                  onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(45,212,191,0.45)'; e.currentTarget.style.color = '#5EEAD4'; } }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+                >
+                  <Image size={12} />
+                  Scan for Visuals
+                </button>
+              )}
+              {hasConversationHistory && (
+                <React.Fragment>
+                  <button
+                    type="button"
+                    disabled={isProcessing}
+                    onClick={() => onQuickUndoLastEdit && onQuickUndoLastEdit()}
+                    style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
+                    onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(0,188,212,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+                  >
+                    Undo last edit
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isProcessing}
+                    onClick={() => onExplainLastChange && onExplainLastChange()}
+                    style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
+                    onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(0,188,212,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+                  >
+                    Explain last change
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isProcessing}
+                    onClick={() => onClearConversationHistory && onClearConversationHistory()}
+                    style={{ ...pillBtn, opacity: isProcessing ? 0.45 : 1 }}
+                    onMouseEnter={e => { if (!isProcessing) { e.currentTarget.style.borderColor = 'rgba(255,152,0,0.35)'; e.currentTarget.style.color = '#bbb'; } }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; e.currentTarget.style.color = '#888'; }}
+                  >
+                    Clear history
+                  </button>
+                </React.Fragment>
+              )}
             </div>
           )}
 

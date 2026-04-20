@@ -15,7 +15,7 @@
 
 require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
-const { SYSTEM_PROMPT } = require('./systemPrompt');
+const { SYSTEM_PROMPT, VISUAL_COMPONENT_RULES } = require('./systemPrompt');
 const { searchAudio }   = require('../assets/audio');
 
 const log = (...args) => console.log('[generate]', ...args);
@@ -135,11 +135,31 @@ function compressAudioElement(el) {
   return out;
 }
 
+function compressImageClipElement(el) {
+  const stripped = omitKeys(el, ['storageRef', 'pixabayId', 'nativePayload', 'src']);
+  const out = {
+    id: stripped.id,
+    st: stripped.startTime,
+    et: stripped.endTime,
+    tp: 'imageClip',
+  };
+  if (stripped.originalFilename !== undefined) out.fn = stripped.originalFilename;
+  if (stripped.sourceName !== undefined) out.sn = stripped.sourceName;
+  if (stripped.sourceType !== undefined) out.st_ = stripped.sourceType;
+  if (stripped.isImage !== undefined) out.ii = stripped.isImage;
+  if (stripped.opacity !== undefined) out.opv = stripped.opacity;
+  if (stripped.volume !== undefined) out.v = stripped.volume;
+  if (stripped.fitMode !== undefined) out.fm = stripped.fitMode;
+  if (stripped.keyframes) out.kf = compressVideoKeyframes(stripped.keyframes);
+  return out;
+}
+
 function compressElement(el) {
   if (!el || typeof el !== 'object') return el;
   if (el.type === 'subtitle') return compressSubtitleElement(el);
   if (el.type === 'videoClip') return compressVideoElement(el);
   if (el.type === 'audioClip') return compressAudioElement(el);
+  if (el.type === 'imageClip') return compressImageClipElement(el);
   return deepCloneJson(el);
 }
 
@@ -161,7 +181,7 @@ function compressTrack(track) {
 function compressTracks(tracks) {
   const raw = deepCloneJson(tracks || {});
   const out = {};
-  for (const kind of ['video', 'subtitle', 'audio']) {
+  for (const kind of ['video', 'subtitle', 'audio', 'image']) {
     if (!Array.isArray(raw[kind])) continue;
     out[kind] = raw[kind].map(compressTrack);
   }
@@ -1282,6 +1302,193 @@ async function generateOperations(
   return { operations, warnings, isExplanation: false, claudeUsage };
 }
 
+// ── Visual pipeline (Pass 1 / Pass 2) — VISUAL_COMPONENT_RULES never mixed into generateOperations ──
+
+const VISUAL_PASS_SYSTEM = () => `${SYSTEM_PROMPT.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
+
+function detectVisualIntent(prompt) {
+  const p = String(prompt || '').toLowerCase();
+  const keys = [
+    'b-roll', 'broll', 'visual', 'footage', 'cutaway', 'stock', 'overlay',
+    'image layer', 'add footage', 'pixabay', 'illustrate', 'emphasize visually',
+    'show footage', 'visual component', 'add visuals', 'suggest visuals',
+    'analyse visuals', 'analyze visuals', 'scan for visuals', 'scan visuals',
+  ];
+  return keys.some(k => p.includes(k));
+}
+
+function parseJsonArrayFromText(text) {
+  if (!text || typeof text !== 'string') return [];
+  let t = text.trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  try {
+    const parsed = JSON.parse(t);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function parseJsonObjectFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  let t = text.trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  try {
+    const parsed = JSON.parse(t);
+    if (Array.isArray(parsed)) return parsed[0] && typeof parsed[0] === 'object' ? parsed[0] : null;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * @param {Array<{startTime?:number,endTime?:number,text?:string}>} transcript
+ * @param {number} centerT
+ * @param {number} windowSec
+ */
+function extractTranscriptContext(transcript, centerT, windowSec) {
+  const w = typeof windowSec === 'number' && windowSec > 0 ? windowSec : 10;
+  const c = Number(centerT) || 0;
+  const lo = c - w;
+  const hi = c + w;
+  const segs = Array.isArray(transcript) ? transcript : [];
+  return segs.filter(s => {
+    const st = s.startTime != null ? s.startTime : s.start;
+    const et = s.endTime != null ? s.endTime : s.end;
+    if (typeof st !== 'number' || typeof et !== 'number') return false;
+    return et >= lo && st <= hi;
+  });
+}
+
+/**
+ * Pass 1 — visual candidate scan.
+ * @param {{ includeAllPriorities?: boolean }} [opts]
+ */
+async function generateVisualCandidates(
+  transcript,
+  stylePolicy,
+  keyMomentsPolicy,
+  visualContext,
+  opts = {}
+) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error('generateVisualCandidates: ANTHROPIC_API_KEY is not set');
+  }
+  const userMsg =
+    'PROMPT: Scan this transcript for visual component opportunities.\n' +
+    'TRANSCRIPT: ' + JSON.stringify(transcript || []) + '\n' +
+    'STYLE_VISUAL_POLICY: ' + JSON.stringify(stylePolicy || {}) + '\n' +
+    'KEY_MOMENTS_POLICY: ' + JSON.stringify(keyMomentsPolicy || {}) + '\n' +
+    'CURRENT_VISUAL_CONTEXT: ' + JSON.stringify(visualContext || {});
+
+  let response;
+  try {
+    response = await client.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 8000,
+      system:     VISUAL_PASS_SYSTEM(),
+      messages:   [{ role: 'user', content: userMsg }],
+    });
+  } catch (err) {
+    throw new Error('generateVisualCandidates: Claude API failed — ' + err.message);
+  }
+
+  const u = response.usage || {};
+  const inTok = Number(u.input_tokens != null ? u.input_tokens : u.inputTokens) || 0;
+  const outTok = Number(u.output_tokens != null ? u.output_tokens : u.outputTokens) || 0;
+  console.log('[visual-pass1] input_tokens=' + inTok + ' output_tokens=' + outTok);
+
+  const textBlock = response.content && response.content.find(b => b.type === 'text');
+  const rawText = textBlock && textBlock.text ? textBlock.text.trim() : '';
+  let arr = parseJsonArrayFromText(rawText);
+  if (!opts.includeAllPriorities) {
+    arr = arr.filter(c => {
+      const pr = String(c.priority || '').toLowerCase();
+      return pr === 'critical' || pr === 'high';
+    });
+  }
+  return arr;
+}
+
+async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error('generateRetrievalBrief: ANTHROPIC_API_KEY is not set');
+  }
+  const userMsg =
+    'PROMPT: Generate a retrieval brief for this visual candidate.\n' +
+    'CANDIDATE: ' + JSON.stringify(candidate || {}) + '\n' +
+    'TRANSCRIPT_CONTEXT: ' + JSON.stringify(transcriptContext || []) + '\n' +
+    'STYLE_VISUAL_POLICY: ' + JSON.stringify(stylePolicy || {});
+
+  let response;
+  try {
+    response = await client.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system:     VISUAL_PASS_SYSTEM(),
+      messages:   [{ role: 'user', content: userMsg }],
+    });
+  } catch (err) {
+    throw new Error('generateRetrievalBrief: Claude API failed — ' + err.message);
+  }
+
+  const u = response.usage || {};
+  const inTok = Number(u.input_tokens != null ? u.input_tokens : u.inputTokens) || 0;
+  const outTok = Number(u.output_tokens != null ? u.output_tokens : u.outputTokens) || 0;
+  console.log('[visual-pass2] input_tokens=' + inTok + ' output_tokens=' + outTok);
+
+  const textBlock = response.content && response.content.find(b => b.type === 'text');
+  const rawText = textBlock && textBlock.text ? textBlock.text.trim() : '';
+  const obj = parseJsonObjectFromText(rawText);
+  if (!obj) return null;
+
+  const conf = Number(obj.confidence_score);
+  if (!Number.isFinite(conf) || conf < 0.55) return null;
+
+  const req = [
+    'candidate_id', 'retrieval_query_primary', 'retrieval_query_alternates',
+    'required_orientation', 'required_asset_kind', 'confidence_score',
+  ];
+  for (const k of req) {
+    if (obj[k] === undefined || obj[k] === null) return null;
+  }
+  if (!Array.isArray(obj.retrieval_query_alternates)) return null;
+
+  return obj;
+}
+
+async function visualPipelineClaudePick(candidate, assets) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error('visualPipelineClaudePick: ANTHROPIC_API_KEY is not set');
+  }
+  const userMsg =
+    'Given these ranked visual assets for the moment described, choose the single best one. ' +
+    'Return only the asset id as a JSON object: { "chosen_id": <number> }\n\n' +
+    'CANDIDATE: ' + JSON.stringify(candidate || {}) + '\n' +
+    'ASSETS: ' + JSON.stringify(assets || []);
+
+  const response = await client.messages.create({
+    model:      'claude-sonnet-4-20250514',
+    max_tokens: 256,
+    system:     'You respond with JSON only. No markdown.',
+    messages:   [{ role: 'user', content: userMsg }],
+  });
+  const textBlock = response.content && response.content.find(b => b.type === 'text');
+  const raw = textBlock && textBlock.text ? textBlock.text.trim() : '{}';
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
+  } catch (_) {
+    parsed = {};
+  }
+  const id = parsed && parsed.chosen_id != null ? Number(parsed.chosen_id) : NaN;
+  if (!Number.isFinite(id)) throw new Error('visualPipelineClaudePick: invalid chosen_id');
+  return { chosen_id: id };
+}
+
 (function logCompressionRatioOnce() {
   try {
     const sampleSubtitle = {
@@ -1312,7 +1519,7 @@ async function generateOperations(
       },
     };
     const sampleTrack = { id: 'track_sub_0', index: 0, elements: [sampleSubtitle] };
-    const sampleTracks = { subtitle: [sampleTrack], video: [], audio: [] };
+    const sampleTracks = { subtitle: [sampleTrack], image: [], video: [], audio: [] };
     const compressed = compressTracks(sampleTracks);
     const before = JSON.stringify(sampleTracks).length;
     const after = JSON.stringify(compressed).length;
@@ -1335,4 +1542,9 @@ module.exports = {
   compressTracks,
   selectRelevantTracks,
   decompressOperations,
+  detectVisualIntent,
+  generateVisualCandidates,
+  generateRetrievalBrief,
+  visualPipelineClaudePick,
+  extractTranscriptContext,
 };

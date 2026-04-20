@@ -93,6 +93,15 @@
 
   function signOut() {
     clearAllSessionStorage();
+    var path = '';
+    try {
+      path = String(global.location.pathname || '').replace(/\/$/, '') || '/';
+    } catch (e) {
+      path = '/';
+    }
+    if (path === '/login' || path === '/login.html') {
+      return;
+    }
     global.location.href = '/login.html';
   }
 
@@ -207,22 +216,26 @@
    * @returns {Promise<{ id: string, email: string }|null>}
    */
   async function verifySession() {
-    await refreshIfNeeded();
-    var t = null;
     try {
-      t = lsGet(TOKEN_KEY) || lsGet(LEGACY_STORAGE_KEY);
-    } catch (e) {
-      return null;
-    }
-    if (!t) return null;
-    try {
-      var res = await fetch('/api/auth/verify', {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + t },
-      });
-      if (!res.ok) return null;
-      var data = await res.json();
-      return data.user || null;
+      await refreshIfNeeded();
+      var t = null;
+      try {
+        t = lsGet(TOKEN_KEY) || lsGet(LEGACY_STORAGE_KEY);
+      } catch (e) {
+        return null;
+      }
+      if (!t) return null;
+      try {
+        var res = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + t },
+        });
+        if (!res.ok) return null;
+        var data = await res.json();
+        return data.user || null;
+      } catch (e) {
+        return null;
+      }
     } catch (e) {
       return null;
     }

@@ -91,13 +91,16 @@
 
   // ── Migrate tracks schema — remove invalid track types, ensure required ones exist ──
   function migrateTracksSchema(tracks) {
-    const valid = new Set(['video', 'subtitle', 'audio']);
+    const valid = new Set(['video', 'subtitle', 'audio', 'image']);
     const cleaned = {};
     for (const [key, val] of Object.entries(tracks || {})) {
       if (valid.has(key)) cleaned[key] = val;
     }
-    if (!cleaned.video)    cleaned.video    = [{ id: 'track_video_0',  index: 0, name: 'Video 1',    locked: false, visible: true, elements: [] }];
     if (!cleaned.subtitle) cleaned.subtitle = [{ id: 'track_sub_0',   index: 0, name: 'Subtitle 1', locked: false, visible: true, elements: [] }];
+    if (!cleaned.image) {
+      cleaned.image = [{ id: 'track_image_0', index: 0, name: 'Image 1', locked: false, visible: true, elements: [] }];
+    }
+    if (!cleaned.video)    cleaned.video    = [{ id: 'track_video_0',  index: 0, name: 'Video 1',    locked: false, visible: true, elements: [] }];
     if (!cleaned.audio)    cleaned.audio    = [{ id: 'track_audio_0', index: 0, name: 'Audio 1',    locked: false, visible: true, elements: [] }];
     return cleaned;
   }
@@ -162,6 +165,17 @@
     return max;
   }
 
+  function findNextAvailableTimeOnTrackType(tracks, trackType) {
+    const arr = tracks && tracks[trackType] ? tracks[trackType] : [];
+    let max = 0;
+    for (const track of arr) {
+      for (const el of (track.elements || [])) {
+        if (el.endTime > max) max = el.endTime;
+      }
+    }
+    return max;
+  }
+
   /** How many timeline video clips use this server URL (e.g. /uploads/…). */
   function countVideoClipsWithSrc(tracks, src) {
     if (!src || !tracks || !tracks.video) return 0;
@@ -169,6 +183,17 @@
     for (const track of tracks.video) {
       for (const el of track.elements || []) {
         if (el.type === 'videoClip' && el.src === src) n++;
+      }
+    }
+    return n;
+  }
+
+  function countImageClipsWithSrc(tracks, src) {
+    if (!src || !tracks || !tracks.image) return 0;
+    let n = 0;
+    for (const track of tracks.image) {
+      for (const el of track.elements || []) {
+        if (el.type === 'imageClip' && el.src === src) n++;
       }
     }
     return n;
@@ -742,15 +767,15 @@
     // For each imported file:
     //   1. Add to media library immediately (optimistic UI)
     //   2. Upload to server (images are auto-converted to mp4 by the server)
-    //   3. Dispatch APPLY_OPERATIONS CREATE to place a videoClip on the timeline
+    //   3. Dispatch APPLY_OPERATIONS CREATE to place a videoClip or imageClip on the timeline
     //   4. Dispatch LOAD_SOURCE only once (Correction 1) to set project metadata,
     //      only if no source file has been set yet (state.source.filename === null)
     const handleMediaImport = useCallback(async (files) => {
       const items = await Promise.all(Array.from(files).map(createMediaItem));
       setMediaItems(prev => [...prev, ...items]);
 
-      // Track start position for sequential placement (React state won't update mid-loop)
-      let nextStart = findNextAvailableTime(state.tracks.video);
+      let nextStartVideo = findNextAvailableTime(state.tracks.video);
+      let nextStartImage = findNextAvailableTimeOnTrackType(state.tracks, 'image');
 
       for (const item of items) {
         const formData = new FormData();
@@ -803,37 +828,65 @@
           }
 
           const clipDuration = data.duration || 10;
-          const newId = 'elem_v_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
-          const clip = {
-            id:               newId,
-            type:             'videoClip',
-            startTime:        nextStart,
-            endTime:          nextStart + clipDuration,
-            sourceStart:      0,
-            sourceEnd:        clipDuration,
-            playbackRate:     1.0,
-            volume:           1.0,
-            src:              primary,
-            originalFilename: data.originalFilename || item.filename,
-            isImage:          data.isImage || false,
-            imageDuration:    data.isImage ? clipDuration : null,
-            keyframes: {
-              scale:   [{ time: 0, value: 1.0, easing: 'linear' }],
-              opacity: [{ time: 0, value: 1.0, easing: 'linear' }],
-            },
-          };
-          if (data.storageRef) clip.storageRef = data.storageRef;
-          dispatch({
-            type:    'APPLY_OPERATIONS',
-            payload: { operations: [{ op: 'CREATE', trackId: 'track_video_0', element: clip }], promptText: null },
-          });
-          nextStart += clipDuration;
+          const rec = data.recommendedTrack === 'image' ? 'image' : 'video';
+
+          if (rec === 'image') {
+            const newId = 'elem_i_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+            const iclip = {
+              id:               newId,
+              type:             'imageClip',
+              startTime:        nextStartImage,
+              endTime:          nextStartImage + clipDuration,
+              src:              primary,
+              originalFilename: data.originalFilename || item.filename,
+              isImage:          true,
+              sourceName:       data.originalFilename || item.filename,
+              sourceType:       'upload',
+              pixabayId:        null,
+              opacity:          1.0,
+              volume:           0.0,
+              fitMode:          'cover',
+              keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+            };
+            if (data.storageRef) iclip.storageRef = data.storageRef;
+            dispatch({
+              type:    'APPLY_OPERATIONS',
+              payload: { operations: [{ op: 'CREATE', trackId: 'track_image_0', element: iclip }], promptText: null },
+            });
+            nextStartImage += clipDuration;
+          } else {
+            const newId = 'elem_v_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+            const clip = {
+              id:               newId,
+              type:             'videoClip',
+              startTime:        nextStartVideo,
+              endTime:          nextStartVideo + clipDuration,
+              sourceStart:      0,
+              sourceEnd:        clipDuration,
+              playbackRate:     1.0,
+              volume:           1.0,
+              src:              primary,
+              originalFilename: data.originalFilename || item.filename,
+              isImage:          data.isImage || false,
+              imageDuration:    data.isImage ? clipDuration : null,
+              keyframes: {
+                scale:   [{ time: 0, value: 1.0, easing: 'linear' }],
+                opacity: [{ time: 0, value: 1.0, easing: 'linear' }],
+              },
+            };
+            if (data.storageRef) clip.storageRef = data.storageRef;
+            dispatch({
+              type:    'APPLY_OPERATIONS',
+              payload: { operations: [{ op: 'CREATE', trackId: 'track_video_0', element: clip }], promptText: null },
+            });
+            nextStartVideo += clipDuration;
+          }
 
         } catch (err) {
           console.error('Upload error:', err);
         }
       }
-    }, [state.source.filename, state.tracks.video, projectId]);
+    }, [state.source.filename, state.tracks.video, state.tracks.image, projectId]);
 
     const handleMediaRemove = useCallback((id) => {
       setMediaItems(prev => prev.filter(m => m.id !== id));
@@ -907,6 +960,7 @@
       function syncSourceAndMaybeAppendClip(data) {
         const clipDuration = data.duration || item.duration || 10;
         const primary = uploadResponsePrimaryUrl(data);
+        const rec = data.recommendedTrack === 'image' ? 'image' : 'video';
         setUploadedVideoPath(primary);
         dispatch({
           type: 'LOAD_SOURCE',
@@ -916,13 +970,42 @@
             width:      data.width  || 1080,
             height:     data.height || 1920,
             fps:        30,
-            fileSize:   item._file.size,
+            fileSize:   item._file ? item._file.size : 0,
             thumbnails: item.thumbnailUrl ? [item.thumbnailUrl] : [],
           },
         });
 
-        const existing = countVideoClipsWithSrc(stateTracksRef.current, primary);
-        if (!forceNewClip && existing > 0) return;
+        const existingV = countVideoClipsWithSrc(stateTracksRef.current, primary);
+        const existingI = countImageClipsWithSrc(stateTracksRef.current, primary);
+        if (!forceNewClip && rec === 'image' && existingI > 0) return;
+        if (!forceNewClip && rec === 'video' && existingV > 0) return;
+
+        if (rec === 'image') {
+          const nextStart = findNextAvailableTimeOnTrackType(stateTracksRef.current, 'image');
+          const newId = 'elem_i_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const el = {
+            id:               newId,
+            type:             'imageClip',
+            startTime:        nextStart,
+            endTime:          nextStart + clipDuration,
+            src:              primary,
+            originalFilename: data.originalFilename || item.filename,
+            isImage:          true,
+            sourceName:       data.originalFilename || item.filename,
+            sourceType:       'upload',
+            pixabayId:        null,
+            opacity:          1.0,
+            volume:           0.0,
+            fitMode:          'cover',
+            keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+          };
+          if (data.storageRef) el.storageRef = data.storageRef;
+          dispatch({
+            type:    'APPLY_OPERATIONS',
+            payload: { operations: [{ op: 'CREATE', trackId: 'track_image_0', element: el }], promptText: null },
+          });
+          return;
+        }
 
         const nextStart = findNextAvailableTime(stateTracksRef.current.video);
         const newId     = 'elem_v_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
@@ -964,6 +1047,7 @@
           height:           item.uploadedHeight,
           isImage:          item.uploadedIsImage,
           originalFilename: item.uploadedOriginalFilename,
+          recommendedTrack: item.uploadedIsImage ? 'image' : 'video',
         });
         if (/^https?:\/\//i.test(p)) setPreviewSrc(p);
         return;
@@ -1023,6 +1107,159 @@
         prev.map(m => m.type === 'status' ? { ...m, content } : m)
       );
     }, []);
+
+    const handleVisualScan = useCallback(async () => {
+      if (!cachedTranscript || !Array.isArray(cachedTranscript)) return;
+      try {
+        const r = await fetch('/api/visual/scan', {
+          method:  'POST',
+          headers: authHeadersJson(),
+          body:    JSON.stringify({
+            projectId:          projectId || '',
+            transcript:         cachedTranscript,
+            stylePolicy:        {},
+            keyMomentsPolicy:   {},
+            visualContext:      {},
+          }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || 'Scan failed');
+        const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+        addMessage({
+          id:        'vc-' + Date.now(),
+          role:      'system',
+          type:      'visual_candidates',
+          content:   { candidates },
+          timestamp: new Date(),
+        });
+      } catch (e) {
+        addMessage({
+          id:        'err-' + Date.now(),
+          role:      'system',
+          type:      'error',
+          content:   e.message || 'Visual scan failed',
+          timestamp: new Date(),
+        });
+      }
+    }, [cachedTranscript, projectId, addMessage]);
+
+    const handleFindAssets = useCallback(async (candidate) => {
+      const r = await fetch('/api/visual/brief', {
+        method:  'POST',
+        headers: authHeadersJson(),
+        body:    JSON.stringify({
+          candidate,
+          transcript: cachedTranscript || [],
+          stylePolicy: {},
+        }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || 'Brief failed');
+      if (!data.brief) {
+        return { assets: [], lowConfidence: true };
+      }
+      const b = data.brief;
+      const kind = b.required_asset_kind === 'image' ? 'image' : 'video';
+      const orient = b.required_orientation === 'portrait' ? 'portrait' : 'all';
+      const qStr = String(b.retrieval_query_primary || '').trim().slice(0, 100);
+      if (!qStr) {
+        return { assets: [], lowConfidence: false, searchError: 'Brief did not include a search query.' };
+      }
+      const qs = new URLSearchParams({
+        q:             qStr,
+        asset_type:    kind,
+        per_page:      '9',
+        orientation:   orient,
+      });
+      const pr = await fetch('/api/pixabay/search?' + qs.toString(), { headers: authHeadersBearer() });
+      const pd = await pr.json().catch(() => ({}));
+      if (!pr.ok) {
+        return {
+          assets: [],
+          lowConfidence: false,
+          searchError: pd.error || pd.message || 'Pixabay search failed',
+        };
+      }
+      return { assets: pd.results || [], lowConfidence: false };
+    }, [cachedTranscript]);
+
+    const handleClaudePickAsset = useCallback(async (candidate, assets) => {
+      const r = await fetch('/api/visual/claude-pick', {
+        method:  'POST',
+        headers: authHeadersJson(),
+        body:    JSON.stringify({ candidate, assets }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.chosen_id == null) return null;
+      const id = Number(data.chosen_id);
+      return (assets || []).find(a => a.id === id) || null;
+    }, []);
+
+    const handleCreateImageClip = useCallback((payload) => {
+      const {
+        src, storageRef, startTime, endTime, duration, sourceName, sourceType, pixabayId,
+      } = payload || {};
+      const dur = typeof duration === 'number' && duration > 0 ? duration : Math.max(0.5, (endTime || 0) - (startTime || 0));
+      const newId = 'elem_i_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+      const el = {
+        id:               newId,
+        type:             'imageClip',
+        startTime:        startTime != null ? startTime : 0,
+        endTime:          endTime != null ? endTime : (startTime != null ? startTime : 0) + dur,
+        src,
+        originalFilename: sourceName || 'pixabay',
+        isImage:          false,
+        sourceName:       sourceName || 'B-roll',
+        sourceType:       sourceType || 'pixabay',
+        pixabayId:        pixabayId != null ? pixabayId : null,
+        opacity:          1.0,
+        volume:           0.3,
+        fitMode:          'cover',
+        keyframes:        { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+      };
+      if (storageRef) el.storageRef = storageRef;
+      dispatch({
+        type:    'APPLY_OPERATIONS',
+        payload: { operations: [{ op: 'CREATE', trackId: 'track_image_0', element: el }], promptText: null },
+      });
+    }, [dispatch]);
+
+    const handleUseNative = useCallback((candidate) => {
+      const st = candidate.start_time != null ? candidate.start_time : candidate.startTime;
+      const et = candidate.end_time != null ? candidate.end_time : candidate.endTime;
+      const start = typeof st === 'number' ? st : 0;
+      const end = typeof et === 'number' && et > start ? et : start + 1.5;
+      const anchor = String(candidate.spoken_text_anchor || candidate.reason || 'Highlight').slice(0, 80);
+      const newId = 'elem_i_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+      const el = {
+        id:               newId,
+        type:             'imageClip',
+        startTime:        start,
+        endTime:          end,
+        src:              'native://keyword_text',
+        originalFilename: 'native',
+        isImage:          false,
+        sourceName:       'Native overlay',
+        sourceType:       'native',
+        pixabayId:        null,
+        opacity:          1.0,
+        volume:           0,
+        fitMode:          'cover',
+        nativePayload:    {
+          text: anchor,
+          color: '#FFFFFF',
+          fontSize: 52,
+          fontFamily: 'Inter, system-ui, sans-serif',
+          fontWeight: '700',
+          background: 'rgba(0,0,0,0.55)',
+        },
+        keyframes: { opacity: [{ time: 0, value: 1.0, easing: 'linear' }] },
+      };
+      dispatch({
+        type:    'APPLY_OPERATIONS',
+        payload: { operations: [{ op: 'CREATE', trackId: 'track_image_0', element: el }], promptText: null },
+      });
+    }, [dispatch]);
 
     const maybeRollUpConversation = useCallback(async (tenExchanges) => {
       if (!Array.isArray(tenExchanges) || tenExchanges.length !== 10 || !projectId) return;
@@ -1584,6 +1821,7 @@
             }
             hasPromptCheckpoint={hasPromptCheckpoint}
             hasConversationHistory={conversationHistory.length > 0}
+            hasCachedTranscript={!!cachedTranscript}
             onSubmitPrompt={handleSubmitPrompt}
             onUndo={handleUndo}
             onRedo={handleRedo}
@@ -1591,6 +1829,12 @@
             onQuickUndoLastEdit={handleQuickUndoLastEdit}
             onExplainLastChange={handleExplainLastChange}
             onClearConversationHistory={handleClearConversationHistory}
+            onVisualScan={handleVisualScan}
+            onFindAssets={handleFindAssets}
+            onUseNative={handleUseNative}
+            onCreateImageClip={handleCreateImageClip}
+            onClaudePickAsset={handleClaudePickAsset}
+            projectId={projectId}
           />
         </div>
 

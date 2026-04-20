@@ -46,7 +46,14 @@ const { createClient } = require('@supabase/supabase-js');
 const { extractAudio, convertImageToVideo, extractThumbnailAtPercent } = require('./video/extract');
 const { serializeToRemotion } = require('./video/serializeToRemotion');
 const { transcribeAudio }     = require('./transcription/transcribe');
-const { generateOperations, summarizeEditingConversation } = require('./claude/generate');
+const {
+  generateOperations,
+  summarizeEditingConversation,
+  generateVisualCandidates,
+  generateRetrievalBrief,
+  extractTranscriptContext,
+  visualPipelineClaudePick,
+} = require('./claude/generate');
 const { searchFreesound, searchJamendo, searchAudio } = require('./assets/audio');
 
 const supabaseAdmin =
@@ -71,6 +78,16 @@ const supabaseAdmin =
       bucket_id = 'audio' AND
       auth.uid()::text = (storage.foldername(name))[1]
     );
+
+  -- image-layer bucket policy
+  create policy "users manage own image layer" on storage.objects
+    for all using (
+      bucket_id = 'image-layer' AND
+      auth.uid()::text = (storage.foldername(name))[1]
+    );
+
+  -- Create image-layer bucket manually in Supabase dashboard if
+  -- ensureStorageBuckets() fails due to permissions.
 
   create policy "thumbnails are public" on storage.objects
     for select using (bucket_id = 'thumbnails');
@@ -340,7 +357,7 @@ function getVideoDuration(filePath) {
 
 async function ensureStorageBuckets() {
   if (!supabaseAdmin) return;
-  const buckets = ['videos', 'thumbnails', 'audio'];
+  const buckets = ['videos', 'thumbnails', 'audio', 'image-layer'];
   for (const bucket of buckets) {
     const { error } = await supabaseAdmin.storage.createBucket(bucket, {
       public: bucket === 'thumbnails',
@@ -381,7 +398,7 @@ async function uploadBufferToSupabase(bucket, storagePath, buffer, contentType) 
 async function hydrateTimelineMediaUrlsAsync(timeline) {
   if (!timeline || typeof timeline !== 'object' || !timeline.tracks) return timeline;
   const out = JSON.parse(JSON.stringify(timeline));
-  const types = ['video', 'audio'];
+  const types = ['video', 'audio', 'image'];
   for (const tt of types) {
     const rows = out.tracks[tt];
     if (!Array.isArray(rows)) continue;
@@ -521,6 +538,7 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
     await deleteStorageFolder('videos', prefix);
     await deleteStorageFolder('audio', prefix);
     await deleteStorageFolder('thumbnails', prefix);
+    await deleteStorageFolder('image-layer', prefix);
 
     const { error } = await supabaseAdmin.from('projects').delete().eq('id', req.params.id);
     if (error) throw error;
@@ -613,8 +631,7 @@ app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
     const isAudio = mimetype.startsWith('audio/') && !isImageOut;
     const localUrl = '/uploads/' + finalFilename;
 
-    // ── Step 1: fast local processing (multer has already saved the file) ──
-    res.json({
+    const uploadJson = {
       filename: finalFilename,
       path: localUrl,
       permanentUrl: localUrl,
@@ -626,13 +643,19 @@ app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
       width,
       height,
       thumbnailUrl: null,
-    });
+    };
+    if (!isAudio) {
+      uploadJson.recommendedTrack = isImage ? 'image' : 'video';
+    }
+
+    // ── Step 1: fast local processing (multer has already saved the file) ──
+    res.json(uploadJson);
 
     // ── Step 2: background Supabase work (does not block response) ─────────
     setImmediate(() => {
       void (async () => {
         try {
-          const bucket = isAudio ? 'audio' : 'videos';
+          const bucket = isAudio ? 'audio' : (isImage ? 'image-layer' : 'videos');
           const storagePath = `${userId}/${projectId}/${finalFilename}`;
           const buf = fs.readFileSync(finalPath);
           const contentType = isAudio ? mimetype : 'video/mp4';
@@ -827,6 +850,253 @@ app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
   } catch (err) {
     log(`summarize-conversation error: ${err.message}`);
     res.status(500).json({ error: err.message || 'Summarization failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Pixabay + visual pipeline (server-side only — key never sent to browser)
+// ---------------------------------------------------------------------------
+
+/** In-memory Pixabay search cache (24h TTL per Pixabay API caching guidance). */
+const pixabaySearchCache = new Map(); // key -> { expiresAt, payload }
+
+function pixabayCacheGet(key) {
+  const row = pixabaySearchCache.get(key);
+  if (!row) return null;
+  if (Date.now() > row.expiresAt) {
+    pixabaySearchCache.delete(key);
+    return null;
+  }
+  return row.payload;
+}
+
+function pixabayCacheSet(key, payload) {
+  // Pixabay API docs: identical queries should be cached up to 24 hours.
+  pixabaySearchCache.set(key, { expiresAt: Date.now() + 24 * 60 * 60 * 1000, payload });
+  for (const [k, v] of pixabaySearchCache) {
+    if (Date.now() > v.expiresAt) pixabaySearchCache.delete(k);
+  }
+}
+
+function normalizePixabayVideo(hit) {
+  const vids = hit.videos || {};
+  const previewUrl = (vids.tiny && vids.tiny.url) || (vids.small && vids.small.url) || '';
+  const downloadUrl = (vids.large && vids.large.url) || (vids.medium && vids.medium.url) || (vids.small && vids.small.url) || previewUrl;
+  const w = (vids.medium && vids.medium.width) || (vids.small && vids.small.width) || 0;
+  const h = (vids.medium && vids.medium.height) || (vids.small && vids.small.height) || 0;
+  const thumbnailUrl =
+    (vids.large && vids.large.thumbnail) ||
+    (vids.medium && vids.medium.thumbnail) ||
+    (vids.small && vids.small.thumbnail) ||
+    (vids.tiny && vids.tiny.thumbnail) ||
+    '';
+  return {
+    id:             hit.id,
+    type:           'video',
+    previewUrl,
+    thumbnailUrl,
+    downloadUrl,
+    duration:       typeof hit.duration === 'number' ? hit.duration : null,
+    width:          Number(w) || 0,
+    height:         Number(h) || 0,
+    tags:           hit.tags || '',
+    contributor:    hit.user || '',
+    pageURL:        hit.pageURL || '',
+  };
+}
+
+function normalizePixabayImage(hit) {
+  const previewUrl = hit.previewURL || hit.webformatURL || '';
+  return {
+    id:             hit.id,
+    type:           'image',
+    previewUrl,
+    thumbnailUrl:   previewUrl,
+    downloadUrl:    hit.largeImageURL || hit.imageURL || hit.webformatURL || '',
+    duration:       null,
+    width:          hit.imageWidth || 0,
+    height:         hit.imageHeight || 0,
+    tags:           hit.tags || '',
+    contributor:    hit.user || '',
+    pageURL:        hit.pageURL || '',
+  };
+}
+
+app.get('/api/pixabay/search', requireAuth, async (req, res) => {
+  const key = process.env.PIXABAY_API_KEY;
+  if (!key) return res.status(503).json({ results: [], error: 'PIXABAY_API_KEY not configured' });
+  const qRaw = String(req.query.q || '').trim();
+  if (!qRaw) return res.status(400).json({ results: [], error: 'q is required' });
+  const q = qRaw.length > 100 ? qRaw.slice(0, 100) : qRaw;
+  const assetType = String(req.query.asset_type || 'video').toLowerCase();
+  let perPage = parseInt(String(req.query.per_page || '9'), 10);
+  if (!Number.isFinite(perPage) || perPage < 1) perPage = 9;
+  perPage = Math.min(20, Math.max(1, perPage));
+  const orientation = String(req.query.orientation || 'all').toLowerCase();
+
+  const cacheKey = JSON.stringify({ q, assetType, perPage, orientation });
+  const cached = pixabayCacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  const results = [];
+  const pushNorm = (arr, normFn) => {
+    for (const h of arr || []) {
+      try {
+        results.push(normFn(h));
+      } catch (_) { /* skip */ }
+    }
+  };
+
+  try {
+    if (assetType === 'image') {
+      const params = {
+        key,
+        q,
+        per_page: perPage,
+        image_type: 'photo',
+        safesearch: 'true',
+      };
+      if (orientation === 'portrait') params.orientation = 'vertical';
+      const r = await axios.get('https://pixabay.com/api/', { params, timeout: 20000 });
+      pushNorm(r.data && r.data.hits, normalizePixabayImage);
+    } else if (assetType === 'video') {
+      const r = await axios.get('https://pixabay.com/api/videos/', {
+        params: { key, q, per_page: perPage, video_type: 'all', safesearch: 'true' },
+        timeout: 20000,
+      });
+      pushNorm(r.data && r.data.hits, normalizePixabayVideo);
+    } else {
+      const half = Math.min(perPage, Math.ceil(perPage / 2));
+      const [rv, ri] = await Promise.all([
+        axios.get('https://pixabay.com/api/videos/', {
+          params: { key, q, per_page: half, video_type: 'all', safesearch: 'true' },
+          timeout: 20000,
+        }).catch(() => ({ data: { hits: [] } })),
+        axios.get('https://pixabay.com/api/', {
+          params: {
+            key, q, per_page: half, image_type: 'photo', safesearch: 'true',
+            ...(orientation === 'portrait' ? { orientation: 'vertical' } : {}),
+          },
+          timeout: 20000,
+        }).catch(() => ({ data: { hits: [] } })),
+      ]);
+      pushNorm(rv.data && rv.data.hits, normalizePixabayVideo);
+      pushNorm(ri.data && ri.data.hits, normalizePixabayImage);
+    }
+
+    const filtered = results.filter(r => {
+      const t = String(r.tags || '').toLowerCase();
+      return !t.includes('watermark');
+    });
+
+    const payload = {
+      results: filtered.slice(0, perPage),
+      query:   q,
+      total:   filtered.length,
+    };
+    pixabayCacheSet(cacheKey, payload);
+    res.json(payload);
+  } catch (err) {
+    const status = err.response && err.response.status;
+    let msg = err.message || 'Pixabay request failed';
+    if (status === 429) {
+      msg = 'Pixabay rate limit exceeded. Wait a moment and try again.';
+    } else if (err.response && err.response.data) {
+      const d = err.response.data;
+      if (typeof d === 'string' && d.trim()) msg = d.trim();
+      else if (d && typeof d === 'object' && d.error) msg = String(d.error);
+    }
+    const http = status === 429 ? 429 : 502;
+    res.status(http).json({ results: [], error: msg });
+  }
+});
+
+app.post('/api/pixabay/ingest', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const { assetId, assetType, downloadUrl, projectId, duration } = req.body || {};
+  if (!downloadUrl || !projectId || !assetId) {
+    return res.status(400).json({ error: 'assetId, downloadUrl, and projectId are required' });
+  }
+  const { data: chk } = await supabaseAdmin.from('projects').select('user_id').eq('id', projectId).single();
+  if (!chk || chk.user_id !== userId) return res.status(403).json({ error: 'Invalid project' });
+
+  const ext = String(assetType).toLowerCase() === 'image' ? '.jpg' : '.mp4';
+  const tmpBase = path.join(os.tmpdir(), `pixabay_${assetId}_${Date.now()}`);
+  const tmpDl = tmpBase + ext;
+
+  try {
+    const resp = await axios.get(String(downloadUrl), { responseType: 'arraybuffer', timeout: 120000, maxContentLength: MAX_UPLOAD_BYTES });
+    fs.writeFileSync(tmpDl, Buffer.from(resp.data));
+
+    let uploadPath = tmpDl;
+    let outDuration = typeof duration === 'number' && duration > 0 ? duration : null;
+
+    if (String(assetType).toLowerCase() === 'image') {
+      const conv = await convertImageToVideo(tmpDl, outDuration || 5);
+      uploadPath = conv.outputPath;
+      outDuration = conv.duration;
+      try { fs.unlinkSync(tmpDl); } catch (_) { /* ignore */ }
+    } else {
+      if (!outDuration) {
+        outDuration = await getVideoDuration(uploadPath);
+      }
+    }
+
+    const filename = `pixabay_${assetId}.mp4`;
+    const storagePath = `${userId}/${projectId}/${filename}`;
+    const buf = fs.readFileSync(uploadPath);
+    const up = await uploadBufferToSupabase('image-layer', storagePath, buf, 'video/mp4');
+
+    try { fs.unlinkSync(uploadPath); } catch (_) { /* ignore */ }
+
+    res.json({
+      permanentUrl: up.permanentUrl,
+      storageRef:   { bucket: 'image-layer', path: storagePath },
+      duration:     outDuration || 5,
+      filename,
+    });
+  } catch (err) {
+    try { if (fs.existsSync(tmpDl)) fs.unlinkSync(tmpDl); } catch (_) { /* ignore */ }
+    res.status(500).json({ error: err.message || 'Ingest failed' });
+  }
+});
+
+app.post('/api/visual/scan', requireAuth, async (req, res) => {
+  try {
+    const { transcript, stylePolicy, keyMomentsPolicy, visualContext } = req.body || {};
+    const candidates = await generateVisualCandidates(
+      transcript,
+      stylePolicy || {},
+      keyMomentsPolicy || {},
+      visualContext || {},
+      {}
+    );
+    res.json({ candidates });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'visual scan failed' });
+  }
+});
+
+app.post('/api/visual/brief', requireAuth, async (req, res) => {
+  try {
+    const { candidate, transcript, stylePolicy } = req.body || {};
+    if (!candidate) return res.status(400).json({ error: 'candidate is required' });
+    const st = candidate.start_time != null ? candidate.start_time : candidate.startTime;
+    const ctx = extractTranscriptContext(transcript || [], st, 10);
+    const brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {});
+    res.json({ brief });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'visual brief failed' });
+  }
+});
+
+app.post('/api/visual/claude-pick', requireAuth, async (req, res) => {
+  try {
+    const { candidate, assets } = req.body || {};
+    const out = await visualPipelineClaudePick(candidate || {}, Array.isArray(assets) ? assets : []);
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'claude-pick failed' });
   }
 });
 

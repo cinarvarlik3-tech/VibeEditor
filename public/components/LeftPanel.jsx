@@ -1119,6 +1119,114 @@
     );
   }
 
+  // ── ImageClipProps (module scope) ─────────────────────────────────────────
+  function ImageClipProps({ element, elementId, update }) {
+    const op = element.opacity != null ? element.opacity : 1;
+    const [localOpacityPct, setLocalOpacityPct] = useState(Math.round(op * 100));
+    const [localVol, setLocalVol] = useState(element.volume != null ? element.volume : 0);
+
+    useEffect(() => {
+      setLocalOpacityPct(Math.round((element.opacity != null ? element.opacity : 1) * 100));
+      setLocalVol(element.volume != null ? element.volume : 0);
+    }, [elementId, element.opacity, element.volume]);
+
+    const SOURCE_BADGE = {
+      upload:  { label: 'UPLOAD',  bg: 'rgba(0,137,123,0.2)',  color: '#00897B' },
+      pixabay: { label: 'PIXABAY', bg: 'rgba(30,136,229,0.2)', color: '#1E88E5' },
+      native:  { label: 'NATIVE',  bg: 'rgba(245,158,11,0.2)', color: '#F59E0B' },
+    };
+    const badge = SOURCE_BADGE[element.sourceType] || SOURCE_BADGE.upload;
+
+    return (
+      <div>
+        <PropRow label="OPACITY">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={localOpacityPct}
+              onChange={e => {
+                const v = Number(e.target.value);
+                setLocalOpacityPct(v);
+                update('opacity', v / 100);
+              }}
+              style={{ flex: 1 }}
+            />
+            <span style={{ color: '#888', fontSize: 11, minWidth: 36, textAlign: 'right' }}>{localOpacityPct}%</span>
+          </div>
+        </PropRow>
+
+        <PropRow label="FIT MODE">
+          <select
+            value={element.fitMode || 'cover'}
+            onChange={e => update('fitMode', e.target.value)}
+            style={{ ...inputStyle(), cursor: 'pointer' }}
+          >
+            <option value="cover">Cover</option>
+            <option value="contain">Contain</option>
+            <option value="fill">Fill</option>
+          </select>
+        </PropRow>
+
+        {!element.isImage && (
+          <PropRow label="VOLUME">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={Math.round(localVol * 100)}
+                onChange={e => {
+                  const v = Number(e.target.value) / 100;
+                  setLocalVol(v);
+                  update('volume', v);
+                }}
+                style={{ flex: 1 }}
+              />
+              <span style={{ color: '#888', fontSize: 11, minWidth: 36, textAlign: 'right' }}>
+                {Math.round(localVol * 100)}%
+              </span>
+            </div>
+          </PropRow>
+        )}
+
+        <PropRow label="SOURCE">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{
+              fontSize: 9, fontWeight: 700, letterSpacing: 0.4,
+              padding: '2px 6px', borderRadius: 3,
+              background: badge.bg, color: badge.color,
+            }}>
+              {badge.label}
+            </span>
+            <span style={{
+              color: '#aaa', fontSize: 11,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0,
+            }}>
+              {element.sourceName || element.originalFilename || '—'}
+            </span>
+          </div>
+        </PropRow>
+
+        <div style={{
+          background:   'rgba(139,92,246,0.06)',
+          border:       '1px solid rgba(139,92,246,0.15)',
+          borderRadius: 4,
+          padding:      '5px 9px',
+          marginTop:    10,
+          color:        '#555',
+          fontSize:     10,
+          lineHeight:   1.5,
+        }}>
+          Opacity can also be keyframed on the timeline (opacity track).
+        </div>
+      </div>
+    );
+  }
+
   // ── KeyframeProps (module scope) ───────────────────────────────────────────
   // Shown in PropertiesTab when a keyframe diamond is selected.
   // Displays and edits the value, time, and easing of the selected keyframe.
@@ -1371,7 +1479,7 @@
         <div style={{ width: '100%', height: 1, background: 'rgba(255,255,255,0.06)', marginBottom: 14 }} />
 
         {/* Keyframe props — shown above element props when a diamond is selected */}
-        {element.type === 'videoClip' && selectedKeyframe && selectedKeyframe.elementId === elementId && (
+        {(element.type === 'videoClip' || element.type === 'imageClip') && selectedKeyframe && selectedKeyframe.elementId === elementId && (
           <KeyframeProps
             element={element}
             selectedKeyframe={selectedKeyframe}
@@ -1391,6 +1499,7 @@
           />
         )}
         {element.type === 'videoClip' && <VideoClipProps element={element} elementId={elementId} update={update} />}
+        {element.type === 'imageClip' && <ImageClipProps element={element} elementId={elementId} update={update} />}
         {element.type === 'audioClip' && <AudioClipProps element={element} elementId={elementId} update={update} />}
       </div>
     );

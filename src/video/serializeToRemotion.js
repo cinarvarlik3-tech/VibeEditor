@@ -42,7 +42,7 @@ function collectClips(tracks, kind, filterFn) {
 function maxEndTime(state) {
   let t = state.source && typeof state.source.duration === 'number' ? state.source.duration : 0;
   const tracks = state.tracks || {};
-  for (const kind of ['video', 'subtitle', 'audio']) {
+  for (const kind of ['video', 'subtitle', 'audio', 'image']) {
     for (const track of tracks[kind] || []) {
       for (const el of track.elements || []) {
         const e = el.endTime;
@@ -76,8 +76,11 @@ function serializeToRemotion(timelineState) {
   const tracks = timelineState.tracks || {};
 
   const videoClips = collectClips(tracks, 'video', el => el.type === 'videoClip' && el.src);
+  const imageClips = collectClips(tracks, 'image', el => el.type === 'imageClip' && el.src);
   const audioClips = collectClips(tracks, 'audio', el => el.type === 'audioClip' && el.src);
   const subtitles = collectClips(tracks, 'subtitle', el => el.type === 'subtitle');
+
+  imageClips.sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
 
   const serialVideo = videoClips.map(el => {
     return {
@@ -118,7 +121,33 @@ function serializeToRemotion(timelineState) {
     animation: el.animation || { in: { type: 'none', duration: 0 }, out: { type: 'none', duration: 0 } },
   }));
 
+  const serialImage = imageClips.map(el => {
+    const src = el.src || '';
+    let nativeType = null;
+    if (String(el.sourceType || '') === 'native' && typeof src === 'string' && src.startsWith('native://')) {
+      nativeType = src.replace(/^native:\/\//, '');
+    }
+    return {
+      id: el.id,
+      absSrc: toAbsoluteUrl(src),
+      startTime: el.startTime || 0,
+      endTime: el.endTime || 0,
+      isImage: !!el.isImage,
+      fitMode: el.fitMode || 'cover',
+      volume: el.volume != null ? el.volume : 0,
+      sourceType: el.sourceType || 'upload',
+      nativeType,
+      nativePayload: el.nativePayload && typeof el.nativePayload === 'object' ? el.nativePayload : {},
+      keyframes: {
+        opacity: Array.isArray(el.keyframes && el.keyframes.opacity)
+          ? el.keyframes.opacity
+          : [{ time: 0, value: 1, easing: 'linear' }],
+      },
+    };
+  });
+
   const videoJson = JSON.stringify(serialVideo, null, 2);
+  const imageJson = JSON.stringify(serialImage, null, 2);
   const audioJson = JSON.stringify(serialAudio, null, 2);
   const subsJson = JSON.stringify(serialSubs, null, 2);
 
@@ -154,6 +183,7 @@ const VIDEO_W = ${VIDEO_W};
 const VIDEO_H = ${VIDEO_H};
 
 const SERIALIZED_VIDEO = ${videoJson};
+const SERIALIZED_IMAGE = ${imageJson};
 const SERIALIZED_SUBTITLES = ${subsJson};
 const SERIALIZED_AUDIO = ${audioJson};
 const GOOGLE_FONT_IMPORT_CSS = ${fontImportsLiteral};
@@ -406,6 +436,123 @@ function VideoBlock(props) {
   );
 }
 
+function ImageClipBlock(props) {
+  var clip = props.clip;
+  var frame = useCurrentFrame();
+  var localSec = frame / FPS;
+  var opacityKF = clip.keyframes && clip.keyframes.opacity ? clip.keyframes.opacity : [{ time: 0, value: 1, easing: 'linear' }];
+  var op = interpolateKeyframes(opacityKF, localSec);
+  var fit = clip.fitMode || 'cover';
+  var p = clip.nativePayload || {};
+
+  if (clip.sourceType === 'native' && clip.nativeType) {
+    if (clip.nativeType === 'keyword_text') {
+      return (
+        <AbsoluteFill style={{ zIndex: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
+          <div style={{
+            color: p.color || '#fff',
+            fontSize: (p.fontSize || 48) + 'px',
+            fontFamily: p.fontFamily || 'Arial',
+            fontWeight: p.fontWeight || '700',
+            background: p.background || 'rgba(0,0,0,0.55)',
+            padding: '8px 16px',
+            borderRadius: 4,
+            opacity: op,
+          }}>{p.text || ''}</div>
+        </AbsoluteFill>
+      );
+    }
+    if (clip.nativeType === 'stat_card') {
+      var unit = p.unit != null ? String(p.unit) : '';
+      return (
+        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+          <div style={{
+            position: 'absolute', bottom: '20%', left: '50%', transform: 'translateX(-50%)',
+            background: 'rgba(0,0,0,0.75)', borderRadius: 8, padding: '16px 24px', textAlign: 'center', opacity: op,
+          }}>
+            <div style={{ fontSize: 48, fontWeight: 'bold', color: p.color || '#00BCD4' }}>{p.value || ''}{unit}</div>
+            <div style={{ fontSize: 16, color: '#ccc', marginTop: 4 }}>{p.label || ''}</div>
+          </div>
+        </AbsoluteFill>
+      );
+    }
+    if (clip.nativeType === 'arrow') {
+      var dir = p.direction || 'right';
+      var sz = p.size || 64;
+      var c = p.color || '#fff';
+      var rot = dir === 'up' ? -90 : dir === 'down' ? 90 : dir === 'left' ? 180 : 0;
+      return (
+        <AbsoluteFill style={{ zIndex: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none', opacity: op }}>
+          <svg width={sz * 2} height={sz * 2} viewBox="0 0 100 100" style={{ transform: 'rotate(' + rot + 'deg)' }}>
+            <polygon points="10,50 75,20 75,35 90,35 90,65 75,65 75,80" fill={c} />
+          </svg>
+        </AbsoluteFill>
+      );
+    }
+    if (clip.nativeType === 'highlight_box') {
+      return (
+        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none', opacity: op }}>
+          <div style={{
+            position: 'absolute',
+            left: (p.x != null ? p.x : 0.2) * 100 + '%',
+            top: (p.y != null ? p.y : 0.35) * 100 + '%',
+            width: (p.width != null ? p.width : 0.6) * 100 + '%',
+            height: (p.height != null ? p.height : 0.25) * 100 + '%',
+            border: '3px solid ' + (p.color || '#00BCD4'),
+            opacity: p.opacity != null ? p.opacity : 1,
+            borderRadius: 4,
+          }} />
+        </AbsoluteFill>
+      );
+    }
+    if (clip.nativeType === 'callout') {
+      return (
+        <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+          <div style={{
+            position: 'absolute', top: '12%', left: '8%',
+            background: 'rgba(0,0,0,0.82)', color: p.color || '#fff',
+            fontSize: (p.fontSize || 36) + 'px', padding: '12px 18px', borderRadius: 12,
+            border: '2px solid rgba(255,255,255,0.25)', maxWidth: '75%', opacity: op,
+          }}>
+            <div style={{ position: 'absolute', bottom: -10, left: 24, width: 0, height: 0,
+              borderLeft: '10px solid transparent', borderRight: '10px solid transparent', borderTop: '10px solid rgba(0,0,0,0.82)' }} />
+            {p.text || ''}
+          </div>
+        </AbsoluteFill>
+      );
+    }
+    return <AbsoluteFill style={{ zIndex: 2, backgroundColor: 'rgba(0,0,0,0.4)', pointerEvents: 'none' }} />;
+  }
+
+  var srcLower = String(clip.absSrc || '').toLowerCase();
+  var looksImage = clip.isImage || /\\.(jpg|jpeg|png|gif|webp)(\\?|$)/i.test(srcLower);
+  if (looksImage) {
+    return (
+      <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+        <img
+          src={clip.absSrc}
+          style={{ width: '100%', height: '100%', objectFit: fit, opacity: op }}
+        />
+      </AbsoluteFill>
+    );
+  }
+
+  var durSec = Math.max(0.1, (clip.endTime || 0) - (clip.startTime || 0));
+  var startFrom = Math.round(localSec * FPS);
+  var endAt = Math.max(startFrom + 1, Math.round(durSec * FPS));
+  return (
+    <AbsoluteFill style={{ zIndex: 2, pointerEvents: 'none' }}>
+      <OffthreadVideo
+        src={clip.absSrc}
+        startFrom={startFrom}
+        endAt={endAt}
+        volume={clip.volume != null ? clip.volume : 0}
+        style={{ width: '100%', height: '100%', objectFit: fit, opacity: op }}
+      />
+    </AbsoluteFill>
+  );
+}
+
 function AudioBlock(props) {
   var a = props.a;
   var frame = useCurrentFrame();
@@ -447,9 +594,18 @@ export const VibeComposition = () => {
         var dur = Math.max(1, Math.round((clip.endTime - clip.startTime) * FPS));
         return (
           <Sequence key={clip.id} from={from} durationInFrames={dur}>
-            <AbsoluteFill>
+            <AbsoluteFill style={{ zIndex: 1 }}>
               <VideoBlock clip={clip} />
             </AbsoluteFill>
+          </Sequence>
+        );
+      })}
+      {SERIALIZED_IMAGE.map(function (clip) {
+        var from = Math.max(0, Math.round(clip.startTime * FPS));
+        var dur = Math.max(1, Math.round((clip.endTime - clip.startTime) * FPS));
+        return (
+          <Sequence key={clip.id} from={from} durationInFrames={dur}>
+            <ImageClipBlock clip={clip} />
           </Sequence>
         );
       })}
@@ -458,7 +614,9 @@ export const VibeComposition = () => {
         var dur = Math.max(1, Math.round((el.endTime - el.startTime) * FPS));
         return (
           <Sequence key={el.id} from={from} durationInFrames={dur}>
-            <SubtitleBlock el={el} />
+            <AbsoluteFill style={{ zIndex: 3 }}>
+              <SubtitleBlock el={el} />
+            </AbsoluteFill>
           </Sequence>
         );
       })}

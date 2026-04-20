@@ -1,0 +1,36 @@
+{
+  "visual_policy": {
+    "brand_safe": true,
+    "avoid_logos_and_identifiable_trademarks": true,
+    "preferred_stock_tone": "professional_uplifting",
+    "default_fit_mode": "cover",
+    "max_overlay_density": "low",
+    "prefer_portrait_for_vertical_timeline": true,
+    "native_fallback_when_retrieval_low_confidence": true,
+    "subtitle_safe_margins": {
+      "respect_lower_third": true,
+      "min_clearance_px": 48
+    },
+    "color_harmony": {
+      "align_with_project_palette": true,
+      "avoid_clashing_saturated_backgrounds": true
+    }
+  },
+  "key_moments_policy": {
+    "minimum_gap_seconds": 0.4,
+    "moment_classes": {
+      "hook": { "description": "Opening attention grab", "default_priority": "high" },
+      "explanation": { "description": "Concept or process explanation", "default_priority": "medium" },
+      "proof": { "description": "Evidence, data, or credibility beat", "default_priority": "high" },
+      "contrast": { "description": "Before/after or opposing ideas", "default_priority": "medium" },
+      "transition": { "description": "Section bridge", "default_priority": "low" },
+      "example": { "description": "Concrete illustration", "default_priority": "medium" },
+      "instruction": { "description": "How-to or directive moment", "default_priority": "medium" },
+      "entity_mention": { "description": "Named person, place, product, brand", "default_priority": "medium" },
+      "emotional_peak": { "description": "Sentiment high point", "default_priority": "high" },
+      "payoff": { "description": "Resolution or punchline", "default_priority": "high" },
+      "CTA": { "description": "Call to action", "default_priority": "high" },
+      "retention_rescue": { "description": "Mid-roll re-engagement", "default_priority": "medium" }
+    }
+  }
+}

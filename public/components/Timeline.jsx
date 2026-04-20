@@ -11,7 +11,7 @@
 
 (function () {
   const { useState, useRef, useCallback, useEffect } = React;
-  const { Lock, Unlock, Eye, EyeOff, GripVertical, Scissors, Plus, Trash2 } = LucideReact;
+  const { Lock, Unlock, Eye, EyeOff, GripVertical, Scissors, Plus, Trash2, Image } = LucideReact;
 
   // ── Constants ──────────────────────────────────────────────────────────────
   const HEADER_WIDTH = 100;   // px — left sidebar width
@@ -22,6 +22,7 @@
   // Element block colour by type
   const ELEMENT_COLORS = {
     videoClip: '#00695C',
+    imageClip: 'rgba(138, 92, 246, 0.7)',
     subtitle:  '#1565C0',
     audioClip: '#1B5E20',
   };
@@ -29,6 +30,7 @@
   // Track type display labels (short, shown inside track header sidebar)
   const TRACK_LABELS = {
     video:    'VIDEO',
+    image:    'IMG',
     subtitle: 'SUB',
     audio:    'AUDIO',
   };
@@ -36,6 +38,7 @@
   // Section header labels (full, shown once per track-type group)
   const SECTION_LABELS = {
     video:    'VIDEO',
+    image:    'IMAGE LAYER',
     subtitle: 'SUBTITLES',
     audio:    'AUDIO',
   };
@@ -43,6 +46,7 @@
   // Section header accent colours (left border on section header)
   const SECTION_COLORS = {
     subtitle: '#1565C0',
+    image:    '#8B5CF6',
     video:    '#00695C',
     audio:    '#1B5E20',
   };
@@ -50,6 +54,7 @@
   // Human-readable "Add X" button labels per track type
   const ADD_LABELS = {
     video:    'Add Video',
+    image:    'Add Image Track',
     subtitle: 'Add Subtitle',
     audio:    'Add Audio',
   };
@@ -181,10 +186,10 @@
     var kfDragRef   = useRef(null);
     var clickStartX = useRef(null);
 
-    var isVideoClip   = element.type === 'videoClip' && !!element.keyframes;
+    var supportsKeyframeCurve = (element.type === 'videoClip' || element.type === 'imageClip') && !!element.keyframes;
     // displayKFTrack is 'scale'/'opacity' even when activeKeyframeTrack is 'none'
     var _displayTrack = displayKFTrack || activeKeyframeTrack;
-    var kfArray       = isVideoClip ? (element.keyframes[_displayTrack] || []) : [];
+    var kfArray       = supportsKeyframeCurve ? (element.keyframes[_displayTrack] || []) : [];
     var interpolate   = window.TimelineReducer && window.TimelineReducer.interpolateKeyframes;
     var trackColor    = KF_COLORS[_displayTrack] || '#00BCD4';
     var blockH      = TRACK_HEIGHT - 4;
@@ -321,7 +326,7 @@
 
     // ── Element block click: add keyframe at click position ───────────────
     function handleBlockClick(e) {
-      if (!isSelected || !isVideoClip || !onAddKeyframe) return;
+      if (!isSelected || !supportsKeyframeCurve || !onAddKeyframe) return;
       if (activeKeyframeTrack === 'none') return;
       if (e.target.closest('[data-kf-diamond]')) return;
       // Guard: don't add if mouse moved during mousedown (drag in progress)
@@ -338,7 +343,7 @@
 
     // ── Element block mouse move: update ghost diamond position ───────────
     function handleBlockMouseMove(e) {
-      if (!isSelected || !isVideoClip) { if (ghostX !== null) setGhostX(null); return; }
+      if (!isSelected || !supportsKeyframeCurve) { if (ghostX !== null) setGhostX(null); return; }
       if (e.target.closest('[data-kf-diamond]')) { if (ghostX !== null) setGhostX(null); return; }
       var rect   = e.currentTarget.getBoundingClientRect();
       var localX = e.clientX - rect.left;
@@ -369,7 +374,7 @@
           height:        blockH,
           background:    color,
           borderRadius:  4,
-          cursor:        (isSelected && isVideoClip && activeKeyframeTrack !== 'none') ? 'crosshair' : 'grab',
+          cursor:        (isSelected && supportsKeyframeCurve && activeKeyframeTrack !== 'none') ? 'crosshair' : 'grab',
           overflow:      'hidden',
           boxSizing:     'border-box',
           outline:       isSelected ? '2px solid #00BCD4' : 'none',
@@ -395,27 +400,41 @@
           {label}
         </span>
 
-        {/* ── Image badge ───────────────────────────────────────────────── */}
-        {element.isImage && (
-          <span style={{
-            position:      'absolute',
-            top:           2,
-            right:         4,
-            fontSize:      8,
-            color:         'rgba(255,255,255,0.55)',
-            background:    'rgba(0,0,0,0.3)',
-            borderRadius:  2,
-            padding:       '1px 3px',
-            userSelect:    'none',
-            pointerEvents: 'none',
-            zIndex:        3,
-          }}>
-            IMG
-          </span>
-        )}
+        {/* ── imageClip source badges (PIX / IMG / NAT) ─────────────────── */}
+        {element.type === 'imageClip' && (function() {
+          var st = element.sourceType;
+          var badge = null;
+          if (st === 'pixabay') {
+            badge = { text: 'PIX', bg: 'rgba(139, 92, 246, 0.85)', fg: '#fff' };
+          } else if (st === 'native') {
+            badge = { text: 'NAT', bg: 'rgba(245, 158, 11, 0.9)', fg: '#111' };
+          } else if (st === 'upload' && element.isImage) {
+            badge = { text: 'IMG', bg: 'rgba(45, 212, 191, 0.85)', fg: '#042f2e' };
+          }
+          if (!badge) return null;
+          return (
+            <span style={{
+              position:      'absolute',
+              top:           2,
+              right:         4,
+              fontSize:      8,
+              fontWeight:    700,
+              color:         badge.fg,
+              background:    badge.bg,
+              borderRadius:  2,
+              padding:       '1px 4px',
+              userSelect:    'none',
+              pointerEvents: 'none',
+              zIndex:        3,
+              letterSpacing: 0.3,
+            }}>
+              {badge.text}
+            </span>
+          );
+        })()}
 
         {/* ── SVG value curve (selected videoClip only) ─────────────────── */}
-        {isSelected && isVideoClip && kfArray.length > 0 && (
+        {isSelected && supportsKeyframeCurve && kfArray.length > 0 && (
           <svg
             style={{
               position:      'absolute',
@@ -443,7 +462,7 @@
         )}
 
         {/* ── Keyframe diamonds ────────────────────────────────────────── */}
-        {isSelected && isVideoClip && kfArray.map(function(kf, i) {
+        {isSelected && supportsKeyframeCurve && kfArray.map(function(kf, i) {
           var dx = getDiamondX(kf, i);
           var isKFSel = selectedKeyframe
             && selectedKeyframe.elementId === element.id
@@ -481,7 +500,7 @@
         })}
 
         {/* ── Ghost diamond (hover over empty clip area) ────────────────── */}
-        {isSelected && isVideoClip && activeKeyframeTrack !== 'none' && ghostX !== null && (function() {
+        {isSelected && supportsKeyframeCurve && activeKeyframeTrack !== 'none' && ghostX !== null && (function() {
           var localT = ghostX / zoom;
           var onExisting = kfArray.some(function(kf) {
             return Math.abs(kf.time - snapTime(localT)) < SNAP;
@@ -639,6 +658,11 @@
           >
             <GripVertical size={10} />
           </div>
+          {trackType === 'image' && (
+            <span style={{ display: 'flex', alignItems: 'center', flexShrink: 0, color: '#A78BFA', marginRight: 2 }} title="Image layer">
+              <Image size={11} />
+            </span>
+          )}
           <span style={{
             color:         track.visible ? '#888' : '#444',
             fontSize:      9,
@@ -910,21 +934,29 @@
     var [trackDrag,           setTrackDrag]           = useState(null);
     var [elementDragTargetId, setElementDragTargetId] = useState(null);
 
-    // Keyframe track selector — only shown when selected element is a videoClip
+    // Keyframe track selector — shown when a videoClip or imageClip is selected
     // 'none' = no-keyframe mode (clicking clips does not add keyframes).
-    // Only scale and opacity are keyframe-animated; speed/volume are clip-level scalars.
     var [activeKeyframeTrack, setActiveKeyframeTrack] = useState('none');
     // Tracks the last non-'none' selection so diamonds remain visible in 'none' mode
     var [lastActiveKFTrack, setLastActiveKFTrack] = useState('scale');
 
-    // Guard: if state somehow holds an unrecognised track name, reset to 'none'
-    var safeKFTrack = ['none', 'scale', 'opacity'].includes(activeKeyframeTrack)
-      ? activeKeyframeTrack : 'none';
+    var selectedIsImageClip = (function() {
+      if (!tracks || !selectedElementId) return false;
+      var ttypes = Object.keys(tracks);
+      for (var ti = 0; ti < ttypes.length; ti++) {
+        var tt = ttypes[ti];
+        for (var tri = 0; tri < tracks[tt].length; tri++) {
+          var tr = tracks[tt][tri];
+          for (var ei = 0; ei < tr.elements.length; ei++) {
+            var el = tr.elements[ei];
+            if (el.id === selectedElementId && el.type === 'imageClip') return true;
+          }
+        }
+      }
+      return false;
+    })();
 
-    // For rendering: never 'none' — falls back to last active track
-    var displayKFTrack = safeKFTrack === 'none' ? lastActiveKFTrack : safeKFTrack;
-
-    // Determine if the selected element is a videoClip
+    // Selected element uses timeline keyframe curve UI (videoClip or imageClip)
     var selectedIsVideoClip = (function() {
       if (!tracks || !selectedElementId) return false;
       var ttypes = Object.keys(tracks);
@@ -934,12 +966,45 @@
           var tr = tracks[tt][tri];
           for (var ei = 0; ei < tr.elements.length; ei++) {
             var el = tr.elements[ei];
-            if (el.id === selectedElementId && el.type === 'videoClip') return true;
+            if (el.id === selectedElementId && (el.type === 'videoClip' || el.type === 'imageClip')) return true;
           }
         }
       }
       return false;
     })();
+
+    var KF_TRACK_OPTIONS = selectedIsImageClip
+      ? [
+        { value: 'none',    label: '— None'  },
+        { value: 'opacity', label: 'Opacity' },
+      ]
+      : [
+        { value: 'none',    label: '— None'  },
+        { value: 'scale',   label: 'Scale'   },
+        { value: 'opacity', label: 'Opacity' },
+      ];
+
+    // Guard: coerce invalid / disallowed track names (imageClip has no scale curve)
+    var safeKFTrack = (function() {
+      var v = activeKeyframeTrack;
+      if (selectedIsImageClip) {
+        if (v === 'scale') return 'opacity';
+        return ['none', 'opacity'].includes(v) ? v : 'none';
+      }
+      return ['none', 'scale', 'opacity'].includes(v) ? v : 'none';
+    })();
+
+    // For rendering: never 'none' — falls back to last active track (opacity for image clips)
+    var displayKFTrack = safeKFTrack === 'none'
+      ? (selectedIsImageClip ? 'opacity' : lastActiveKFTrack)
+      : safeKFTrack;
+
+    useEffect(function() {
+      if (selectedIsImageClip && activeKeyframeTrack === 'scale') {
+        setActiveKeyframeTrack('opacity');
+        setLastActiveKFTrack('opacity');
+      }
+    }, [selectedIsImageClip, activeKeyframeTrack, selectedElementId]);
 
     // ── Scroll playhead into view ──────────────────────────────────────────
     useEffect(function() {
@@ -1092,17 +1157,11 @@
       );
     }
 
-    var TRACK_ORDER       = ['subtitle', 'video', 'audio'];
+    var TRACK_ORDER       = ['subtitle', 'image', 'video', 'audio'];
     var totalTracks       = TRACK_ORDER.reduce(function(sum, t) { return sum + (tracks[t] ? tracks[t].length : 0); }, 0);
     var totalSections     = TRACK_ORDER.reduce(function(sum, t) { return sum + (tracks[t] && tracks[t].length > 0 ? 1 : 0); }, 0);
     var totalHeight       = totalTracks * TRACK_HEIGHT + totalSections * 20;
     var contentWidth = HEADER_WIDTH + Math.max(duration * zoom, 200);
-
-    var KF_TRACK_OPTIONS = [
-      { value: 'none',    label: '— None'  },
-      { value: 'scale',   label: 'Scale'   },
-      { value: 'opacity', label: 'Opacity' },
-    ];
 
     return (
       <div
