@@ -21,6 +21,7 @@
 
 'use strict';
 
+const metrics  = require('../cache/metrics');
 const fs       = require('fs');
 const path     = require('path');
 const axios    = require('axios');
@@ -212,6 +213,15 @@ async function transcribeAudio(audioPath, language = null) {
   const data = response.data;
   if (!data || typeof data !== 'object') {
     throw new Error('transcribeAudio: unexpected response body');
+  }
+
+  const durationSec = typeof data.duration === 'number' ? data.duration : null;
+  if (durationSec != null && durationSec > 0) {
+    metrics.counts.whisperCalls += 1;
+    metrics.counts.whisperMinutes += durationSec / 60;
+    console.log(
+      `[whisper] duration: ${durationSec.toFixed(1)}s, cumulative minutes: ${metrics.counts.whisperMinutes.toFixed(2)}`
+    );
   }
 
   return normalizeVerboseJson(data);

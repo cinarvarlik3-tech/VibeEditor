@@ -4,14 +4,14 @@
  * Master system prompt for the Vibe Editor AI engine.
  * Sent as the system message on every generateOperations() call.
  *
- * Claude no longer generates JSX. It receives the current timeline state
+ * The AI no longer generates JSX. It receives the current timeline state
  * and a user prompt, and returns a JSON operations array that is applied
  * to the timeline state via timelineReducer.
  */
 
 /**
  * SYSTEM_PROMPT
- * Complete instruction set Claude receives on every edit request.
+ * Complete instruction set for every edit request.
  *
  * @type {string}
  */
@@ -32,7 +32,14 @@ You will receive exactly this structure on the final (current) user turn:
 
 PROMPT: {the user's edit request}
 CURRENT_TRACKS: {JSON of the current tracks object}
-TRANSCRIPT: {JSON of whisper transcript array, or null}
+TRANSCRIPT: {JSON object: { mode, segments } or legacy full transcript array, or null}
+  The transcript field may be partial for token efficiency. mode meanings:
+  - 'coarse': sentence-level segments only (no per-word timings) unless included per segment.
+  - 'window': segments near a referenced time range only.
+  - 'full-words': full word-level timing available in segments (when required by the prompt).
+  - 'none': no transcript text included for this turn (structural edits).
+  If you need word-level timing for a subtitle op and mode is not 'full-words', use the best
+  available timing from segments and optionally add a short "comment" on the operation explaining the limitation.
 CLIP_SUMMARY: {numbered list of every videoClip on the timeline — filename, ranges, elementId, trackId; see CLIP REFERENCE RULES}
 SOURCE_DURATION: {total video duration in seconds}
 CURRENT_UPLOADS: {JSON array of uploaded audio files, or empty array []}
@@ -1255,6 +1262,55 @@ Scale: existing keyframe at time=0 value=1.0, new at time=4 value=1.3 → gradua
 Speed: playbackRate is a clip-level scalar updated via UPDATE, not keyframes.
 `;
 
+/** Bump only when SYSTEM_PROMPT body above changes (cache / observability). Not embedded in prompts. */
+const SYSTEM_PROMPT_VERSION = 'v1.0.0';
+
+/**
+ * Split prompt for optional rule bundles (alphabetical concatenation of middle sections).
+ * When featurePromptBundles is false or bundles is empty, returns full SYSTEM_PROMPT (safest).
+ * @param {string[]} bundles  Subset of: 'animations' | 'audio' | 'complex' | 'images' | 'subtitles'
+ * @param {boolean} featurePromptBundles
+ * @returns {string}
+ */
+function buildSystemPrompt(bundles, featurePromptBundles) {
+  const full = SYSTEM_PROMPT;
+  if (!featurePromptBundles || !Array.isArray(bundles) || bundles.length === 0) {
+    return full;
+  }
+  const seg = full.indexOf('\nSUBTITLE SEGMENTATION MODES\n');
+  const kf = full.indexOf('\nKEYFRAME OPERATIONS\n');
+  const subEl = full.indexOf('\nSUBTITLE ELEMENT — COMPLETE FIELD REFERENCE\n');
+  const vid = full.indexOf('\nVIDEOCLIP ELEMENT — COMPLETE FIELD REFERENCE\n');
+  const aud = full.indexOf('\nAUDIOCLIP ELEMENT — COMPLETE FIELD REFERENCE\n');
+  const ex1 = full.indexOf('\nCOMPLETE WORKED EXAMPLE — MODE 1 (sentence by sentence, default)');
+  const err = full.indexOf('\nERROR PREVENTION RULES\n');
+  if (seg < 0 || kf < 0 || subEl < 0 || vid < 0 || aud < 0 || ex1 < 0 || err < 0) {
+    return full;
+  }
+
+  const head = full.slice(0, seg);
+  const tail = full.slice(err);
+  const parts = {
+    animations: full.slice(kf, subEl),
+    audio:      full.slice(aud, ex1),
+    complex:    full.slice(ex1, err),
+    images:     full.slice(vid, aud),
+    subtitles:  full.slice(seg, kf) + full.slice(subEl, vid),
+  };
+  const order = ['animations', 'audio', 'complex', 'images', 'subtitles'];
+  let mid = '';
+  for (const name of order) {
+    if (bundles.includes(name)) mid += parts[name];
+  }
+  if (!mid) return full;
+  return head + mid + tail;
+}
+
 const { VISUAL_COMPONENT_RULES } = require('./visualComponentRules');
 
-module.exports = { SYSTEM_PROMPT, VISUAL_COMPONENT_RULES };
+module.exports = {
+  SYSTEM_PROMPT,
+  SYSTEM_PROMPT_VERSION,
+  buildSystemPrompt,
+  VISUAL_COMPONENT_RULES,
+};

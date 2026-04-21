@@ -1,5 +1,11 @@
 'use strict';
 
+/**
+ * In-memory LLM response memoization. Keys are SHA-256 of canonical JSON payloads.
+ * A disk/Redis backend can replace makeLRU later without changing call sites if the
+ * get(key)/set(key,value) contract stays the same.
+ */
+
 const { makeLRU } = require('./lru');
 const { canonicalStringify, sha256String } = require('./hash');
 

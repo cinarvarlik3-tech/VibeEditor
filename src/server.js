@@ -53,6 +53,7 @@ const {
   extractTranscriptContext,
   visualPipelineAiPick,
 } = require('./claude/generate');
+const { SYSTEM_PROMPT_VERSION } = require('./claude/systemPrompt');
 const { searchFreesound, searchJamendo, searchAudio } = require('./assets/audio');
 
 const supabaseAdmin =
@@ -70,6 +71,7 @@ const {
   saveRenderToCache,
 } = require('./cache/renderCache');
 const metrics = require('./cache/metrics');
+const { allRollingStats, ROLLING_WINDOW } = metrics;
 const { cacheTranscriptRenderEnabled } = require('./cache/config');
 const { makeLlmResponseCache } = require('./cache/llmResponseCache');
 
@@ -333,8 +335,49 @@ app.post('/api/auth/verify', requireAuth, (req, res) => {
  * GET /api/_debug/cache — LRU + transcript/render hit counters (auth required).
  */
 app.get('/api/_debug/cache', requireAuth, (req, res) => {
+  const snap = metrics.snapshot();
+  const rolling = allRollingStats();
+
+  const callSites = ['generate', 'summarize', 'visual_scan', 'visual_brief', 'visual_pick'];
+  const perSite = {};
+  for (const site of callSites) {
+    perSite[site] = {
+      estTotalTokens: rolling[`${site}_estTotalTokens`] || null,
+      realInputTokens: rolling[`${site}_realInputTokens`] || null,
+      realOutputTokens: rolling[`${site}_realOutputTokens`] || null,
+      realCachedTokens: rolling[`${site}_realCachedTokens`] || null,
+      cacheHitRatio: rolling[`${site}_cacheHitRatio`] || null,
+      breakdown: {
+        systemTokens: rolling[`${site}_systemTokens`] || null,
+        historyTokens: rolling[`${site}_historyTokens`] || null,
+        currentTurnTokens: rolling[`${site}_currentTurnTokens`] || null,
+      },
+    };
+  }
+
+  const bundleDistribution = {};
+  const transcriptModeDistribution = {};
+  for (const [key, value] of Object.entries(snap)) {
+    if (key.startsWith('bundles_')) bundleDistribution[key.replace('bundles_', '')] = value;
+    if (key.startsWith('transcriptMode_')) transcriptModeDistribution[key.replace('transcriptMode_', '')] = value;
+  }
+
+  const routingFallbackRate =
+    (snap.routingRequestFallback || 0) /
+    Math.max(1, (snap.routingRequestFallback || 0) + (snap.routingRequestSuccess || 0));
+
   res.json({
-    cacheMetrics:     metrics.snapshot(),
+    SYSTEM_PROMPT_VERSION,
+    cacheMetrics:     snap,
+    routingFallback:  snap.routingFallback,
+    whisperMinutes:   snap.whisperMinutes,
+    chatSiteStats: {
+      generate:     metrics.chatSiteStats('generate'),
+      summarize:    metrics.chatSiteStats('summarize'),
+      visual_scan:  metrics.chatSiteStats('visual_scan'),
+      visual_brief:   metrics.chatSiteStats('visual_brief'),
+      visual_pick:    metrics.chatSiteStats('visual_pick'),
+    },
     cacheTranscriptRender: process.env.CACHE_ENABLED !== 'false',
     transcriptRender: process.env.CACHE_ENABLED !== 'false',
     llmResponseCaches: {
@@ -344,7 +387,95 @@ app.get('/api/_debug/cache', requireAuth, (req, res) => {
       visualBrief:{ max: visualBriefLlmCache.max, ttlMs: visualBriefLlmCache.ttlMs },
       visualPick: { max: visualPickLlmCache.max, ttlMs: visualPickLlmCache.ttlMs },
     },
+    diagnostics: {
+      perSite,
+      bundleDistribution,
+      transcriptModeDistribution,
+      routing: {
+        successCount: snap.routingRequestSuccess || 0,
+        fallbackCount: snap.routingRequestFallback || 0,
+        fallbackRate: routingFallbackRate,
+      },
+      history: {
+        summaryUsedCount: snap.historySummaryUsed || 0,
+        rawJsonUsedCount: snap.historyRawJsonUsed || 0,
+        fullSnapshotsGt1Count: snap.historyFullSnapshotsGt1 || 0,
+      },
+      whisper: {
+        calls: snap.whisperCalls || 0,
+        cumulativeMinutes: snap.whisperMinutes || 0,
+      },
+      systemPromptVersion: SYSTEM_PROMPT_VERSION,
+      rollingWindowSize: ROLLING_WINDOW,
+    },
   });
+});
+
+/**
+ * GET /api/_debug/token-report — plain-text rolling token / routing diagnostics (auth required).
+ */
+app.get('/api/_debug/token-report', requireAuth, (req, res) => {
+  const rolling = allRollingStats();
+  const snap = metrics.snapshot();
+  const callSites = ['generate', 'summarize', 'visual_scan', 'visual_brief', 'visual_pick'];
+
+  const lines = [];
+  lines.push('=== Vibe Editor Token Report ===');
+  lines.push(`Rolling window: last ${ROLLING_WINDOW} calls per metric`);
+  lines.push('');
+
+  for (const site of callSites) {
+    const est = rolling[`${site}_estTotalTokens`];
+    const real = rolling[`${site}_realInputTokens`];
+    if (!est || est.n === 0) {
+      lines.push(`[${site}] no samples yet`);
+      lines.push('');
+      continue;
+    }
+    const sys = rolling[`${site}_systemTokens`];
+    const hist = rolling[`${site}_historyTokens`];
+    const curr = rolling[`${site}_currentTurnTokens`];
+    const cached = rolling[`${site}_realCachedTokens`];
+    const cacheRatio = rolling[`${site}_cacheHitRatio`];
+
+    lines.push(`[${site}] n=${est.n}`);
+    lines.push(
+      `  real input tokens (OpenAI) — avg: ${real && real.n ? real.avg : '?'} | p50: ${real && real.n ? real.p50 : '?'} | p95: ${real && real.n ? real.p95 : '?'}`
+    );
+    lines.push(
+      `  cached tokens — avg: ${cached && cached.n ? cached.avg : '?'} | hit ratio avg: ${((cacheRatio && cacheRatio.n ? cacheRatio.avg : 0) * 100).toFixed(1)}%`
+    );
+    lines.push(
+      `  est breakdown — system: ${sys && sys.n ? sys.avg : '?'} | history: ${hist && hist.n ? hist.avg : '?'} | current: ${curr && curr.n ? curr.avg : '?'}`
+    );
+    lines.push('');
+  }
+
+  const fb = snap.routingRequestFallback || 0;
+  const ok = snap.routingRequestSuccess || 0;
+  const fallbackRate = (fb / Math.max(1, fb + ok)) * 100;
+  lines.push(`Routing fallback (mini → flagship, per completed /generate): ${fb} / ${fb + ok} = ${fallbackRate.toFixed(1)}%`);
+  lines.push('');
+
+  lines.push('Rule bundle distribution (keyword hits, per /generate):');
+  for (const [key, value] of Object.entries(snap)) {
+    if (key.startsWith('bundles_')) lines.push(`  ${key.replace('bundles_', '')}: ${value}`);
+  }
+  lines.push('');
+
+  lines.push('Transcript mode distribution (per /generate):');
+  for (const [key, value] of Object.entries(snap)) {
+    if (key.startsWith('transcriptMode_')) lines.push(`  ${key.replace('transcriptMode_', '')}: ${value}`);
+  }
+  lines.push('');
+
+  lines.push(
+    `Whisper: ${snap.whisperCalls || 0} calls, ${(snap.whisperMinutes || 0).toFixed(1)} min cumulative`
+  );
+  lines.push(`System prompt version: ${SYSTEM_PROMPT_VERSION || 'unknown'}`);
+
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+  res.send(lines.join('\n'));
 });
 
 // Serve state files (schema.js, timelineReducer.js) to the browser.
@@ -908,13 +1039,21 @@ app.post('/generate', requireAuth, async (req, res) => {
         transcript,
         sourceDuration,
         uploadedAudioFiles,
-        priorEx
+        priorEx,
+        req.user.id
       );
       generateLlmCache.set(generateCacheKey, result);
       log(`LLM response cache MISS (${generateLlmCache.name}) key=${generateCacheKey.slice(0, 12)}…`);
     }
 
-    const { operations, warnings, isExplanation, claudeUsage } = result;
+    const {
+      operations,
+      warnings,
+      isExplanation,
+      claudeUsage,
+      modelUsed,
+      fallback,
+    } = result;
     const usageOut = cachedGenerate
       ? {
         inputTokens:              0,
@@ -942,6 +1081,8 @@ app.post('/generate', requireAuth, async (req, res) => {
       warnings:       warnings != null && Array.isArray(warnings) ? warnings : [],
       isExplanation:  !!isExplanation,
       claudeUsage:    usageOut,
+      modelUsed:      modelUsed != null ? modelUsed : null,
+      fallback:       fallback === true,
       llmCacheHit:    !!cachedGenerate,
       llmCache:       cachedGenerate ? { scope: 'generate', keyPrefix: generateCacheKey.slice(0, 12) } : null,
     });
@@ -978,7 +1119,7 @@ app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
       text = cachedSum.summary;
       log(`LLM response cache HIT (${summarizeLlmCache.name}) key=${sumKey.slice(0, 12)}…`);
     } else {
-      text = await summarizeEditingConversation(exchanges);
+      text = await summarizeEditingConversation(exchanges, req.user.id);
       summarizeLlmCache.set(sumKey, { summary: text });
       log(`LLM response cache MISS (${summarizeLlmCache.name}) key=${sumKey.slice(0, 12)}…`);
     }
@@ -1204,7 +1345,8 @@ app.post('/api/visual/scan', requireAuth, async (req, res) => {
         stylePolicy || {},
         keyMomentsPolicy || {},
         visualContext || {},
-        {}
+        {},
+        req.user.id
       );
       visualScanLlmCache.set(scanKey, { candidates });
       log(`LLM response cache MISS (${visualScanLlmCache.name}) key=${scanKey.slice(0, 12)}…`);
@@ -1238,7 +1380,7 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
       brief = cachedBrief.brief;
       log(`LLM response cache HIT (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
     } else {
-      brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {});
+      brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {}, req.user.id);
       visualBriefLlmCache.set(briefKey, { brief });
       log(`LLM response cache MISS (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
     }
@@ -1267,7 +1409,11 @@ app.post('/api/visual/claude-pick', requireAuth, async (req, res) => {
       out = cachedPick;
       log(`LLM response cache HIT (${visualPickLlmCache.name}) key=${pickKey.slice(0, 12)}…`);
     } else {
-      out = await visualPipelineAiPick(candidate || {}, Array.isArray(assets) ? assets : []);
+      out = await visualPipelineAiPick(
+        candidate || {},
+        Array.isArray(assets) ? assets : [],
+        req.user.id
+      );
       visualPickLlmCache.set(pickKey, out);
       log(`LLM response cache MISS (${visualPickLlmCache.name}) key=${pickKey.slice(0, 12)}…`);
     }

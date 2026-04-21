@@ -15,12 +15,181 @@
 
 require('dotenv').config();
 const { OpenAI, APIError } = require('openai');
-const { SYSTEM_PROMPT, VISUAL_COMPONENT_RULES } = require('./systemPrompt');
+const {
+  SYSTEM_PROMPT,
+  VISUAL_COMPONENT_RULES,
+  SYSTEM_PROMPT_VERSION,
+  buildSystemPrompt,
+} = require('./systemPrompt');
 const { searchAudio } = require('../assets/audio');
+const { canonicalStringify } = require('../cache/hash');
+const metrics = require('../cache/metrics');
 
 const log = (...args) => console.log('[generate]', ...args);
 
-const OPENAI_MODEL = 'gpt-5.4';
+function envFeature(name, defaultTrue = true) {
+  const v = process.env[name];
+  if (v === undefined || v === '') return defaultTrue;
+  return String(v).toLowerCase() !== 'false';
+}
+
+const MODEL_FLAGSHIP = process.env.OPENAI_MODEL_FLAGSHIP || 'gpt-5.4';
+const MODEL_MINI = process.env.OPENAI_MODEL_MINI || 'gpt-5.4-mini';
+const MODEL_NANO = process.env.OPENAI_MODEL_NANO || 'gpt-5.4-nano';
+
+const FEATURE_MODEL_ROUTING = envFeature('FEATURE_MODEL_ROUTING', true);
+const FEATURE_TRANSCRIPT_WINDOWING = envFeature('FEATURE_TRANSCRIPT_WINDOWING', true);
+const FEATURE_HISTORY_SUMMARIES = envFeature('FEATURE_HISTORY_SUMMARIES', true);
+const FEATURE_PROMPT_BUNDLES = envFeature('FEATURE_PROMPT_BUNDLES', true);
+
+const MODEL_FOR_GENERATE = FEATURE_MODEL_ROUTING ? MODEL_MINI : MODEL_FLAGSHIP;
+const MODEL_FOR_SUMMARIZE = FEATURE_MODEL_ROUTING ? MODEL_NANO : MODEL_FLAGSHIP;
+const MODEL_FOR_VISUAL_SCAN = FEATURE_MODEL_ROUTING ? MODEL_MINI : MODEL_FLAGSHIP;
+const MODEL_FOR_VISUAL_BRIEF = FEATURE_MODEL_ROUTING ? MODEL_MINI : MODEL_FLAGSHIP;
+const MODEL_FOR_VISUAL_PICK = FEATURE_MODEL_ROUTING ? MODEL_NANO : MODEL_FLAGSHIP;
+
+const ANIMATION_KEYWORDS = /\b(animat|fade|keyframe|transition|opacity|zoom|pan|slide\s+in|slide\s+out)\b/i;
+const SUBTITLE_KEYWORDS = /\b(subtitle|caption|word|sync|text\s+on\s+screen)\b/i;
+const IMAGE_KEYWORDS = /\b(image|picture|photo|overlay|anchor|layout|fit|cover|contain)\b/i;
+const AUDIO_KEYWORDS = /\b(audio|sound|music|volume|duck|mute|loud)\b/i;
+const COMPLEX_KEYWORDS = /\b(split|trim|reorder|multiple|each|every|all\s+clips)\b/i;
+
+/**
+ * @param {string} userPrompt
+ * @returns {string[]} bundle ids: animations | subtitles | images | audio | complex
+ */
+function selectRuleBundles(userPrompt) {
+  const p = String(userPrompt || '');
+  const bundles = [];
+  if (ANIMATION_KEYWORDS.test(p)) bundles.push('animations');
+  if (SUBTITLE_KEYWORDS.test(p)) bundles.push('subtitles');
+  if (IMAGE_KEYWORDS.test(p)) bundles.push('images');
+  if (AUDIO_KEYWORDS.test(p)) bundles.push('audio');
+  if (COMPLEX_KEYWORDS.test(p)) bundles.push('complex');
+  return bundles;
+}
+
+/**
+ * @param {Array|null|undefined} fullTranscript
+ * @param {string} userPrompt
+ * @param {{ windowSeconds?: number }} [opts]
+ * @returns {{ mode: string, segments: Array } | null}
+ */
+function selectTranscriptWindow(fullTranscript, userPrompt, opts) {
+  const opt = opts || {};
+  const segs = Array.isArray(fullTranscript) ? fullTranscript : [];
+  if (segs.length === 0) return null;
+
+  if (!FEATURE_TRANSCRIPT_WINDOWING) {
+    return { mode: 'full-words', segments: segs };
+  }
+
+  const p = String(userPrompt || '');
+  const needsWordLevel = /\b(subtitle|caption|word|sync|per\s+word)\b/i.test(p);
+  const needsNoTranscript =
+    /\b(reorder|swap|move|trim|split|delete|remove|duplicate)\b/i.test(p) &&
+    !/\b(say|said|when\s+they|the\s+part\s+where)\b/i.test(p);
+
+  if (needsNoTranscript) return { mode: 'none', segments: [] };
+  if (needsWordLevel) return { mode: 'full-words', segments: segs };
+
+  const tsMatch = p.match(/\b(?:at\s+)?(\d+):(\d+)\b/);
+  const startMatch = /\b(start|beginning|intro)\b/i.test(p);
+  const endMatch = /\b(end|ending|outro|last)\b/i.test(p);
+
+  let windowCenter = null;
+  if (tsMatch) {
+    windowCenter = parseInt(tsMatch[1], 10) * 60 + parseInt(tsMatch[2], 10);
+  } else if (startMatch) {
+    windowCenter = 0;
+  } else if (endMatch) {
+    const last = segs[segs.length - 1];
+    const et = last && (last.endTime != null ? last.endTime : last.end);
+    windowCenter = typeof et === 'number' ? et : 0;
+  }
+
+  if (windowCenter !== null) {
+    const w = typeof opt.windowSeconds === 'number' && opt.windowSeconds > 0 ? opt.windowSeconds : 15;
+    const filtered = segs.filter(s => {
+      const st = s.startTime != null ? s.startTime : s.start;
+      const et = s.endTime != null ? s.endTime : s.end;
+      if (typeof st !== 'number' || typeof et !== 'number') return false;
+      return et >= windowCenter - w && st <= windowCenter + w;
+    });
+    return {
+      mode:         'window',
+      segments:     filtered,
+      windowCenter,
+      windowRadius: w,
+    };
+  }
+
+  return {
+    mode: 'coarse',
+    segments: segs.map(s => ({
+      startTime: Math.round((s.startTime != null ? s.startTime : s.start) * 10) / 10,
+      endTime:   Math.round((s.endTime != null ? s.endTime : s.end) * 10) / 10,
+      text:      s.text || '',
+    })),
+  };
+}
+
+/**
+ * @param {Array} operations
+ * @returns {string}
+ */
+function summarizeOpsForHistory(operations) {
+  if (!Array.isArray(operations) || operations.length === 0) return 'No operations applied.';
+  const counts = {};
+  const details = [];
+  for (const op of operations) {
+    if (!op || typeof op !== 'object') continue;
+    const name = op.op;
+    if (typeof name === 'string') counts[name] = (counts[name] || 0) + 1;
+    if (name === 'CREATE' && op.element && op.element.type) {
+      details.push('created ' + op.element.type);
+    } else if (name === 'UPDATE' && op.elementId) {
+      details.push('updated ' + op.elementId);
+    } else if (name === 'DELETE' && op.elementId) {
+      details.push('deleted ' + op.elementId);
+    } else if (typeof name === 'string') {
+      details.push(name);
+    }
+  }
+  const countSummary = Object.entries(counts).map(([t, n]) => n + '×' + t).join(', ');
+  const det = details.slice(0, 10).join('; ');
+  return (
+    `Applied ${operations.length} op(s): ${countSummary}. Details: ${det}${details.length > 10 ? '…' : ''}`
+  );
+}
+
+/**
+ * @param {string} rawText
+ * @returns {{ valid: boolean, reason?: string, isExplanation?: boolean, operations?: Array }}
+ */
+function parseAndValidateOperationsJson(rawText) {
+  if (!rawText || typeof rawText !== 'string') return { valid: false, reason: 'empty' };
+  const stripped = stripMarkdownJsonFence(rawText);
+  if (stripped.startsWith('[]') && stripped.length > 2) {
+    return { valid: true, isExplanation: true, operations: [] };
+  }
+  let operations;
+  try {
+    operations = JSON.parse(stripped);
+  } catch (e) {
+    return { valid: false, reason: 'json: ' + e.message };
+  }
+  if (!Array.isArray(operations)) return { valid: false, reason: 'not array' };
+  for (let i = 0; i < operations.length; i++) {
+    const row = operations[i];
+    if (!row || typeof row !== 'object') return { valid: false, reason: 'op ' + i + ' not object' };
+    const opName = row.op;
+    if (typeof opName !== 'string' || !VALID_MODEL_OPERATION_OPS.has(opName)) {
+      return { valid: false, reason: 'bad op at ' + i };
+    }
+  }
+  return { valid: true, isExplanation: false, operations };
+}
 
 /**
  * Known operation names accepted from the model (reducer + server-side expansion).
@@ -137,6 +306,82 @@ function messageContentToString(content) {
     return JSON.stringify(content);
   } catch (_) {
     return '';
+  }
+}
+
+/** Chars÷4 — observability only (aligns with estimateTokens message side). */
+function approxTokensForMessageContent(content) {
+  return Math.ceil(messageContentToString(content).length / 4);
+}
+
+function approxTokensForSystemPrompt(systemPrompt) {
+  if (systemPrompt == null || typeof systemPrompt !== 'string') return 0;
+  return Math.ceil(systemPrompt.length / 4);
+}
+
+/**
+ * Segment breakdown before chat.completions.create (system vs history vs current user turn).
+ * @param {string} callSite
+ * @param {string} systemPrompt
+ * @param {Array<{role:string,content?:unknown}>} messages
+ * @param {{ bundles?: string[], transcriptMode?: string|null, transcriptSegments?: number|null, historyTurnCount?: number|null }} [meta]
+ */
+function recordCallBreakdown(callSite, systemPrompt, messages, meta = {}) {
+  const systemTokens = approxTokensForSystemPrompt(systemPrompt);
+  let historyTokens = 0;
+  let currentTurnTokens = 0;
+  if (Array.isArray(messages) && messages.length > 0) {
+    for (let i = 0; i < messages.length - 1; i++) {
+      historyTokens += approxTokensForMessageContent(messages[i].content);
+    }
+    currentTurnTokens = approxTokensForMessageContent(messages[messages.length - 1].content);
+  }
+  const total = systemTokens + historyTokens + currentTurnTokens;
+
+  let bundlePart = '';
+  if (Array.isArray(meta.bundles)) {
+    bundlePart = ` | bundles: ${meta.bundles.length ? meta.bundles.join(',') : 'core-only'}`;
+  }
+  let trPart = '';
+  if (meta.transcriptMode != null) {
+    trPart = ` | transcript: ${meta.transcriptMode}`;
+    if (meta.transcriptSegments != null) trPart += ` (${meta.transcriptSegments} segs)`;
+  }
+  const turnsPart = meta.historyTurnCount != null ? ` | turns: ${meta.historyTurnCount}` : '';
+
+  console.log(
+    `[${callSite}] breakdown — system: ${systemTokens} | history: ${historyTokens} | current: ${currentTurnTokens} | total_est: ${total}` +
+      bundlePart +
+      trPart +
+      turnsPart
+  );
+
+  metrics.recordSample(`${callSite}_systemTokens`, systemTokens);
+  metrics.recordSample(`${callSite}_historyTokens`, historyTokens);
+  metrics.recordSample(`${callSite}_currentTurnTokens`, currentTurnTokens);
+  metrics.recordSample(`${callSite}_estTotalTokens`, total);
+
+  return { systemTokens, historyTokens, currentTurnTokens, total };
+}
+
+function recordUsageSamples(callSite, usage) {
+  if (!usage || typeof usage !== 'object') return;
+  const inT = Number(usage.inputTokens);
+  const outT = Number(usage.outputTokens);
+  const cIn = Number(usage.cacheReadInputTokens) || 0;
+  if (!Number.isFinite(inT) || !Number.isFinite(outT)) return;
+  metrics.recordSample(`${callSite}_realInputTokens`, inT);
+  metrics.recordSample(`${callSite}_realOutputTokens`, outT);
+  metrics.recordSample(`${callSite}_realCachedTokens`, cIn);
+  const ratio = inT > 0 ? cIn / inT : 0;
+  metrics.recordSample(`${callSite}_cacheHitRatio`, ratio);
+}
+
+function recordGenerateRoutingOutcome(fallbackUsed) {
+  if (fallbackUsed) {
+    metrics.counts.routingRequestFallback = (metrics.counts.routingRequestFallback || 0) + 1;
+  } else {
+    metrics.counts.routingRequestSuccess = (metrics.counts.routingRequestSuccess || 0) + 1;
   }
 }
 
@@ -350,7 +595,7 @@ function compressTracks(tracks) {
   return out;
 }
 
-const SUBTITLE_KEYWORDS = [
+const SUBTITLE_TRACK_KEYWORDS = [
   'subtitle', 'caption', 'text', 'font', 'size', 'color', 'bold', 'italic', 'animation',
   'slide', 'pop', 'typewriter', 'outline', 'shadow', 'glow', 'box', 'uppercase', 'position',
   'align', 'center', 'bottom', 'top',
@@ -363,7 +608,7 @@ const VIDEO_KEYWORDS = [
   'remove section', 'keep only',
 ];
 
-const AUDIO_KEYWORDS = [
+const AUDIO_TRACK_KEYWORDS = [
   'audio', 'music', 'sound', 'track', 'volume', 'lofi', 'ambient', 'beat',
   'background', 'jamendo', 'freesound', 'upload', 'song', 'instrumental',
 ];
@@ -400,9 +645,9 @@ function selectRelevantTracks(tracks, prompt) {
   for (const ph of SUBTITLE_PHRASES) {
     if (p.includes(ph)) wantSub = true;
   }
-  if (promptMatchesAnyKeyword(p, SUBTITLE_KEYWORDS)) wantSub = true;
+  if (promptMatchesAnyKeyword(p, SUBTITLE_TRACK_KEYWORDS)) wantSub = true;
   if (promptMatchesAnyKeyword(p, VIDEO_KEYWORDS)) wantVid = true;
-  if (promptMatchesAnyKeyword(p, AUDIO_KEYWORDS)) wantAud = true;
+  if (promptMatchesAnyKeyword(p, AUDIO_TRACK_KEYWORDS)) wantAud = true;
 
   if (!wantSub && !wantVid && !wantAud) {
     return deepCloneJson(tracks);
@@ -810,10 +1055,11 @@ function buildClipSummary(tracks) {
  *
  * @param {string}      userPrompt
  * @param {object}      tracksForCurrentTracksJson  Serialized into CURRENT_TRACKS (may be compressed / selected).
- * @param {Array|null}  transcript
+ * @param {Array|null|object}  transcript  Full transcript array, or null, or { mode, segments } from selectTranscriptWindow.
  * @param {number}      sourceDuration
  * @param {Array}       uploadedAudioFiles
  * @param {object}      [tracksForClipSummary]       Full timeline for CLIP_SUMMARY (defaults to tracksForCurrentTracksJson).
+ * @param {{ useCanonicalJson?: boolean }} [opts]
  * @returns {string}
  */
 function buildUserTurnContent(
@@ -822,19 +1068,39 @@ function buildUserTurnContent(
   transcript,
   sourceDuration,
   uploadedAudioFiles,
-  tracksForClipSummary
+  tracksForClipSummary,
+  opts
 ) {
+  const useCanon = opts && opts.useCanonicalJson === true;
+  const j = useCanon ? canonicalStringify : (v) => JSON.stringify(v);
   const clipSrc =
     tracksForClipSummary != null && typeof tracksForClipSummary === 'object'
       ? tracksForClipSummary
       : tracksForCurrentTracksJson;
+
+  /** @type {object|null} */
+  let transcriptPayload = null;
+  if (transcript == null) {
+    transcriptPayload = null;
+  } else if (Array.isArray(transcript)) {
+    transcriptPayload = selectTranscriptWindow(transcript, userPrompt, {});
+    log(
+      `transcript mode: ${transcriptPayload ? transcriptPayload.mode : 'none'}, segments: ` +
+      (transcriptPayload && transcriptPayload.segments ? transcriptPayload.segments.length : 0)
+    );
+  } else if (typeof transcript === 'object') {
+    transcriptPayload = transcript;
+  }
+
+  const transStr = transcriptPayload == null ? 'null' : j(transcriptPayload);
+
   return (
     'PROMPT: ' + userPrompt + '\n\n' +
-    'CURRENT_TRACKS: ' + JSON.stringify(tracksForCurrentTracksJson) + '\n\n' +
-    'TRANSCRIPT: ' + (transcript ? JSON.stringify(transcript) : 'null') + '\n\n' +
+    'CURRENT_TRACKS: ' + j(tracksForCurrentTracksJson) + '\n\n' +
+    'TRANSCRIPT: ' + transStr + '\n\n' +
     buildClipSummary(clipSrc) + '\n\n' +
     'SOURCE_DURATION: ' + (sourceDuration || 0) + '\n\n' +
-    'CURRENT_UPLOADS: ' + JSON.stringify(uploadedAudioFiles || [])
+    'CURRENT_UPLOADS: ' + j(uploadedAudioFiles || [])
   );
 }
 
@@ -883,25 +1149,31 @@ function buildFullUserMessageFromExchange(ex) {
   const dur = ex && Number(ex.sourceDuration) ? Number(ex.sourceDuration) : 0;
   const prompt = ex && ex.promptText != null ? String(ex.promptText) : '';
   const tracksPayload = prepareTracksForClaude(rawTracks, prompt, {});
-  return buildUserTurnContent(prompt, tracksPayload, transcript, dur, [], rawTracks);
+  return buildUserTurnContent(prompt, tracksPayload, transcript, dur, [], rawTracks, {
+    useCanonicalJson: true,
+  });
 }
 
-const FULL_SNAPSHOT_DEFAULT = 3;
+const FULL_SNAPSHOT_DEFAULT = 1;
 const MAX_HISTORY_EXCHANGES   = 10;
 
 /**
  * Rough token estimate for rate-limit / payload guarding (chars ÷ 4).
+ * Include system prompt when estimating total request size.
  *
  * @param {Array<{role:string,content?:unknown}>} messages
+ * @param {string} [systemPrompt]
  * @returns {number}
  */
-function estimateTokens(messages) {
-  if (!Array.isArray(messages)) return 0;
-  return messages.reduce((total, msg) => {
+function estimateTokens(messages, systemPrompt) {
+  const sysChars = systemPrompt && typeof systemPrompt === 'string' ? systemPrompt.length : 0;
+  if (!Array.isArray(messages)) return Math.ceil(sysChars / 4);
+  const msgChars = messages.reduce((total, msg) => {
     const c = msg && msg.content;
     const s = messageContentToString(c);
-    return total + Math.ceil(String(s).length / 4);
+    return total + String(s).length;
   }, 0);
+  return Math.ceil((sysChars + msgChars) / 4);
 }
 
 /**
@@ -951,9 +1223,19 @@ function buildHistoryMessagesFromConversationExchanges(exchanges, fullSnapshotCo
       ? buildFullUserMessageFromExchange(ex)
       : buildStrippedUserMessageFromExchange(ex);
     messages.push({ role: 'user', content: userContent });
+    const useSummary =
+      FEATURE_HISTORY_SUMMARIES && index < tail.length - 1;
+    const assistantContent = useSummary
+      ? summarizeOpsForHistory(Array.isArray(ex.operations) ? ex.operations : [])
+      : JSON.stringify(Array.isArray(ex.operations) ? ex.operations : []);
+    if (useSummary) {
+      metrics.counts.historySummaryUsed = (metrics.counts.historySummaryUsed || 0) + 1;
+    } else {
+      metrics.counts.historyRawJsonUsed = (metrics.counts.historyRawJsonUsed || 0) + 1;
+    }
     messages.push({
       role:      'assistant',
-      content:   JSON.stringify(Array.isArray(ex.operations) ? ex.operations : []),
+      content:   assistantContent,
     });
   }
   return messages;
@@ -988,7 +1270,7 @@ const SUMMARY_SYSTEM =
  * @param {Array<{ promptText: string, operations: Array }>} exchanges
  * @returns {Promise<string>}
  */
-async function summarizeEditingConversation(exchanges) {
+async function summarizeEditingConversation(exchanges, userId = null) {
   if (!Array.isArray(exchanges) || exchanges.length === 0) {
     throw new Error('summarizeEditingConversation: exchanges must be a non-empty array');
   }
@@ -1000,7 +1282,9 @@ async function summarizeEditingConversation(exchanges) {
     const ex = exchanges[i];
     lines.push('Exchange ' + (i + 1) + ':');
     lines.push('User prompt: ' + (ex && ex.promptText != null ? String(ex.promptText) : ''));
-    lines.push('Operations: ' + JSON.stringify(ex && Array.isArray(ex.operations) ? ex.operations : []));
+    lines.push(
+      'Operations: ' + canonicalStringify(ex && Array.isArray(ex.operations) ? ex.operations : [])
+    );
     lines.push('');
   }
   const userMsg =
@@ -1012,16 +1296,23 @@ async function summarizeEditingConversation(exchanges) {
 
   let response;
   try {
-    response = await client.chat.completions.create({
-      model:       OPENAI_MODEL,
-      max_completion_tokens:  1024,
-      messages:    [
-        { role: 'system', content: SUMMARY_SYSTEM },
-        { role: 'user', content: userMsg },
-      ],
+    response = await chatCompletionRequest({
+      model:                 MODEL_FOR_SUMMARIZE,
+      messages:              [{ role: 'user', content: userMsg }],
+      systemPrompt:          SUMMARY_SYSTEM,
+      max_completion_tokens: 1024,
+      userId,
+      callSite:              'summarize',
     });
   } catch (err) {
     throw new Error('summarizeEditingConversation: API call failed — ' + formatOpenAIError(err));
+  }
+  const usage = usageFromChatCompletionResponse(response);
+  if (usage) {
+    metrics.recordChatUsage('summarize', usage);
+    log(
+      `[summarize] usage — in: ${usage.inputTokens} (cached: ${usage.cacheReadInputTokens}) | out: ${usage.outputTokens}`
+    );
   }
   const raw = response.choices && response.choices[0] && response.choices[0].message
     ? response.choices[0].message.content
@@ -1095,6 +1386,29 @@ function validateOperationElementRefs(operations, currentTracks) {
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+/**
+ * @param {{ model: string, messages: Array, systemPrompt: string, max_completion_tokens: number, userId?: string|null, callSite: string, breakdownMeta?: object }} opts
+ */
+async function chatCompletionRequest(opts) {
+  recordCallBreakdown(opts.callSite, opts.systemPrompt, opts.messages, opts.breakdownMeta || {});
+
+  const body = {
+    model:                 opts.model,
+    messages:              [
+      { role: 'system', content: opts.systemPrompt },
+      ...opts.messages,
+    ],
+    max_completion_tokens: opts.max_completion_tokens,
+  };
+  if (opts.userId && String(opts.userId).trim()) {
+    body.prompt_cache_key = `vibe-${opts.userId}-${opts.callSite}`;
+  }
+  const response = await client.chat.completions.create(body);
+  const usage = usageFromChatCompletionResponse(response);
+  if (usage) recordUsageSamples(opts.callSite, usage);
+  return response;
+}
 
 /**
  * expandSubtitleOps
@@ -1228,7 +1542,8 @@ async function generateOperations(
   transcript,
   sourceDuration,
   uploadedAudioFiles = [],
-  conversationExchanges = []
+  conversationExchanges = [],
+  userId = null
 ) {
   if (!userPrompt || typeof userPrompt !== 'string') {
     throw new Error('generateOperations: userPrompt must be a non-empty string');
@@ -1240,6 +1555,35 @@ async function generateOperations(
     throw new Error('generateOperations: OPENAI_API_KEY is not set in environment');
   }
 
+  const fullTranscript = Array.isArray(transcript) ? transcript : [];
+
+  const keywordBundles = selectRuleBundles(userPrompt);
+  const bundleCountKey = `bundles_${keywordBundles.length ? keywordBundles.join('_') : 'coreOnly'}`;
+  metrics.counts[bundleCountKey] = (metrics.counts[bundleCountKey] || 0) + 1;
+
+  const twForDiag =
+    fullTranscript.length > 0 ? selectTranscriptWindow(fullTranscript, userPrompt, {}) : null;
+  const transcriptModeForDiag = twForDiag ? twForDiag.mode : 'none';
+  const transcriptSegCount =
+    twForDiag && Array.isArray(twForDiag.segments) ? twForDiag.segments.length : 0;
+  const transcriptModeCountKey = `transcriptMode_${transcriptModeForDiag}`;
+  metrics.counts[transcriptModeCountKey] = (metrics.counts[transcriptModeCountKey] || 0) + 1;
+
+  let systemPrompt;
+  if (!FEATURE_PROMPT_BUNDLES) {
+    systemPrompt = SYSTEM_PROMPT;
+    log('rule bundles: FEATURE_PROMPT_BUNDLES off — full prompt');
+  } else {
+    const bundles = keywordBundles;
+    if (bundles.length === 0) {
+      systemPrompt = SYSTEM_PROMPT;
+      log('rule bundles: no keyword match — full prompt');
+    } else {
+      systemPrompt = buildSystemPrompt(bundles, true);
+      log(`rule bundles: ${bundles.join(',')}`);
+    }
+  }
+
   const tracksPayload = prepareTracksForClaude(currentTracks, userPrompt, {});
   const userMessage = buildUserTurnContent(
     userPrompt,
@@ -1247,16 +1591,19 @@ async function generateOperations(
     transcript,
     sourceDuration,
     uploadedAudioFiles,
-    currentTracks
+    currentTracks,
+    { useCanonicalJson: true }
   );
 
+  let fullSnapshotsUsed = FULL_SNAPSHOT_DEFAULT;
   let messages = buildMessagesForGenerate(
     Array.isArray(conversationExchanges) ? conversationExchanges : [],
     userMessage,
     FULL_SNAPSHOT_DEFAULT
   );
 
-  if (estimateTokens(messages) > 20000) {
+  if (estimateTokens(messages, systemPrompt) > 20000) {
+    fullSnapshotsUsed = 1;
     messages = buildMessagesForGenerate(
       Array.isArray(conversationExchanges) ? conversationExchanges : [],
       userMessage,
@@ -1264,88 +1611,125 @@ async function generateOperations(
     );
   }
 
-  if (estimateTokens(messages) > 25000) {
+  if (estimateTokens(messages, systemPrompt) > 25000) {
+    fullSnapshotsUsed = 0;
     messages = [{ role: 'user', content: userMessage }];
     console.warn(
-      '[generateOperations] Warning: conversation history dropped due to token limit (messages-only estimate > 25000)'
+      '[generateOperations] Warning: conversation history dropped due to token limit (estimate > 25000 incl. system)'
     );
   }
 
-  const estSys = Math.ceil(String(SYSTEM_PROMPT).length / 4);
-  const estimatedTokens = estimateTokens(messages);
+  if (fullSnapshotsUsed > 1) {
+    metrics.counts.historyFullSnapshotsGt1 = (metrics.counts.historyFullSnapshotsGt1 || 0) + 1;
+  }
+
+  const estimatedTokens = estimateTokens(messages, systemPrompt);
   log(
-    `Token estimate — system: ~${estSys} | messages: ~${estimatedTokens} | total: ~${estSys + estimatedTokens}`
+    `Token estimate — ~${estimatedTokens} (chars÷4, system+messages) | version ${SYSTEM_PROMPT_VERSION}`
   );
 
-  let response;
-  try {
-    response = await client.chat.completions.create({
-      model:       OPENAI_MODEL,
-      max_completion_tokens:  8000,
-      messages:    [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...messages,
-      ],
-    });
-  } catch (err) {
-    throw new Error('generateOperations: API call failed — ' + formatOpenAIError(err));
-  }
+  const tryModels = FEATURE_MODEL_ROUTING && MODEL_FOR_GENERATE !== MODEL_FLAGSHIP
+    ? [MODEL_FOR_GENERATE, MODEL_FLAGSHIP]
+    : [MODEL_FOR_GENERATE];
 
-  const claudeUsage = usageFromChatCompletionResponse(response);
-  if (claudeUsage) {
-    const cachedRead = claudeUsage.cacheReadInputTokens || 0;
-    const freshIn = Math.max(0, claudeUsage.inputTokens - cachedRead);
-    log(
-      'REAL token usage — ' +
-      'input: ' + claudeUsage.inputTokens + ' (fresh ' + freshIn + ' + cached ' + cachedRead + ') | ' +
-      'output: ' + claudeUsage.outputTokens + ' | ' +
-      'total: ' + claudeUsage.totalTokens + ' | ' +
-      'estimated was: ' + estimatedTokens
+  let rawText = '';
+  let claudeUsage = null;
+  let modelUsed = MODEL_FOR_GENERATE;
+  let fallbackUsed = false;
+
+  for (let ti = 0; ti < tryModels.length; ti++) {
+    const model = tryModels[ti];
+    let response;
+    try {
+      response = await chatCompletionRequest({
+        model,
+        messages,
+        systemPrompt,
+        max_completion_tokens: 8000,
+        userId,
+        callSite: 'generate',
+        breakdownMeta: {
+          bundles:        keywordBundles,
+          transcriptMode: transcriptModeForDiag,
+          transcriptSegments: transcriptSegCount,
+          historyTurnCount: messages.length >= 1 ? Math.floor((messages.length - 1) / 2) : 0,
+        },
+      });
+    } catch (err) {
+      if (ti === tryModels.length - 1) {
+        throw new Error('generateOperations: API call failed — ' + formatOpenAIError(err));
+      }
+      console.warn(`[generate] model ${model} failed: ${err.message} — retrying with fallback`);
+      metrics.counts.routingFallback += 1;
+      continue;
+    }
+
+    claudeUsage = usageFromChatCompletionResponse(response);
+    if (claudeUsage) {
+      metrics.recordChatUsage('generate', claudeUsage);
+      const cachedRead = claudeUsage.cacheReadInputTokens || 0;
+      const freshIn = Math.max(0, claudeUsage.inputTokens - cachedRead);
+      log(
+        'REAL token usage — ' +
+        'input: ' + claudeUsage.inputTokens + ' (fresh ' + freshIn + ' + cached ' + cachedRead + ') | ' +
+        'output: ' + claudeUsage.outputTokens + ' | ' +
+        'total: ' + claudeUsage.totalTokens + ' | ' +
+        'estimated: ' + estimatedTokens +
+        ` | model: ${model}`
+      );
+    }
+
+    const rawMsg = response.choices && response.choices[0] && response.choices[0].message
+      ? response.choices[0].message.content
+      : '';
+    rawText = stripMarkdownJsonFence(
+      typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
     );
-  } else {
-    log(
-      'REAL token usage — (could not parse usage from response) | estimated was: ' + estimatedTokens
-    );
+    if (!rawText) {
+      if (ti === tryModels.length - 1) {
+        throw new Error('generateOperations: model returned an empty response');
+      }
+      metrics.counts.routingFallback += 1;
+      continue;
+    }
+
+    const pv = parseAndValidateOperationsJson(rawText);
+    if (pv.valid) {
+      modelUsed = model;
+      if (ti > 0) fallbackUsed = true;
+      break;
+    }
+    if (ti === tryModels.length - 1) {
+      throw new Error(
+        'generateOperations: invalid operations JSON from all models — ' + (pv.reason || 'unknown')
+      );
+    }
+    console.warn(`[generate] model ${model} invalid ops (${pv.reason}) — falling back`);
+    metrics.counts.routingFallback += 1;
   }
 
-  const rawMsg = response.choices && response.choices[0] && response.choices[0].message
-    ? response.choices[0].message.content
-    : '';
-  const rawText = stripMarkdownJsonFence(
-    typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
-  );
-  if (!rawText) {
-    throw new Error('generateOperations: model returned an empty response');
+  const pvFinal = parseAndValidateOperationsJson(rawText);
+  if (!pvFinal.valid) {
+    throw new Error('generateOperations: parse failed — ' + (pvFinal.reason || ''));
   }
 
-  // [] followed by plain-language explanation (e.g. explain-last-change replies)
-  if (rawText.startsWith('[]') && rawText.length > 2) {
-    const explanation = rawText.slice(2).trim();
+  if (pvFinal.isExplanation) {
+    const st = stripMarkdownJsonFence(rawText);
+    const explanation = st.startsWith('[]') && st.length > 2 ? st.slice(2).trim() : '';
+    recordGenerateRoutingOutcome(fallbackUsed);
     return {
       operations:    [],
       warnings:      explanation ? [explanation] : ['No explanation text after [].'],
       isExplanation: true,
       claudeUsage,
+      modelUsed,
+      fallback:      fallbackUsed,
     };
   }
 
-  // Parse as JSON — response must be a valid JSON array.
-  let operations;
-  try {
-    operations = JSON.parse(rawText);
-  } catch (err) {
-    throw new Error(
-      'generateOperations: model response is not valid JSON.\n' +
-      'Parse error: ' + err.message + '\n' +
-      'Response starts with: ' + rawText.substring(0, 200)
-    );
-  }
-
+  let operations = pvFinal.operations;
   if (!Array.isArray(operations)) {
-    throw new Error(
-      'generateOperations: model response parsed as JSON but is not an array. ' +
-      'Got: ' + typeof operations
-    );
+    throw new Error('generateOperations: internal parse missing operations array');
   }
 
   validateParsedOperationOps(operations);
@@ -1353,11 +1737,12 @@ async function generateOperations(
   operations = decompressOperations(operations);
 
   // Expand any CREATE_SUBTITLES operations into BATCH_CREATE server-side.
-  operations = expandSubtitleOps(operations, transcript);
+  operations = expandSubtitleOps(operations, fullTranscript);
 
   const refInvalid = validateOperationElementRefs(operations, currentTracks);
   if (refInvalid) {
-    return { ...refInvalid, claudeUsage };
+    recordGenerateRoutingOutcome(fallbackUsed);
+    return { ...refInvalid, claudeUsage, modelUsed, fallback: fallbackUsed };
   }
 
   // Validate BATCH_CREATE operations before dispatching to reducer.
@@ -1520,12 +1905,26 @@ async function generateOperations(
     }
   }
 
-  return { operations, warnings, isExplanation: false, claudeUsage };
+  recordGenerateRoutingOutcome(fallbackUsed);
+  return {
+    operations,
+    warnings,
+    isExplanation: false,
+    claudeUsage,
+    modelUsed,
+    fallback:      fallbackUsed,
+  };
 }
 
 // ── Visual pipeline (Pass 1 / Pass 2) — VISUAL_COMPONENT_RULES never mixed into generateOperations ──
 
-const VISUAL_PASS_SYSTEM = () => `${SYSTEM_PROMPT.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
+function visualPassSystemContent() {
+  if (!FEATURE_PROMPT_BUNDLES) {
+    return `${SYSTEM_PROMPT.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
+  }
+  const sp = buildSystemPrompt(['animations', 'audio', 'complex', 'images', 'subtitles'], true);
+  return `${sp.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
+}
 
 function detectVisualIntent(prompt) {
   const p = String(prompt || '').toLowerCase();
@@ -1593,36 +1992,40 @@ async function generateVisualCandidates(
   stylePolicy,
   keyMomentsPolicy,
   visualContext,
-  opts = {}
+  opts = {},
+  userId = null
 ) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('generateVisualCandidates: OPENAI_API_KEY is not set');
   }
   const userMsg =
     'PROMPT: Scan this transcript for visual component opportunities.\n' +
-    'TRANSCRIPT: ' + JSON.stringify(transcript || []) + '\n' +
-    'STYLE_VISUAL_POLICY: ' + JSON.stringify(stylePolicy || {}) + '\n' +
-    'KEY_MOMENTS_POLICY: ' + JSON.stringify(keyMomentsPolicy || {}) + '\n' +
-    'CURRENT_VISUAL_CONTEXT: ' + JSON.stringify(visualContext || {});
+    'TRANSCRIPT: ' + canonicalStringify(transcript || []) + '\n' +
+    'STYLE_VISUAL_POLICY: ' + canonicalStringify(stylePolicy || {}) + '\n' +
+    'KEY_MOMENTS_POLICY: ' + canonicalStringify(keyMomentsPolicy || {}) + '\n' +
+    'CURRENT_VISUAL_CONTEXT: ' + canonicalStringify(visualContext || {});
 
   let response;
   try {
-    response = await client.chat.completions.create({
-      model:       OPENAI_MODEL,
-      max_completion_tokens:  8000,
-      messages:    [
-        { role: 'system', content: VISUAL_PASS_SYSTEM() },
-        { role: 'user', content: userMsg },
-      ],
+    response = await chatCompletionRequest({
+      model:                 MODEL_FOR_VISUAL_SCAN,
+      messages:              [{ role: 'user', content: userMsg }],
+      systemPrompt:          visualPassSystemContent(),
+      max_completion_tokens: 8000,
+      userId,
+      callSite:              'visual_scan',
     });
   } catch (err) {
     throw new Error('generateVisualCandidates: API failed — ' + formatOpenAIError(err));
   }
 
-  const u = response.usage || {};
-  const inTok = Number(u.prompt_tokens != null ? u.prompt_tokens : u.promptTokens) || 0;
-  const outTok = Number(u.completion_tokens != null ? u.completion_tokens : u.completionTokens) || 0;
-  console.log('[visual-pass1] prompt_tokens=' + inTok + ' completion_tokens=' + outTok);
+  const usage = usageFromChatCompletionResponse(response);
+  if (usage) {
+    metrics.recordChatUsage('visual_scan', usage);
+    log(
+      `[visual-pass1] usage — in: ${usage.inputTokens} (cached: ${usage.cacheReadInputTokens}) | out: ${usage.outputTokens}`
+    );
+  }
 
   const rawMsg = response.choices && response.choices[0] && response.choices[0].message
     ? response.choices[0].message.content
@@ -1640,34 +2043,37 @@ async function generateVisualCandidates(
   return arr;
 }
 
-async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy) {
+async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy, userId = null) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('generateRetrievalBrief: OPENAI_API_KEY is not set');
   }
   const userMsg =
     'PROMPT: Generate a retrieval brief for this visual candidate.\n' +
-    'CANDIDATE: ' + JSON.stringify(candidate || {}) + '\n' +
-    'TRANSCRIPT_CONTEXT: ' + JSON.stringify(transcriptContext || []) + '\n' +
-    'STYLE_VISUAL_POLICY: ' + JSON.stringify(stylePolicy || {});
+    'CANDIDATE: ' + canonicalStringify(candidate || {}) + '\n' +
+    'TRANSCRIPT_CONTEXT: ' + canonicalStringify(transcriptContext || []) + '\n' +
+    'STYLE_VISUAL_POLICY: ' + canonicalStringify(stylePolicy || {});
 
   let response;
   try {
-    response = await client.chat.completions.create({
-      model:       OPENAI_MODEL,
-      max_completion_tokens:  4096,
-      messages:    [
-        { role: 'system', content: VISUAL_PASS_SYSTEM() },
-        { role: 'user', content: userMsg },
-      ],
+    response = await chatCompletionRequest({
+      model:                 MODEL_FOR_VISUAL_BRIEF,
+      messages:              [{ role: 'user', content: userMsg }],
+      systemPrompt:          visualPassSystemContent(),
+      max_completion_tokens: 4096,
+      userId,
+      callSite:              'visual_brief',
     });
   } catch (err) {
     throw new Error('generateRetrievalBrief: API failed — ' + formatOpenAIError(err));
   }
 
-  const u = response.usage || {};
-  const inTok = Number(u.prompt_tokens != null ? u.prompt_tokens : u.promptTokens) || 0;
-  const outTok = Number(u.completion_tokens != null ? u.completion_tokens : u.completionTokens) || 0;
-  console.log('[visual-pass2] prompt_tokens=' + inTok + ' completion_tokens=' + outTok);
+  const usage = usageFromChatCompletionResponse(response);
+  if (usage) {
+    metrics.recordChatUsage('visual_brief', usage);
+    log(
+      `[visual-pass2] usage — in: ${usage.inputTokens} (cached: ${usage.cacheReadInputTokens}) | out: ${usage.outputTokens}`
+    );
+  }
 
   const rawMsg = response.choices && response.choices[0] && response.choices[0].message
     ? response.choices[0].message.content
@@ -1693,28 +2099,36 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy)
   return obj;
 }
 
-async function visualPipelineAiPick(candidate, assets) {
+async function visualPipelineAiPick(candidate, assets, userId = null) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('visualPipelineAiPick: OPENAI_API_KEY is not set');
   }
+  const pickSystem = 'You respond with JSON only. No markdown.';
   const userMsg =
     'Given these ranked visual assets for the moment described, choose the single best one. ' +
     'Return only the asset id as a JSON object: { "chosen_id": <number> }\n\n' +
-    'CANDIDATE: ' + JSON.stringify(candidate || {}) + '\n' +
-    'ASSETS: ' + JSON.stringify(assets || []);
+    'CANDIDATE: ' + canonicalStringify(candidate || {}) + '\n' +
+    'ASSETS: ' + canonicalStringify(assets || []);
 
   let response;
   try {
-    response = await client.chat.completions.create({
-      model:       OPENAI_MODEL,
-      max_completion_tokens:  256,
-      messages:    [
-        { role: 'system', content: 'You respond with JSON only. No markdown.' },
-        { role: 'user', content: userMsg },
-      ],
+    response = await chatCompletionRequest({
+      model:                 MODEL_FOR_VISUAL_PICK,
+      messages:              [{ role: 'user', content: userMsg }],
+      systemPrompt:          pickSystem,
+      max_completion_tokens: 256,
+      userId,
+      callSite:              'visual_pick',
     });
   } catch (err) {
     throw new Error('visualPipelineAiPick: API failed — ' + formatOpenAIError(err));
+  }
+  const usage = usageFromChatCompletionResponse(response);
+  if (usage) {
+    metrics.recordChatUsage('visual_pick', usage);
+    log(
+      `[visual-pick] usage — in: ${usage.inputTokens} (cached: ${usage.cacheReadInputTokens}) | out: ${usage.outputTokens}`
+    );
   }
   const rawMsg = response.choices && response.choices[0] && response.choices[0].message
     ? response.choices[0].message.content
