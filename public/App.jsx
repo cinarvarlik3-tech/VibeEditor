@@ -36,11 +36,15 @@
   }
 
   /**
-   * Normalizes POST /generate `claudeUsage` to Anthropic API numbers (same as server "REAL token usage").
+   * Normalizes POST /generate `claudeUsage` (OpenAI usage; field name kept for wire compatibility).
    * Accepts camelCase or snake_case; never uses char÷4 estimates.
    */
-  function normalizeClaudeUsageFromApi(raw) {
+  function normalizeClaudeUsageFromApi(raw, opts) {
     if (!raw || typeof raw !== 'object') return null;
+    const llmCacheHit =
+      opts && opts.llmCacheHit === true
+        ? true
+        : (raw.llmCacheHit === true || raw.llm_cache_hit === true);
     function pick(camel, snake) {
       const v = raw[camel] != null ? raw[camel] : raw[snake];
       const n = Number(v);
@@ -57,6 +61,7 @@
       totalTokens:              inT + outT,
       cacheCreationInputTokens: cc != null ? cc : 0,
       cacheReadInputTokens:     cr != null ? cr : 0,
+      llmCacheHit,
     };
   }
 
@@ -535,7 +540,7 @@
 
     const [isProcessing,      setIsProcessing]       = useState(false);
     const [cachedTranscript,  setCachedTranscript]   = useState(null);
-    /** Dev / tuning: last Claude Messages API usage from POST /generate (Anthropic billing tokens). */
+    /** Dev / tuning: last OpenAI Chat Completions usage from POST /generate. */
     const [claudeUsageLast,   setClaudeUsageLast]    = useState(null);
     const [claudeUsageSession, setClaudeUsageSession] = useState(0);
 
@@ -1413,10 +1418,14 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Generation failed');
 
-        const usageNorm = normalizeClaudeUsageFromApi(data.claudeUsage);
+        const usageNorm = normalizeClaudeUsageFromApi(data.claudeUsage, {
+          llmCacheHit: data.llmCacheHit === true,
+        });
         if (usageNorm) {
           setClaudeUsageLast(usageNorm);
-          setClaudeUsageSession(prev => prev + usageNorm.totalTokens);
+          if (!usageNorm.llmCacheHit) {
+            setClaudeUsageSession(prev => prev + usageNorm.totalTokens);
+          }
         }
 
         const ops = Array.isArray(data.operations) ? data.operations : [];

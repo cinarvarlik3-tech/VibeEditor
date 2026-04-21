@@ -1,28 +1,38 @@
 /**
  * src/claude/generate.js
  *
- * Claude API integration for Vibe Editor.
- * Sends the current timeline state and a user prompt to Claude,
+ * OpenAI API integration for Vibe Editor.
+ * Sends the current timeline state and a user prompt to the model,
  * and returns a JSON operations array ready to dispatch to timelineReducer.
  *
  * Role in project:
  *   Called by POST /generate in src/server.js.
  *   Replaces the old generateVideoComponent() which returned raw JSX.
- *   Claude now returns structured operations — no JSX, no rendering here.
+ *   The model returns structured operations — no JSX, no rendering here.
  */
 
 'use strict';
 
 require('dotenv').config();
-const Anthropic = require('@anthropic-ai/sdk');
+const { OpenAI, APIError } = require('openai');
 const { SYSTEM_PROMPT, VISUAL_COMPONENT_RULES } = require('./systemPrompt');
-const { searchAudio }   = require('../assets/audio');
-const { cacheAnthropicEnabled } = require('../cache/config');
+const { searchAudio } = require('../assets/audio');
 
 const log = (...args) => console.log('[generate]', ...args);
 
+const OPENAI_MODEL = 'gpt-5.4';
+
 /**
- * Read a numeric field from Anthropic usage (SDK may expose snake_case or camelCase).
+ * Known operation names accepted from the model (reducer + server-side expansion).
+ */
+const VALID_MODEL_OPERATION_OPS = new Set([
+  'CREATE', 'UPDATE', 'DELETE', 'CREATE_TRACK', 'DELETE_TRACK', 'BATCH_CREATE',
+  'ADD_KEYFRAME', 'UPDATE_KEYFRAME', 'DELETE_KEYFRAME', 'SPLIT_ELEMENT', 'REORDER_TRACK',
+  'SEARCH_AUDIO', 'CREATE_SUBTITLES',
+]);
+
+/**
+ * Read a numeric field from usage (SDK may expose snake_case or camelCase).
  * @param {object} u
  * @param {string} camelKey
  * @param {string} snakeKey
@@ -43,34 +53,71 @@ function pickUsageNumber(u, camelKey, snakeKey) {
 
 /**
  * Normalized usage for JSON responses + UI (matches server "REAL token usage" log).
+ * OpenAI: prompt_tokens / completion_tokens / total_tokens.
+ * Exposes cache* fields as 0 for compatibility with the existing AgentPanel display.
  * @param {object|null|undefined} resp
  * @returns {{ inputTokens:number, outputTokens:number, totalTokens:number, cacheCreationInputTokens:number, cacheReadInputTokens:number }|null}
  */
-function usageFromAnthropicMessage(resp) {
+function usageFromChatCompletionResponse(resp) {
   const u = resp && resp.usage;
   if (!u || typeof u !== 'object') return null;
-  const inTok = pickUsageNumber(u, 'inputTokens', 'input_tokens');
-  const outTok = pickUsageNumber(u, 'outputTokens', 'output_tokens');
+  const inTok = pickUsageNumber(u, 'promptTokens', 'prompt_tokens');
+  const outTok = pickUsageNumber(u, 'completionTokens', 'completion_tokens');
   if (!Number.isFinite(inTok) || !Number.isFinite(outTok)) return null;
-  const ccIn = pickUsageNumber(u, 'cacheCreationInputTokens', 'cache_creation_input_tokens');
-  const crIn = pickUsageNumber(u, 'cacheReadInputTokens', 'cache_read_input_tokens');
+  const totalFromApi = pickUsageNumber(u, 'totalTokens', 'total_tokens');
+  // OpenAI reports automatic prompt-cache hits inside prompt_tokens_details.cached_tokens.
+  // These are part of prompt_tokens but billed at a lower rate.
+  const details = u.prompt_tokens_details || u.promptTokensDetails || {};
+  const cachedIn = pickUsageNumber(details, 'cachedTokens', 'cached_tokens');
   return {
     inputTokens:              inTok,
     outputTokens:             outTok,
-    totalTokens:              inTok + outTok,
-    cacheCreationInputTokens: Number.isFinite(ccIn) ? ccIn : 0,
-    cacheReadInputTokens:     Number.isFinite(crIn) ? crIn : 0,
+    totalTokens:              Number.isFinite(totalFromApi) ? totalFromApi : inTok + outTok,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens:     Number.isFinite(cachedIn) ? cachedIn : 0,
   };
 }
 
-/** Anthropic prompt caching: stable system text as one cacheable block. */
-function anthropicSystemBlocks(systemText) {
-  if (!cacheAnthropicEnabled() || typeof systemText !== 'string') {
-    return systemText;
+function formatOpenAIError(err) {
+  if (err instanceof APIError) {
+    const status = err.status != null ? String(err.status) : '';
+    const req = err.message || String(err);
+    return status ? `OpenAI API error ${status}: ${req}` : `OpenAI API error: ${req}`;
   }
-  return [
-    { type: 'text', text: systemText, cache_control: { type: 'ephemeral' } },
-  ];
+  return err && err.message ? err.message : String(err);
+}
+
+/**
+ * Strip optional markdown code fences and trim (models sometimes wrap JSON).
+ * @param {string} text
+ * @returns {string}
+ */
+function stripMarkdownJsonFence(text) {
+  if (typeof text !== 'string') return '';
+  let raw = text.trim();
+  raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  return raw.trim();
+}
+
+/**
+ * Ensure each parsed operation has a recognized `op` before decompression.
+ * @param {unknown} operations
+ */
+function validateParsedOperationOps(operations) {
+  if (!Array.isArray(operations)) return;
+  for (let i = 0; i < operations.length; i++) {
+    const row = operations[i];
+    if (!row || typeof row !== 'object') {
+      throw new Error('generateOperations: operation at index ' + i + ' is not an object');
+    }
+    const opName = row.op;
+    if (typeof opName !== 'string' || !VALID_MODEL_OPERATION_OPS.has(opName)) {
+      throw new Error(
+        'generateOperations: unknown or missing op at index ' + i + ': ' +
+        JSON.stringify(opName)
+      );
+    }
+  }
 }
 
 function messageContentToString(content) {
@@ -859,7 +906,7 @@ function estimateTokens(messages) {
 
 /**
  * buildHistoryMessagesFromConversationExchanges
- * Builds Anthropic messages[] from structured exchanges.
+ * Builds chat messages[] (user / assistant turns only; system is added by the caller).
  * Only the last `fullSnapshotCount` exchanges in the retained tail include full CURRENT_TRACKS;
  * older retained exchanges use stripped PROMPT + CLIP_SUMMARY only.
  *
@@ -928,22 +975,7 @@ function buildMessagesForGenerate(conversationExchanges, currentUserMessageConte
   if (prior.length === 0) {
     return [{ role: 'user', content: currentUserMessageContent }];
   }
-  if (!cacheAnthropicEnabled()) {
-    return [...prior, { role: 'user', content: currentUserMessageContent }];
-  }
-  const lastIdx = prior.length - 1;
-  const withAssistantCache = prior.map((m, i) => {
-    if (i === lastIdx && m.role === 'assistant' && typeof m.content === 'string') {
-      return {
-        role:      'assistant',
-        content:   [
-          { type: 'text', text: m.content, cache_control: { type: 'ephemeral' } },
-        ],
-      };
-    }
-    return m;
-  });
-  return [...withAssistantCache, { role: 'user', content: currentUserMessageContent }];
+  return [...prior, { role: 'user', content: currentUserMessageContent }];
 }
 
 const SUMMARY_SYSTEM =
@@ -951,7 +983,7 @@ const SUMMARY_SYSTEM =
 
 /**
  * summarizeEditingConversation
- * Separate Claude call to compress the last N editing exchanges into a short summary.
+ * Separate API call to compress the last N editing exchanges into a short summary.
  *
  * @param {Array<{ promptText: string, operations: Array }>} exchanges
  * @returns {Promise<string>}
@@ -960,8 +992,8 @@ async function summarizeEditingConversation(exchanges) {
   if (!Array.isArray(exchanges) || exchanges.length === 0) {
     throw new Error('summarizeEditingConversation: exchanges must be a non-empty array');
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error('summarizeEditingConversation: ANTHROPIC_API_KEY is not set in environment');
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('summarizeEditingConversation: OPENAI_API_KEY is not set in environment');
   }
   const lines = [];
   for (let i = 0; i < exchanges.length; i++) {
@@ -980,21 +1012,25 @@ async function summarizeEditingConversation(exchanges) {
 
   let response;
   try {
-    response = await client.messages.create({
-      model:      'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system:     SUMMARY_SYSTEM,
-      messages:   [{ role: 'user', content: userMsg }],
+    response = await client.chat.completions.create({
+      model:       OPENAI_MODEL,
+      max_completion_tokens:  1024,
+      messages:    [
+        { role: 'system', content: SUMMARY_SYSTEM },
+        { role: 'user', content: userMsg },
+      ],
     });
   } catch (err) {
-    throw new Error('summarizeEditingConversation: Claude API call failed — ' + err.message);
+    throw new Error('summarizeEditingConversation: API call failed — ' + formatOpenAIError(err));
   }
-  const content = response.content;
-  const textBlock = content && content.find(block => block.type === 'text');
-  if (!textBlock || !textBlock.text) {
-    throw new Error('summarizeEditingConversation: Claude returned no text');
+  const raw = response.choices && response.choices[0] && response.choices[0].message
+    ? response.choices[0].message.content
+    : '';
+  const text = typeof raw === 'string' ? raw : messageContentToString(raw);
+  if (!text || !String(text).trim()) {
+    throw new Error('summarizeEditingConversation: model returned no text');
   }
-  return textBlock.text.trim();
+  return String(text).trim();
 }
 
 /**
@@ -1047,7 +1083,7 @@ function validateOperationElementRefs(operations, currentTracks) {
     return {
       operations:     [],
       warnings:       [
-        `Claude referenced clip IDs that don't exist on the timeline: ${details}. This can happen if you described a clip by number or name and Claude misidentified it. Try rephrasing with the exact filename or clip number from the timeline.`,
+        `The model referenced clip IDs that don't exist on the timeline: ${details}. This can happen if you described a clip by number or name and the model misidentified it. Try rephrasing with the exact filename or clip number from the timeline.`,
       ],
       isExplanation:  false,
     };
@@ -1055,15 +1091,15 @@ function validateOperationElementRefs(operations, currentTracks) {
   return null;
 }
 
-// Initialise Anthropic client once at module load.
-const client = new Anthropic.default({
-  apiKey: process.env.ANTHROPIC_API_KEY,
+// Initialise OpenAI client once at module load.
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 /**
  * expandSubtitleOps
  * Replaces any CREATE_SUBTITLES operation with a single BATCH_CREATE operation
- * by expanding the transcript server-side. Claude may return CREATE_SUBTITLES as
+ * by expanding the transcript server-side. The model may return CREATE_SUBTITLES as
  * a compact fallback (mode + styling template); this function does the mechanical
  * splitting and produces one BATCH_CREATE with template + elements array.
  *
@@ -1074,7 +1110,7 @@ const client = new Anthropic.default({
  *
  * Falls back to "sentence" if wordTimings are missing across all segments.
  *
- * @param {Array}       operations  Parsed operations array from Claude.
+ * @param {Array}       operations  Parsed operations array from the model.
  * @param {Array|null}  transcript  Whisper transcript segments array, or null.
  * @returns {Array}     New operations array with CREATE_SUBTITLES expanded to BATCH_CREATE.
  */
@@ -1174,7 +1210,7 @@ function expandSubtitleOps(operations, transcript) {
 
 /**
  * generateOperations
- * Calls Claude with the current timeline state and user prompt.
+ * Calls the language model with the current timeline state and user prompt.
  * Returns a validated JSON operations array.
  *
  * @param {string}      userPrompt     Natural-language edit instruction from the user.
@@ -1183,7 +1219,7 @@ function expandSubtitleOps(operations, transcript) {
  * @param {number}      sourceDuration Total source video duration in seconds.
  * @param {Array<object>} conversationExchanges Optional prior structured exchanges (max 10 used); only the last few include full tracks in user content (see buildHistoryMessagesFromConversationExchanges).
  *
- * @returns {Promise<{operations:Array,warnings?:Array,isExplanation?:boolean,claudeUsage?:{inputTokens:number,outputTokens:number,totalTokens:number}|null}>}
+ * @returns {Promise<{operations:Array,warnings?:Array,isExplanation?:boolean,claudeUsage?:{inputTokens:number,outputTokens:number,totalTokens:number}|null}>} claudeUsage key kept for API compatibility with the editor UI.
  * @throws  {Error}           Descriptive error if API call fails or response is not valid JSON array.
  */
 async function generateOperations(
@@ -1200,8 +1236,8 @@ async function generateOperations(
   if (!currentTracks || typeof currentTracks !== 'object') {
     throw new Error('generateOperations: currentTracks must be an object');
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error('generateOperations: ANTHROPIC_API_KEY is not set in environment');
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('generateOperations: OPENAI_API_KEY is not set in environment');
   }
 
   const tracksPayload = prepareTracksForClaude(currentTracks, userPrompt, {});
@@ -1243,25 +1279,27 @@ async function generateOperations(
 
   let response;
   try {
-    response = await client.messages.create({
-      model:      'claude-sonnet-4-20250514',
-      max_tokens: 8000,
-      system:     anthropicSystemBlocks(SYSTEM_PROMPT),
-      messages,
+    response = await client.chat.completions.create({
+      model:       OPENAI_MODEL,
+      max_completion_tokens:  8000,
+      messages:    [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...messages,
+      ],
     });
   } catch (err) {
-    throw new Error('generateOperations: Claude API call failed — ' + err.message);
+    throw new Error('generateOperations: API call failed — ' + formatOpenAIError(err));
   }
 
-  const claudeUsage = usageFromAnthropicMessage(response);
+  const claudeUsage = usageFromChatCompletionResponse(response);
   if (claudeUsage) {
+    const cachedRead = claudeUsage.cacheReadInputTokens || 0;
+    const freshIn = Math.max(0, claudeUsage.inputTokens - cachedRead);
     log(
       'REAL token usage — ' +
-      'input: ' + claudeUsage.inputTokens + ' | ' +
+      'input: ' + claudeUsage.inputTokens + ' (fresh ' + freshIn + ' + cached ' + cachedRead + ') | ' +
       'output: ' + claudeUsage.outputTokens + ' | ' +
       'total: ' + claudeUsage.totalTokens + ' | ' +
-      'cache_write_in: ' + claudeUsage.cacheCreationInputTokens + ' | ' +
-      'cache_read_in: ' + claudeUsage.cacheReadInputTokens + ' | ' +
       'estimated was: ' + estimatedTokens
     );
   } else {
@@ -1270,18 +1308,15 @@ async function generateOperations(
     );
   }
 
-  // Extract text content from the response.
-  const content = response.content;
-  if (!content || content.length === 0) {
-    throw new Error('generateOperations: Claude returned an empty response');
+  const rawMsg = response.choices && response.choices[0] && response.choices[0].message
+    ? response.choices[0].message.content
+    : '';
+  const rawText = stripMarkdownJsonFence(
+    typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
+  );
+  if (!rawText) {
+    throw new Error('generateOperations: model returned an empty response');
   }
-
-  const textBlock = content.find(block => block.type === 'text');
-  if (!textBlock || !textBlock.text) {
-    throw new Error('generateOperations: Claude response contained no text block');
-  }
-
-  const rawText = textBlock.text.trim();
 
   // [] followed by plain-language explanation (e.g. explain-last-change replies)
   if (rawText.startsWith('[]') && rawText.length > 2) {
@@ -1300,7 +1335,7 @@ async function generateOperations(
     operations = JSON.parse(rawText);
   } catch (err) {
     throw new Error(
-      'generateOperations: Claude response is not valid JSON.\n' +
+      'generateOperations: model response is not valid JSON.\n' +
       'Parse error: ' + err.message + '\n' +
       'Response starts with: ' + rawText.substring(0, 200)
     );
@@ -1308,10 +1343,12 @@ async function generateOperations(
 
   if (!Array.isArray(operations)) {
     throw new Error(
-      'generateOperations: Claude response parsed as JSON but is not an array. ' +
+      'generateOperations: model response parsed as JSON but is not an array. ' +
       'Got: ' + typeof operations
     );
   }
+
+  validateParsedOperationOps(operations);
 
   operations = decompressOperations(operations);
 
@@ -1558,8 +1595,8 @@ async function generateVisualCandidates(
   visualContext,
   opts = {}
 ) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error('generateVisualCandidates: ANTHROPIC_API_KEY is not set');
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('generateVisualCandidates: OPENAI_API_KEY is not set');
   }
   const userMsg =
     'PROMPT: Scan this transcript for visual component opportunities.\n' +
@@ -1570,23 +1607,29 @@ async function generateVisualCandidates(
 
   let response;
   try {
-    response = await client.messages.create({
-      model:      'claude-sonnet-4-20250514',
-      max_tokens: 8000,
-      system:     anthropicSystemBlocks(VISUAL_PASS_SYSTEM()),
-      messages:   [{ role: 'user', content: userMsg }],
+    response = await client.chat.completions.create({
+      model:       OPENAI_MODEL,
+      max_completion_tokens:  8000,
+      messages:    [
+        { role: 'system', content: VISUAL_PASS_SYSTEM() },
+        { role: 'user', content: userMsg },
+      ],
     });
   } catch (err) {
-    throw new Error('generateVisualCandidates: Claude API failed — ' + err.message);
+    throw new Error('generateVisualCandidates: API failed — ' + formatOpenAIError(err));
   }
 
   const u = response.usage || {};
-  const inTok = Number(u.input_tokens != null ? u.input_tokens : u.inputTokens) || 0;
-  const outTok = Number(u.output_tokens != null ? u.output_tokens : u.outputTokens) || 0;
-  console.log('[visual-pass1] input_tokens=' + inTok + ' output_tokens=' + outTok);
+  const inTok = Number(u.prompt_tokens != null ? u.prompt_tokens : u.promptTokens) || 0;
+  const outTok = Number(u.completion_tokens != null ? u.completion_tokens : u.completionTokens) || 0;
+  console.log('[visual-pass1] prompt_tokens=' + inTok + ' completion_tokens=' + outTok);
 
-  const textBlock = response.content && response.content.find(b => b.type === 'text');
-  const rawText = textBlock && textBlock.text ? textBlock.text.trim() : '';
+  const rawMsg = response.choices && response.choices[0] && response.choices[0].message
+    ? response.choices[0].message.content
+    : '';
+  const rawText = stripMarkdownJsonFence(
+    typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
+  );
   let arr = parseJsonArrayFromText(rawText);
   if (!opts.includeAllPriorities) {
     arr = arr.filter(c => {
@@ -1598,8 +1641,8 @@ async function generateVisualCandidates(
 }
 
 async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error('generateRetrievalBrief: ANTHROPIC_API_KEY is not set');
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('generateRetrievalBrief: OPENAI_API_KEY is not set');
   }
   const userMsg =
     'PROMPT: Generate a retrieval brief for this visual candidate.\n' +
@@ -1609,23 +1652,29 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy)
 
   let response;
   try {
-    response = await client.messages.create({
-      model:      'claude-sonnet-4-20250514',
-      max_tokens: 4096,
-      system:     anthropicSystemBlocks(VISUAL_PASS_SYSTEM()),
-      messages:   [{ role: 'user', content: userMsg }],
+    response = await client.chat.completions.create({
+      model:       OPENAI_MODEL,
+      max_completion_tokens:  4096,
+      messages:    [
+        { role: 'system', content: VISUAL_PASS_SYSTEM() },
+        { role: 'user', content: userMsg },
+      ],
     });
   } catch (err) {
-    throw new Error('generateRetrievalBrief: Claude API failed — ' + err.message);
+    throw new Error('generateRetrievalBrief: API failed — ' + formatOpenAIError(err));
   }
 
   const u = response.usage || {};
-  const inTok = Number(u.input_tokens != null ? u.input_tokens : u.inputTokens) || 0;
-  const outTok = Number(u.output_tokens != null ? u.output_tokens : u.outputTokens) || 0;
-  console.log('[visual-pass2] input_tokens=' + inTok + ' output_tokens=' + outTok);
+  const inTok = Number(u.prompt_tokens != null ? u.prompt_tokens : u.promptTokens) || 0;
+  const outTok = Number(u.completion_tokens != null ? u.completion_tokens : u.completionTokens) || 0;
+  console.log('[visual-pass2] prompt_tokens=' + inTok + ' completion_tokens=' + outTok);
 
-  const textBlock = response.content && response.content.find(b => b.type === 'text');
-  const rawText = textBlock && textBlock.text ? textBlock.text.trim() : '';
+  const rawMsg = response.choices && response.choices[0] && response.choices[0].message
+    ? response.choices[0].message.content
+    : '';
+  const rawText = stripMarkdownJsonFence(
+    typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
+  );
   const obj = parseJsonObjectFromText(rawText);
   if (!obj) return null;
 
@@ -1644,9 +1693,9 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy)
   return obj;
 }
 
-async function visualPipelineClaudePick(candidate, assets) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error('visualPipelineClaudePick: ANTHROPIC_API_KEY is not set');
+async function visualPipelineAiPick(candidate, assets) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('visualPipelineAiPick: OPENAI_API_KEY is not set');
   }
   const userMsg =
     'Given these ranked visual assets for the moment described, choose the single best one. ' +
@@ -1654,14 +1703,25 @@ async function visualPipelineClaudePick(candidate, assets) {
     'CANDIDATE: ' + JSON.stringify(candidate || {}) + '\n' +
     'ASSETS: ' + JSON.stringify(assets || []);
 
-  const response = await client.messages.create({
-    model:      'claude-sonnet-4-20250514',
-    max_tokens: 256,
-    system:     'You respond with JSON only. No markdown.',
-    messages:   [{ role: 'user', content: userMsg }],
-  });
-  const textBlock = response.content && response.content.find(b => b.type === 'text');
-  const raw = textBlock && textBlock.text ? textBlock.text.trim() : '{}';
+  let response;
+  try {
+    response = await client.chat.completions.create({
+      model:       OPENAI_MODEL,
+      max_completion_tokens:  256,
+      messages:    [
+        { role: 'system', content: 'You respond with JSON only. No markdown.' },
+        { role: 'user', content: userMsg },
+      ],
+    });
+  } catch (err) {
+    throw new Error('visualPipelineAiPick: API failed — ' + formatOpenAIError(err));
+  }
+  const rawMsg = response.choices && response.choices[0] && response.choices[0].message
+    ? response.choices[0].message.content
+    : '';
+  const raw = stripMarkdownJsonFence(
+    typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
+  ) || '{}';
   let parsed;
   try {
     parsed = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
@@ -1669,7 +1729,7 @@ async function visualPipelineClaudePick(candidate, assets) {
     parsed = {};
   }
   const id = parsed && parsed.chosen_id != null ? Number(parsed.chosen_id) : NaN;
-  if (!Number.isFinite(id)) throw new Error('visualPipelineClaudePick: invalid chosen_id');
+  if (!Number.isFinite(id)) throw new Error('visualPipelineAiPick: invalid chosen_id');
   return { chosen_id: id };
 }
 
@@ -1722,7 +1782,7 @@ module.exports = {
   buildUserTurnContent,
   buildHistoryMessagesFromConversationExchanges,
   estimateTokens,
-  usageFromAnthropicMessage,
+  usageFromChatCompletionResponse,
   buildMessagesForGenerate,
   compressTracks,
   selectRelevantTracks,
@@ -1730,6 +1790,6 @@ module.exports = {
   detectVisualIntent,
   generateVisualCandidates,
   generateRetrievalBrief,
-  visualPipelineClaudePick,
+  visualPipelineAiPick,
   extractTranscriptContext,
 };

@@ -1,7 +1,7 @@
 {
   "name": "vibe-editor",
   "version": "1.0.0",
-  "description": "Claude-powered automated AI video editing tool",
+  "description": "AI-assisted timeline-based video editor",
   "main": "src/server.js",
   "scripts": {
     "predev": "lsof -ti :3000 | xargs kill -9 2>/dev/null; sleep 1; exit 0",
@@ -10,7 +10,6 @@
     "test:stage1": "node tests/test-stage1.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.52.0",
     "@remotion/cli": "^4.0.190",
     "@supabase/supabase-js": "^2.103.3",
     "axios": "^1.7.2",
@@ -21,6 +20,7 @@
     "form-data": "^4.0.5",
     "lru-cache": "^11.3.5",
     "multer": "^1.4.5-lts.1",
+    "openai": "^6.34.0",
     "remotion": "^4.0.190"
   },
   "devDependencies": {

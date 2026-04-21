@@ -4,7 +4,7 @@
  *
  * Serves the static frontend, state files, and orchestrates the pipeline:
  *   POST /upload    → save video, return metadata
- *   POST /generate  → (optional) transcribe + Claude operations → return { operations, transcript }
+ *   POST /generate  → (optional) transcribe + AI operations → return { operations, transcript }
  *   POST /export    → serialize timeline → Remotion render → output file
  *   GET  /download/:filename → serve rendered video as download
  *   GET  /renders/*          → serve rendered output as streamable video (for VideoPreview)
@@ -51,7 +51,7 @@ const {
   generateVisualCandidates,
   generateRetrievalBrief,
   extractTranscriptContext,
-  visualPipelineClaudePick,
+  visualPipelineAiPick,
 } = require('./claude/generate');
 const { searchFreesound, searchJamendo, searchAudio } = require('./assets/audio');
 
@@ -71,6 +71,7 @@ const {
 } = require('./cache/renderCache');
 const metrics = require('./cache/metrics');
 const { cacheTranscriptRenderEnabled } = require('./cache/config');
+const { makeLlmResponseCache } = require('./cache/llmResponseCache');
 
 /** In-memory API response caches (see docs/sql/cache_tables.sql for Supabase transcript cache). */
 const fontsLRU           = makeLRU({ max: 2, ttlMs: 24 * 60 * 60 * 1000, name: 'fonts' });
@@ -78,6 +79,43 @@ const pixabayLRU         = makeLRU({ max: 500, ttlMs: 24 * 60 * 60 * 1000, name:
 const audioFreesoundLRU  = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_freesound' });
 const audioJamendoLRU    = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_jamendo' });
 const audioUnifiedLRU    = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_unified' });
+
+/** Deterministic LLM response memoization (per-user; in-memory). */
+const generateLlmCache = makeLlmResponseCache({
+  name:       'llm_generate',
+  maxEnv:     'LLM_RESPONSE_CACHE_MAX',
+  ttlMsEnv:   'LLM_RESPONSE_CACHE_TTL_MS',
+  defaultMax: 200,
+  defaultTtlMs: 5 * 60 * 1000,
+});
+const summarizeLlmCache = makeLlmResponseCache({
+  name:       'llm_summarize',
+  maxEnv:     'LLM_SUMMARIZE_CACHE_MAX',
+  ttlMsEnv:   'LLM_SUMMARIZE_CACHE_TTL_MS',
+  defaultMax: 80,
+  defaultTtlMs: 30 * 60 * 1000,
+});
+const visualScanLlmCache = makeLlmResponseCache({
+  name:       'llm_visual_scan',
+  maxEnv:     'LLM_VISUAL_SCAN_CACHE_MAX',
+  ttlMsEnv:   'LLM_VISUAL_SCAN_CACHE_TTL_MS',
+  defaultMax: 60,
+  defaultTtlMs: 15 * 60 * 1000,
+});
+const visualBriefLlmCache = makeLlmResponseCache({
+  name:       'llm_visual_brief',
+  maxEnv:     'LLM_VISUAL_BRIEF_CACHE_MAX',
+  ttlMsEnv:   'LLM_VISUAL_BRIEF_CACHE_TTL_MS',
+  defaultMax: 200,
+  defaultTtlMs: 15 * 60 * 1000,
+});
+const visualPickLlmCache = makeLlmResponseCache({
+  name:       'llm_visual_pick',
+  maxEnv:     'LLM_VISUAL_PICK_CACHE_MAX',
+  ttlMsEnv:   'LLM_VISUAL_PICK_CACHE_TTL_MS',
+  defaultMax: 400,
+  defaultTtlMs: 15 * 60 * 1000,
+});
 
 /*
   Run in Supabase SQL editor (Storage + projects):
@@ -297,8 +335,15 @@ app.post('/api/auth/verify', requireAuth, (req, res) => {
 app.get('/api/_debug/cache', requireAuth, (req, res) => {
   res.json({
     cacheMetrics:     metrics.snapshot(),
-    cacheAnthropic:   process.env.CACHE_ENABLED !== 'false',
+    cacheTranscriptRender: process.env.CACHE_ENABLED !== 'false',
     transcriptRender: process.env.CACHE_ENABLED !== 'false',
+    llmResponseCaches: {
+      generate:   { max: generateLlmCache.max, ttlMs: generateLlmCache.ttlMs },
+      summarize:  { max: summarizeLlmCache.max, ttlMs: summarizeLlmCache.ttlMs },
+      visualScan: { max: visualScanLlmCache.max, ttlMs: visualScanLlmCache.ttlMs },
+      visualBrief:{ max: visualBriefLlmCache.max, ttlMs: visualBriefLlmCache.ttlMs },
+      visualPick: { max: visualPickLlmCache.max, ttlMs: visualPickLlmCache.ttlMs },
+    },
   });
 });
 
@@ -775,8 +820,8 @@ app.post('/upload', requireAuth, upload.single('video'), async (req, res) => {
  *   presetName    {string|null}   Optional preset (Stage 3)
  *   conversationExchanges {Array<object>} Optional structured prior exchanges (see generate.js)
  *
- * Response: { operations: Array, transcript: Array, warnings?: Array, isExplanation?: boolean, claudeUsage?: { inputTokens, outputTokens, totalTokens } }
- */
+ * Response: { operations, transcript, warnings?, isExplanation?, claudeUsage?, llmCacheHit?, llmCache? }
+   */
 app.post('/generate', requireAuth, async (req, res) => {
   const {
     videoPath,
@@ -836,22 +881,53 @@ app.post('/generate', requireAuth, async (req, res) => {
     // ── Step 2: Get source duration ──────────────────────────────────────────
     const sourceDuration = await getVideoDuration(resolvedVideoPath);
 
-    // ── Step 3: Generate operations via Claude ───────────────────────────────
-    log('Generating operations with Claude...');
+    // ── Step 3: Generate operations via OpenAI ───────────────────────────────
+    log('Generating operations with OpenAI...');
     const uploadedAudioFiles = scanUploadedAudio();
     const priorEx = Array.isArray(conversationExchanges) ? conversationExchanges : [];
-    const result = await generateOperations(
-      prompt,
+
+    const generateCachePayload = {
+      userId:                 req.user.id,
+      prompt:                 String(prompt),
       currentTracks,
       transcript,
       sourceDuration,
       uploadedAudioFiles,
-      priorEx
-    );
+      conversationExchanges:  priorEx,
+    };
+    const generateCacheKey = generateLlmCache.keyForPayload(generateCachePayload);
+    const cachedGenerate = generateLlmCache.get(generateCacheKey);
+    let result;
+    if (cachedGenerate) {
+      log(`LLM response cache HIT (${generateLlmCache.name}) key=${generateCacheKey.slice(0, 12)}…`);
+      result = cachedGenerate;
+    } else {
+      result = await generateOperations(
+        prompt,
+        currentTracks,
+        transcript,
+        sourceDuration,
+        uploadedAudioFiles,
+        priorEx
+      );
+      generateLlmCache.set(generateCacheKey, result);
+      log(`LLM response cache MISS (${generateLlmCache.name}) key=${generateCacheKey.slice(0, 12)}…`);
+    }
+
     const { operations, warnings, isExplanation, claudeUsage } = result;
+    const usageOut = cachedGenerate
+      ? {
+        inputTokens:              0,
+        outputTokens:             0,
+        totalTokens:              0,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens:     0,
+      }
+      : (claudeUsage && typeof claudeUsage === 'object' ? claudeUsage : null);
+
     log(`Operations generated — ${operations.length} operation(s)`);
-    if (claudeUsage && typeof claudeUsage.totalTokens === 'number') {
-      log(`Claude tokens — in: ${claudeUsage.inputTokens} · out: ${claudeUsage.outputTokens} · total: ${claudeUsage.totalTokens}`);
+    if (usageOut && typeof usageOut.totalTokens === 'number') {
+      log(`LLM tokens — in: ${usageOut.inputTokens} · out: ${usageOut.outputTokens} · total: ${usageOut.totalTokens}`);
     }
     if (warnings && warnings.length > 0) {
       log(`Warnings: ${warnings.join('; ')}`);
@@ -865,7 +941,9 @@ app.post('/generate', requireAuth, async (req, res) => {
       transcript,
       warnings:       warnings != null && Array.isArray(warnings) ? warnings : [],
       isExplanation:  !!isExplanation,
-      claudeUsage:    claudeUsage && typeof claudeUsage === 'object' ? claudeUsage : null,
+      claudeUsage:    usageOut,
+      llmCacheHit:    !!cachedGenerate,
+      llmCache:       cachedGenerate ? { scope: 'generate', keyPrefix: generateCacheKey.slice(0, 12) } : null,
     });
 
   } catch (err) {
@@ -880,7 +958,7 @@ app.post('/generate', requireAuth, async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // POST /api/summarize-conversation
-// Compresses up to 10 editing exchanges via a separate Claude call (after edits complete).
+// Compresses up to 10 editing exchanges via a separate LLM call (after edits complete).
 // ---------------------------------------------------------------------------
 app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
   try {
@@ -891,8 +969,25 @@ app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
     if (exchanges.length > 10) {
       return res.status(400).json({ error: 'exchanges must contain at most 10 items' });
     }
-    const text = await summarizeEditingConversation(exchanges);
-    res.json({ summary: text });
+
+    const sumKeyPayload = { userId: req.user.id, exchanges };
+    const sumKey = summarizeLlmCache.keyForPayload(sumKeyPayload);
+    const cachedSum = summarizeLlmCache.get(sumKey);
+    let text;
+    if (cachedSum && typeof cachedSum.summary === 'string') {
+      text = cachedSum.summary;
+      log(`LLM response cache HIT (${summarizeLlmCache.name}) key=${sumKey.slice(0, 12)}…`);
+    } else {
+      text = await summarizeEditingConversation(exchanges);
+      summarizeLlmCache.set(sumKey, { summary: text });
+      log(`LLM response cache MISS (${summarizeLlmCache.name}) key=${sumKey.slice(0, 12)}…`);
+    }
+
+    res.json({
+      summary:     text,
+      llmCacheHit: !!cachedSum,
+      llmCache:    cachedSum ? { scope: 'summarize', keyPrefix: sumKey.slice(0, 12) } : null,
+    });
   } catch (err) {
     log(`summarize-conversation error: ${err.message}`);
     res.status(500).json({ error: err.message || 'Summarization failed' });
@@ -1089,14 +1184,36 @@ app.post('/api/pixabay/ingest', requireAuth, async (req, res) => {
 app.post('/api/visual/scan', requireAuth, async (req, res) => {
   try {
     const { transcript, stylePolicy, keyMomentsPolicy, visualContext } = req.body || {};
-    const candidates = await generateVisualCandidates(
+    const scanPayload = {
+      userId:           req.user.id,
       transcript,
-      stylePolicy || {},
-      keyMomentsPolicy || {},
-      visualContext || {},
-      {}
-    );
-    res.json({ candidates });
+      stylePolicy:      stylePolicy || {},
+      keyMomentsPolicy: keyMomentsPolicy || {},
+      visualContext:    visualContext || {},
+      opts:             {},
+    };
+    const scanKey = visualScanLlmCache.keyForPayload(scanPayload);
+    const cachedScan = visualScanLlmCache.get(scanKey);
+    let candidates;
+    if (cachedScan && Array.isArray(cachedScan.candidates)) {
+      candidates = cachedScan.candidates;
+      log(`LLM response cache HIT (${visualScanLlmCache.name}) key=${scanKey.slice(0, 12)}…`);
+    } else {
+      candidates = await generateVisualCandidates(
+        transcript,
+        stylePolicy || {},
+        keyMomentsPolicy || {},
+        visualContext || {},
+        {}
+      );
+      visualScanLlmCache.set(scanKey, { candidates });
+      log(`LLM response cache MISS (${visualScanLlmCache.name}) key=${scanKey.slice(0, 12)}…`);
+    }
+    res.json({
+      candidates,
+      llmCacheHit: !!cachedScan,
+      llmCache:    cachedScan ? { scope: 'visual_scan', keyPrefix: scanKey.slice(0, 12) } : null,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message || 'visual scan failed' });
   }
@@ -1108,8 +1225,28 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
     if (!candidate) return res.status(400).json({ error: 'candidate is required' });
     const st = candidate.start_time != null ? candidate.start_time : candidate.startTime;
     const ctx = extractTranscriptContext(transcript || [], st, 10);
-    const brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {});
-    res.json({ brief });
+    const briefPayload = {
+      userId:        req.user.id,
+      candidate,
+      transcriptCtx: ctx,
+      stylePolicy:   stylePolicy || {},
+    };
+    const briefKey = visualBriefLlmCache.keyForPayload(briefPayload);
+    const cachedBrief = visualBriefLlmCache.get(briefKey);
+    let brief;
+    if (cachedBrief && Object.prototype.hasOwnProperty.call(cachedBrief, 'brief')) {
+      brief = cachedBrief.brief;
+      log(`LLM response cache HIT (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
+    } else {
+      brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {});
+      visualBriefLlmCache.set(briefKey, { brief });
+      log(`LLM response cache MISS (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
+    }
+    res.json({
+      brief,
+      llmCacheHit: !!cachedBrief,
+      llmCache:    cachedBrief ? { scope: 'visual_brief', keyPrefix: briefKey.slice(0, 12) } : null,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message || 'visual brief failed' });
   }
@@ -1118,10 +1255,29 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
 app.post('/api/visual/claude-pick', requireAuth, async (req, res) => {
   try {
     const { candidate, assets } = req.body || {};
-    const out = await visualPipelineClaudePick(candidate || {}, Array.isArray(assets) ? assets : []);
-    res.json(out);
+    const pickPayload = {
+      userId:   req.user.id,
+      candidate: candidate || {},
+      assets:    Array.isArray(assets) ? assets : [],
+    };
+    const pickKey = visualPickLlmCache.keyForPayload(pickPayload);
+    const cachedPick = visualPickLlmCache.get(pickKey);
+    let out;
+    if (cachedPick && cachedPick.chosen_id != null) {
+      out = cachedPick;
+      log(`LLM response cache HIT (${visualPickLlmCache.name}) key=${pickKey.slice(0, 12)}…`);
+    } else {
+      out = await visualPipelineAiPick(candidate || {}, Array.isArray(assets) ? assets : []);
+      visualPickLlmCache.set(pickKey, out);
+      log(`LLM response cache MISS (${visualPickLlmCache.name}) key=${pickKey.slice(0, 12)}…`);
+    }
+    res.json({
+      ...out,
+      llmCacheHit: !!cachedPick,
+      llmCache:    cachedPick ? { scope: 'visual_pick', keyPrefix: pickKey.slice(0, 12) } : null,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message || 'claude-pick failed' });
+    res.status(500).json({ error: err.message || 'visual pick failed' });
   }
 });
 
@@ -1380,7 +1536,7 @@ app.get('/download/:filename', requireAuth, (req, res) => {
 /**
  * scanUploadedAudio
  * Scans the uploads/ directory and returns metadata for every audio file found.
- * Called before generateOperations so Claude knows which files are available.
+ * Called before generateOperations so the model knows which files are available.
  *
  * @returns {Array} Array of { filename, url, name }
  */

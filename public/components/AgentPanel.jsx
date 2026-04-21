@@ -624,7 +624,7 @@
           </div>
           </div>
           <div
-            title="Anthropic Messages API usage (input_tokens + output_tokens) — same numbers as the server REAL token log, not the char÷4 estimate."
+            title="OpenAI Chat Completions usage (prompt_tokens + completion_tokens) — same numbers as the server REAL token log, not the char÷4 estimate. 'cache read' is OpenAI's automatic prompt-cache hit (cheaper). 'server memo' means the response was served from the server's in-memory duplicate-request cache (no API call; $0)."
             style={{
               fontSize:     10,
               lineHeight:   1.35,
@@ -637,7 +637,13 @@
           >
             {(() => {
               if (!claudeUsageLast) {
-                return 'Claude tokens (API): — (send a prompt; usage comes from /generate)';
+                return 'LLM Tokens (API): — (send a prompt; usage comes from /generate)';
+              }
+              if (claudeUsageLast.llmCacheHit) {
+                return (
+                  'LLM Tokens (last): server memo (duplicate request; no API call)' +
+                  ` · session Σ ${fmtTok(claudeUsageSessionTotal)}`
+                );
               }
               const inN = Number(claudeUsageLast.inputTokens);
               const outN = Number(claudeUsageLast.outputTokens);
@@ -647,14 +653,13 @@
               } else if (Number.isFinite(Number(claudeUsageLast.totalTokens))) {
                 totalReal = Number(claudeUsageLast.totalTokens);
               }
-              const cacheR = claudeUsageLast.cacheReadInputTokens;
-              const cacheW = claudeUsageLast.cacheCreationInputTokens;
-              const cacheBit = (Number(cacheR) > 0 || Number(cacheW) > 0)
-                ? ` · cache read ${fmtTok(cacheR)} / write ${fmtTok(cacheW)}`
+              const cacheR = Number(claudeUsageLast.cacheReadInputTokens) || 0;
+              const fresh = Math.max(0, Number(inN) - cacheR);
+              const cacheBit = cacheR > 0
+                ? ` (fresh ${fmtTok(fresh)} + cached ${fmtTok(cacheR)})`
                 : '';
               return (
-                `Claude tokens (API, last): in ${fmtTok(inN)} + out ${fmtTok(outN)} = ${fmtTok(totalReal)}` +
-                cacheBit +
+                `LLM Tokens (API, last): in ${fmtTok(inN)}${cacheBit} + out ${fmtTok(outN)} = ${fmtTok(totalReal)}` +
                 ` · session Σ ${fmtTok(claudeUsageSessionTotal)}`
               );
             })()}
