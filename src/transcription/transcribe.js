@@ -226,4 +226,14 @@ function safeStringify(x) {
   }
 }
 
-module.exports = { transcribeAudio };
+/**
+ * Stable key for transcript cache rows (ISO-639-1 or 'auto' when Whisper auto-detects).
+ * @param {string|null|undefined} language
+ * @returns {string}
+ */
+function languageHintForCache(language) {
+  const iso = mapLanguage(language);
+  return iso || 'auto';
+}
+
+module.exports = { transcribeAudio, languageHintForCache };

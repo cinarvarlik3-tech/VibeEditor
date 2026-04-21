@@ -45,7 +45,6 @@ const { createClient } = require('@supabase/supabase-js');
 
 const { extractAudio, convertImageToVideo, extractThumbnailAtPercent } = require('./video/extract');
 const { serializeToRemotion } = require('./video/serializeToRemotion');
-const { transcribeAudio }     = require('./transcription/transcribe');
 const {
   generateOperations,
   summarizeEditingConversation,
@@ -62,6 +61,23 @@ const supabaseAdmin =
         auth: { autoRefreshToken: false, persistSession: false },
       })
     : null;
+
+const { makeLRU } = require('./cache/lru');
+const { getOrTranscribeAudio } = require('./cache/transcriptCache');
+const {
+  computeRenderHash,
+  renderCacheFilePath,
+  saveRenderToCache,
+} = require('./cache/renderCache');
+const metrics = require('./cache/metrics');
+const { cacheTranscriptRenderEnabled } = require('./cache/config');
+
+/** In-memory API response caches (see docs/sql/cache_tables.sql for Supabase transcript cache). */
+const fontsLRU           = makeLRU({ max: 2, ttlMs: 24 * 60 * 60 * 1000, name: 'fonts' });
+const pixabayLRU         = makeLRU({ max: 500, ttlMs: 24 * 60 * 60 * 1000, name: 'pixabay' });
+const audioFreesoundLRU  = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_freesound' });
+const audioJamendoLRU    = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_jamendo' });
+const audioUnifiedLRU    = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_unified' });
 
 /*
   Run in Supabase SQL editor (Storage + projects):
@@ -174,7 +190,11 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // ---------------------------------------------------------------------------
 
 app.get('/status', (req, res) => {
-  res.json({ status: 'ok', version: '0.2.0' });
+  const base = { status: 'ok', version: '0.2.0' };
+  if (String(req.query.debug || '') === 'cache') {
+    return res.json({ ...base, cache: metrics.snapshot() });
+  }
+  res.json(base);
 });
 
 /** Google Fonts catalogue — used when GOOGLE_FONTS_API_KEY is missing or API fails */
@@ -201,21 +221,19 @@ const FONTS_FALLBACK = [
   { family: 'Dancing Script', category: 'handwriting', variants: ['400', '700'] },
 ];
 
-const FONTS_CACHE_MS = 24 * 60 * 60 * 1000;
-let fontsApiCache = { expiresAt: 0, list: null };
+const FONTS_LRU_KEY = 'google-fonts';
 
 /**
  * GET /api/fonts — simplified Google Web Fonts list (public, no auth).
- * Cached 24h in memory. Falls back to FONTS_FALLBACK if no API key or request fails.
+ * Cached 24h in memory (LRU). Falls back to FONTS_FALLBACK if no API key or request fails.
  */
 app.get('/api/fonts', async (req, res) => {
   try {
-    if (fontsApiCache.list && Date.now() < fontsApiCache.expiresAt) {
-      return res.json(fontsApiCache.list);
-    }
+    const cached = fontsLRU.get(FONTS_LRU_KEY);
+    if (cached !== undefined) return res.json(cached);
     const key = process.env.GOOGLE_FONTS_API_KEY;
     if (!key || !String(key).trim()) {
-      fontsApiCache = { expiresAt: Date.now() + FONTS_CACHE_MS, list: FONTS_FALLBACK };
+      fontsLRU.set(FONTS_LRU_KEY, FONTS_FALLBACK);
       return res.json(FONTS_FALLBACK);
     }
     const url =
@@ -225,6 +243,7 @@ app.get('/api/fonts', async (req, res) => {
     const r = await axios.get(url, { timeout: 20000 });
     const items = r.data && r.data.items;
     if (!Array.isArray(items) || items.length === 0) {
+      fontsLRU.set(FONTS_LRU_KEY, FONTS_FALLBACK);
       return res.json(FONTS_FALLBACK);
     }
     const list = items.map(it => ({
@@ -232,7 +251,7 @@ app.get('/api/fonts', async (req, res) => {
       category: it.category || 'sans-serif',
       variants: Array.isArray(it.variants) ? it.variants : ['400', '700'],
     }));
-    fontsApiCache = { expiresAt: Date.now() + FONTS_CACHE_MS, list };
+    fontsLRU.set(FONTS_LRU_KEY, list);
     res.json(list);
   } catch (err) {
     log('GET /api/fonts failed: ' + (err.message || err));
@@ -272,17 +291,40 @@ app.post('/api/auth/verify', requireAuth, (req, res) => {
   res.json({ user: { id: req.user.id, email: req.user.email } });
 });
 
+/**
+ * GET /api/_debug/cache — LRU + transcript/render hit counters (auth required).
+ */
+app.get('/api/_debug/cache', requireAuth, (req, res) => {
+  res.json({
+    cacheMetrics:     metrics.snapshot(),
+    cacheAnthropic:   process.env.CACHE_ENABLED !== 'false',
+    transcriptRender: process.env.CACHE_ENABLED !== 'false',
+  });
+});
+
 // Serve state files (schema.js, timelineReducer.js) to the browser.
-app.use('/state', express.static(path.join(__dirname, 'state')));
+app.use('/state', express.static(path.join(__dirname, 'state'), {
+  maxAge: 5 * 60 * 1000,
+  etag:   true,
+}));
 
 // Serve rendered output videos as streamable (for VideoPreview <video> element).
-app.use('/renders', express.static(path.join(__dirname, '..', 'output')));
+app.use('/renders', express.static(path.join(__dirname, '..', 'output'), {
+  maxAge: 24 * 60 * 60 * 1000,
+  etag:   true,
+}));
 
 // Serve uploaded audio files for in-browser playback via /audio/filename.mp3.
-app.use('/audio', express.static(path.join(__dirname, '..', 'uploads')));
+app.use('/audio', express.static(path.join(__dirname, '..', 'uploads'), {
+  maxAge: 60 * 60 * 1000,
+  etag:   true,
+}));
 
 // Serve all uploaded files (video, image-derived mp4) via /uploads/filename.
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads'), {
+  maxAge: 60 * 60 * 1000,
+  etag:   true,
+}));
 
 // ---------------------------------------------------------------------------
 // Multer — video upload storage
@@ -781,7 +823,11 @@ app.post('/generate', requireAuth, async (req, res) => {
       log(`Audio extracted → ${audioPath}`);
 
       log('Step 2/2 — Transcribing with OpenAI (whisper-1)...');
-      transcript = await transcribeAudio(audioPath, language || null);
+      transcript = await getOrTranscribeAudio({
+        audioPath,
+        language: language || null,
+        supabaseAdmin,
+      });
       log(`Transcription complete — ${transcript.length} segments`);
     } else {
       log('Transcript provided — skipping extraction and transcription');
@@ -857,27 +903,6 @@ app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
 // Pixabay + visual pipeline (server-side only — key never sent to browser)
 // ---------------------------------------------------------------------------
 
-/** In-memory Pixabay search cache (24h TTL per Pixabay API caching guidance). */
-const pixabaySearchCache = new Map(); // key -> { expiresAt, payload }
-
-function pixabayCacheGet(key) {
-  const row = pixabaySearchCache.get(key);
-  if (!row) return null;
-  if (Date.now() > row.expiresAt) {
-    pixabaySearchCache.delete(key);
-    return null;
-  }
-  return row.payload;
-}
-
-function pixabayCacheSet(key, payload) {
-  // Pixabay API docs: identical queries should be cached up to 24 hours.
-  pixabaySearchCache.set(key, { expiresAt: Date.now() + 24 * 60 * 60 * 1000, payload });
-  for (const [k, v] of pixabaySearchCache) {
-    if (Date.now() > v.expiresAt) pixabaySearchCache.delete(k);
-  }
-}
-
 function normalizePixabayVideo(hit) {
   const vids = hit.videos || {};
   const previewUrl = (vids.tiny && vids.tiny.url) || (vids.small && vids.small.url) || '';
@@ -935,8 +960,8 @@ app.get('/api/pixabay/search', requireAuth, async (req, res) => {
   const orientation = String(req.query.orientation || 'all').toLowerCase();
 
   const cacheKey = JSON.stringify({ q, assetType, perPage, orientation });
-  const cached = pixabayCacheGet(cacheKey);
-  if (cached) return res.json(cached);
+  const cached = pixabayLRU.get(cacheKey);
+  if (cached !== undefined) return res.json(cached);
 
   const results = [];
   const pushNorm = (arr, normFn) => {
@@ -994,7 +1019,7 @@ app.get('/api/pixabay/search', requireAuth, async (req, res) => {
       query:   q,
       total:   filtered.length,
     };
-    pixabayCacheSet(cacheKey, payload);
+    pixabayLRU.set(cacheKey, payload);
     res.json(payload);
   } catch (err) {
     const status = err.response && err.response.status;
@@ -1241,6 +1266,9 @@ async function runExportJob(jobId, timelineState, outputFilename, format, qualit
       throw new Error('Render finished but output file is missing');
     }
 
+    const renderHash = computeRenderHash(timelineState, { format, quality });
+    saveRenderToCache(projectRoot, renderHash, format, outputPath);
+
     job.status    = 'done';
     job.progress  = 100;
     job.filename  = safeName;
@@ -1279,6 +1307,28 @@ app.post('/export', requireAuth, (req, res) => {
   const fmt      = ['mp4', 'mov'].includes(format) ? format : 'mp4';
   const qual     = ['720p', '1080p', '4k'].includes(quality) ? quality : '1080p';
 
+  const projectRoot = path.join(__dirname, '..');
+  const outputDir   = path.join(projectRoot, 'output');
+  if (cacheTranscriptRenderEnabled()) {
+    const rh = computeRenderHash(timelineState, { format: fmt, quality: qual });
+    const cachePath = renderCacheFilePath(projectRoot, rh, fmt);
+    if (fs.existsSync(cachePath)) {
+      try {
+        fs.mkdirSync(outputDir, { recursive: true });
+        const dest = path.join(outputDir, filename);
+        fs.copyFileSync(cachePath, dest);
+        metrics.counts.renderHit += 1;
+        exportJobs.set(jobId, { status: 'done', progress: 100, filename });
+        log(`Export cache HIT (${rh.slice(0, 12)}…) → ${filename}`);
+        return res.json({ jobId, filename, cached: true });
+      } catch (e) {
+        log(`Export cache copy failed — ${e.message}`);
+      }
+    } else {
+      metrics.counts.renderMiss += 1;
+    }
+  }
+
   exportJobs.set(jobId, { status: 'queued', progress: 0, filename });
   log(`Export job ${jobId} queued → ${filename}`);
 
@@ -1287,7 +1337,7 @@ app.post('/export', requireAuth, (req, res) => {
     log(`Export job ${jobId} crashed: ${err.message}`);
   });
 
-  res.json({ jobId, filename });
+  res.json({ jobId, filename, cached: false });
 });
 
 // ---------------------------------------------------------------------------
@@ -1394,8 +1444,13 @@ app.get('/api/audio/search/freesound', requireAuth, async (req, res) => {
   const { q, page_size } = req.query;
   if (!q) return res.status(400).json({ error: 'q parameter is required' });
 
+  const cacheKey = `fs::${String(q).toLowerCase().trim()}::${Number(page_size) || 6}`;
+  const cached = audioFreesoundLRU.get(cacheKey);
+  if (cached !== undefined) return res.json(cached);
+
   try {
     const results = await searchFreesound(q, Number(page_size) || 6);
+    audioFreesoundLRU.set(cacheKey, results);
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1414,8 +1469,13 @@ app.get('/api/audio/search/jamendo', requireAuth, async (req, res) => {
   const { q, page_size } = req.query;
   if (!q) return res.status(400).json({ error: 'q parameter is required' });
 
+  const cacheKey = `jm::${String(q).toLowerCase().trim()}::${Number(page_size) || 6}`;
+  const cached = audioJamendoLRU.get(cacheKey);
+  if (cached !== undefined) return res.json(cached);
+
   try {
     const results = await searchJamendo(q, Number(page_size) || 6);
+    audioJamendoLRU.set(cacheKey, results);
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1439,9 +1499,15 @@ app.get('/api/audio/search', requireAuth, async (req, res) => {
     ? sources.split(',').map(s => s.trim()).filter(Boolean)
     : ['freesound', 'jamendo'];
 
+  const cacheKey = `mix::${String(q).toLowerCase().trim()}::${sourceList.join(',')}`;
+  const cached = audioUnifiedLRU.get(cacheKey);
+  if (cached !== undefined) return res.json(cached);
+
   try {
     const results = await searchAudio(q, sourceList, 20);
-    res.json({ results, query: q });
+    const payload = { results, query: q };
+    audioUnifiedLRU.set(cacheKey, payload);
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

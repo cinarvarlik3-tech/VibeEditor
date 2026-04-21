@@ -11,6 +11,9 @@ const DEFAULT_FPS = 30;
 const VIDEO_W = 1080;
 const VIDEO_H = 1920;
 
+/** Bump when Remotion serialization semantics change (invalidates render disk cache). */
+const SERIALIZER_VERSION = 1;
+
 /**
  * Turn timeline media src into an absolute URL Remotion can fetch (Headless Chrome).
  * Relative paths are served by the Vibe Editor Express app during export.
@@ -711,4 +714,5 @@ export default VibeComposition;
 module.exports = {
   serializeToRemotion,
   getRemotionDurationInFrames,
+  SERIALIZER_VERSION,
 };

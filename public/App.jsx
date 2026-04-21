@@ -35,6 +35,31 @@
     return t ? { Authorization: 'Bearer ' + t } : {};
   }
 
+  /**
+   * Normalizes POST /generate `claudeUsage` to Anthropic API numbers (same as server "REAL token usage").
+   * Accepts camelCase or snake_case; never uses char÷4 estimates.
+   */
+  function normalizeClaudeUsageFromApi(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    function pick(camel, snake) {
+      const v = raw[camel] != null ? raw[camel] : raw[snake];
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    const inT  = pick('inputTokens', 'input_tokens');
+    const outT = pick('outputTokens', 'output_tokens');
+    if (inT == null || outT == null) return null;
+    const cc = pick('cacheCreationInputTokens', 'cache_creation_input_tokens');
+    const cr = pick('cacheReadInputTokens', 'cache_read_input_tokens');
+    return {
+      inputTokens:              inT,
+      outputTokens:             outT,
+      totalTokens:              inT + outT,
+      cacheCreationInputTokens: cc != null ? cc : 0,
+      cacheReadInputTokens:     cr != null ? cr : 0,
+    };
+  }
+
   const { initialTimelineState } = window.TimelineSchema;
   const { timelineReducer }      = window.TimelineReducer;
 
@@ -1388,9 +1413,10 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Generation failed');
 
-        if (data.claudeUsage && typeof data.claudeUsage.totalTokens === 'number') {
-          setClaudeUsageLast(data.claudeUsage);
-          setClaudeUsageSession(prev => prev + data.claudeUsage.totalTokens);
+        const usageNorm = normalizeClaudeUsageFromApi(data.claudeUsage);
+        if (usageNorm) {
+          setClaudeUsageLast(usageNorm);
+          setClaudeUsageSession(prev => prev + usageNorm.totalTokens);
         }
 
         const ops = Array.isArray(data.operations) ? data.operations : [];

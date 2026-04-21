@@ -624,7 +624,7 @@
           </div>
           </div>
           <div
-            title="Billable tokens from the Claude API (Messages). Session Σ sums totals across this browser session until you clear agent history."
+            title="Anthropic Messages API usage (input_tokens + output_tokens) — same numbers as the server REAL token log, not the char÷4 estimate."
             style={{
               fontSize:     10,
               lineHeight:   1.35,
@@ -635,9 +635,29 @@
               textOverflow: 'ellipsis',
             }}
           >
-            {claudeUsageLast
-              ? `Claude tokens (last): in ${fmtTok(claudeUsageLast.inputTokens)} + out ${fmtTok(claudeUsageLast.outputTokens)} = ${fmtTok(claudeUsageLast.totalTokens)} · session Σ ${fmtTok(claudeUsageSessionTotal)}`
-              : 'Claude tokens: — (send a prompt after /generate returns usage)'}
+            {(() => {
+              if (!claudeUsageLast) {
+                return 'Claude tokens (API): — (send a prompt; usage comes from /generate)';
+              }
+              const inN = Number(claudeUsageLast.inputTokens);
+              const outN = Number(claudeUsageLast.outputTokens);
+              let totalReal = null;
+              if (Number.isFinite(inN) && Number.isFinite(outN)) {
+                totalReal = inN + outN;
+              } else if (Number.isFinite(Number(claudeUsageLast.totalTokens))) {
+                totalReal = Number(claudeUsageLast.totalTokens);
+              }
+              const cacheR = claudeUsageLast.cacheReadInputTokens;
+              const cacheW = claudeUsageLast.cacheCreationInputTokens;
+              const cacheBit = (Number(cacheR) > 0 || Number(cacheW) > 0)
+                ? ` · cache read ${fmtTok(cacheR)} / write ${fmtTok(cacheW)}`
+                : '';
+              return (
+                `Claude tokens (API, last): in ${fmtTok(inN)} + out ${fmtTok(outN)} = ${fmtTok(totalReal)}` +
+                cacheBit +
+                ` · session Σ ${fmtTok(claudeUsageSessionTotal)}`
+              );
+            })()}
           </div>
         </div>
 

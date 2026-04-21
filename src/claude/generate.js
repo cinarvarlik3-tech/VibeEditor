@@ -17,8 +17,81 @@ require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const { SYSTEM_PROMPT, VISUAL_COMPONENT_RULES } = require('./systemPrompt');
 const { searchAudio }   = require('../assets/audio');
+const { cacheAnthropicEnabled } = require('../cache/config');
 
 const log = (...args) => console.log('[generate]', ...args);
+
+/**
+ * Read a numeric field from Anthropic usage (SDK may expose snake_case or camelCase).
+ * @param {object} u
+ * @param {string} camelKey
+ * @param {string} snakeKey
+ * @returns {number}
+ */
+function pickUsageNumber(u, camelKey, snakeKey) {
+  if (!u || typeof u !== 'object') return NaN;
+  if (u[camelKey] != null && u[camelKey] !== '') {
+    const n = Number(u[camelKey]);
+    if (Number.isFinite(n)) return n;
+  }
+  if (u[snakeKey] != null && u[snakeKey] !== '') {
+    const n = Number(u[snakeKey]);
+    if (Number.isFinite(n)) return n;
+  }
+  return NaN;
+}
+
+/**
+ * Normalized usage for JSON responses + UI (matches server "REAL token usage" log).
+ * @param {object|null|undefined} resp
+ * @returns {{ inputTokens:number, outputTokens:number, totalTokens:number, cacheCreationInputTokens:number, cacheReadInputTokens:number }|null}
+ */
+function usageFromAnthropicMessage(resp) {
+  const u = resp && resp.usage;
+  if (!u || typeof u !== 'object') return null;
+  const inTok = pickUsageNumber(u, 'inputTokens', 'input_tokens');
+  const outTok = pickUsageNumber(u, 'outputTokens', 'output_tokens');
+  if (!Number.isFinite(inTok) || !Number.isFinite(outTok)) return null;
+  const ccIn = pickUsageNumber(u, 'cacheCreationInputTokens', 'cache_creation_input_tokens');
+  const crIn = pickUsageNumber(u, 'cacheReadInputTokens', 'cache_read_input_tokens');
+  return {
+    inputTokens:              inTok,
+    outputTokens:             outTok,
+    totalTokens:              inTok + outTok,
+    cacheCreationInputTokens: Number.isFinite(ccIn) ? ccIn : 0,
+    cacheReadInputTokens:     Number.isFinite(crIn) ? crIn : 0,
+  };
+}
+
+/** Anthropic prompt caching: stable system text as one cacheable block. */
+function anthropicSystemBlocks(systemText) {
+  if (!cacheAnthropicEnabled() || typeof systemText !== 'string') {
+    return systemText;
+  }
+  return [
+    { type: 'text', text: systemText, cache_control: { type: 'ephemeral' } },
+  ];
+}
+
+function messageContentToString(content) {
+  if (typeof content === 'string') return content;
+  if (content === undefined || content === null) return '';
+  if (Array.isArray(content)) {
+    return content.map(block => {
+      if (block && block.type === 'text' && typeof block.text === 'string') return block.text;
+      try {
+        return JSON.stringify(block);
+      } catch (_) {
+        return '';
+      }
+    }).join('');
+  }
+  try {
+    return JSON.stringify(content);
+  } catch (_) {
+    return '';
+  }
+}
 
 function deepCloneJson(obj) {
   return JSON.parse(JSON.stringify(obj));
@@ -779,12 +852,7 @@ function estimateTokens(messages) {
   if (!Array.isArray(messages)) return 0;
   return messages.reduce((total, msg) => {
     const c = msg && msg.content;
-    const s =
-      typeof c === 'string'
-        ? c
-        : c === undefined || c === null
-          ? ''
-          : JSON.stringify(c);
+    const s = messageContentToString(c);
     return total + Math.ceil(String(s).length / 4);
   }, 0);
 }
@@ -857,9 +925,25 @@ function buildMessagesForGenerate(conversationExchanges, currentUserMessageConte
     Array.isArray(conversationExchanges) ? conversationExchanges : [],
     fullSnapshotCount
   );
-  return prior.length > 0
-    ? [...prior, { role: 'user', content: currentUserMessageContent }]
-    : [{ role: 'user', content: currentUserMessageContent }];
+  if (prior.length === 0) {
+    return [{ role: 'user', content: currentUserMessageContent }];
+  }
+  if (!cacheAnthropicEnabled()) {
+    return [...prior, { role: 'user', content: currentUserMessageContent }];
+  }
+  const lastIdx = prior.length - 1;
+  const withAssistantCache = prior.map((m, i) => {
+    if (i === lastIdx && m.role === 'assistant' && typeof m.content === 'string') {
+      return {
+        role:      'assistant',
+        content:   [
+          { type: 'text', text: m.content, cache_control: { type: 'ephemeral' } },
+        ],
+      };
+    }
+    return m;
+  });
+  return [...withAssistantCache, { role: 'user', content: currentUserMessageContent }];
 }
 
 const SUMMARY_SYSTEM =
@@ -1162,30 +1246,29 @@ async function generateOperations(
     response = await client.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 8000,
-      system:     SYSTEM_PROMPT,
+      system:     anthropicSystemBlocks(SYSTEM_PROMPT),
       messages,
     });
   } catch (err) {
     throw new Error('generateOperations: Claude API call failed — ' + err.message);
   }
 
-  log(
-    'REAL token usage — ' +
-    'input: ' + response.usage.input_tokens + ' | ' +
-    'output: ' + response.usage.output_tokens + ' | ' +
-    'total: ' + (response.usage.input_tokens + response.usage.output_tokens) + ' | ' +
-    'estimated was: ' + estimatedTokens
-  );
-
-  const claudeUsage = (function usageFromAnthropicMessage(resp) {
-    const u = resp && resp.usage;
-    if (!u || typeof u !== 'object') return null;
-    const input = Number(u.input_tokens != null ? u.input_tokens : u.inputTokens);
-    const output = Number(u.output_tokens != null ? u.output_tokens : u.outputTokens);
-    const inTok = Number.isFinite(input) ? input : 0;
-    const outTok = Number.isFinite(output) ? output : 0;
-    return { inputTokens: inTok, outputTokens: outTok, totalTokens: inTok + outTok };
-  })(response);
+  const claudeUsage = usageFromAnthropicMessage(response);
+  if (claudeUsage) {
+    log(
+      'REAL token usage — ' +
+      'input: ' + claudeUsage.inputTokens + ' | ' +
+      'output: ' + claudeUsage.outputTokens + ' | ' +
+      'total: ' + claudeUsage.totalTokens + ' | ' +
+      'cache_write_in: ' + claudeUsage.cacheCreationInputTokens + ' | ' +
+      'cache_read_in: ' + claudeUsage.cacheReadInputTokens + ' | ' +
+      'estimated was: ' + estimatedTokens
+    );
+  } else {
+    log(
+      'REAL token usage — (could not parse usage from response) | estimated was: ' + estimatedTokens
+    );
+  }
 
   // Extract text content from the response.
   const content = response.content;
@@ -1490,7 +1573,7 @@ async function generateVisualCandidates(
     response = await client.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 8000,
-      system:     VISUAL_PASS_SYSTEM(),
+      system:     anthropicSystemBlocks(VISUAL_PASS_SYSTEM()),
       messages:   [{ role: 'user', content: userMsg }],
     });
   } catch (err) {
@@ -1529,7 +1612,7 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy)
     response = await client.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 4096,
-      system:     VISUAL_PASS_SYSTEM(),
+      system:     anthropicSystemBlocks(VISUAL_PASS_SYSTEM()),
       messages:   [{ role: 'user', content: userMsg }],
     });
   } catch (err) {
@@ -1639,6 +1722,7 @@ module.exports = {
   buildUserTurnContent,
   buildHistoryMessagesFromConversationExchanges,
   estimateTokens,
+  usageFromAnthropicMessage,
   buildMessagesForGenerate,
   compressTracks,
   selectRelevantTracks,
