@@ -198,6 +198,8 @@
     onUseNative,
     onCreateImageClip,
     onClaudePickAsset,
+    onAiGenerate,
+    onAiAccept,
     projectId,
   }) {
     const [local, setLocal] = useState(function() {
@@ -208,7 +210,19 @@
           : ('tmp_' + i + '_' + String(Date.now()) + '_' + Math.random().toString(36).slice(2, 8));
         return Object.assign({}, c, { __vuid: uid });
       });
-      return { list: list, expanded: {}, loading: {}, assets: {}, confirm: {}, warn: {} };
+      return {
+        list: list,
+        expanded: {},
+        loading: {},
+        assets: {},
+        confirm: {},
+        warn: {},
+        aiGenerating: {},
+        aiPreview: {},
+        aiAccepting: {},
+        aiAccepted: {},
+        aiError: {},
+      };
     });
 
     function fmtRange(c) {
@@ -333,6 +347,79 @@
       if (chosen) await onUseThis(cand, chosen);
     }
 
+    async function onAiGenerateClick(cand) {
+      var vk = vkey(cand);
+      setLocal(function(prev) {
+        var n = Object.assign({}, prev);
+        n.aiGenerating = Object.assign({}, n.aiGenerating, { [vk]: true });
+        n.aiError = Object.assign({}, n.aiError, { [vk]: '' });
+        n.aiAccepted = Object.assign({}, n.aiAccepted);
+        delete n.aiAccepted[vk];
+        return n;
+      });
+      try {
+        var result = await onAiGenerate(cand);
+        if (!result || !result.success) {
+          throw new Error((result && result.error) || 'Generation failed');
+        }
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.aiGenerating = Object.assign({}, n.aiGenerating, { [vk]: false });
+          n.aiPreview = Object.assign({}, n.aiPreview, {
+            [vk]: {
+              base64: result.base64,
+              mimeType: result.mimeType || 'image/png',
+              model: result.model || '',
+            },
+          });
+          n.aiAccepted = Object.assign({}, n.aiAccepted);
+          delete n.aiAccepted[vk];
+          return n;
+        });
+      } catch (e) {
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.aiGenerating = Object.assign({}, n.aiGenerating, { [vk]: false });
+          n.aiError = Object.assign({}, n.aiError, { [vk]: String(e.message || e) });
+          return n;
+        });
+      }
+    }
+
+    async function onAiAcceptClick(cand) {
+      var vk = vkey(cand);
+      var preview = local.aiPreview[vk];
+      if (!preview || !preview.base64) return;
+
+      setLocal(function(prev) {
+        var n = Object.assign({}, prev);
+        n.aiAccepting = Object.assign({}, n.aiAccepting, { [vk]: true });
+        n.aiError = Object.assign({}, n.aiError, { [vk]: '' });
+        return n;
+      });
+      try {
+        var result = await onAiAccept(cand, preview);
+        if (!result || !result.success) {
+          throw new Error((result && result.error) || 'Accept failed');
+        }
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.aiAccepting = Object.assign({}, n.aiAccepting, { [vk]: false });
+          n.aiAccepted = Object.assign({}, n.aiAccepted, { [vk]: true });
+          n.aiPreview = Object.assign({}, n.aiPreview);
+          delete n.aiPreview[vk];
+          return n;
+        });
+      } catch (e) {
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.aiAccepting = Object.assign({}, n.aiAccepting, { [vk]: false });
+          n.aiError = Object.assign({}, n.aiError, { [vk]: String(e.message || e) });
+          return n;
+        });
+      }
+    }
+
     function skipCand(vuid) {
       setLocal(function(prev) {
         var n = Object.assign({}, prev);
@@ -372,20 +459,128 @@
                 <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 3, background: clsColor(mc) + '22', color: clsColor(mc) }}>{mc || '—'}</span>
                 <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 3, background: ps.bg, color: ps.color }}>{ps.lab}</span>
               </div>
-              <div style={{ color: '#888', fontSize: 12, fontStyle: 'italic', marginBottom: 8 }}>{cand.reason || ''}</div>
+              <div style={{ color: '#888', fontSize: 12, fontStyle: 'italic', marginBottom: 6 }}>{cand.reason || ''}</div>
+              {cand.ideal_visual_description ? (
+                <div style={{
+                  color: '#666',
+                  fontSize: 11,
+                  lineHeight: 1.45,
+                  marginBottom: 8,
+                  paddingLeft: 8,
+                  borderLeft: '2px solid rgba(45,212,191,0.25)',
+                }}>
+                  <span style={{ color: '#5EEAD4', fontWeight: 600, fontSize: 10, letterSpacing: 0.3 }}>IDEAL VISUAL</span>
+                  <br />
+                  {cand.ideal_visual_description}
+                </div>
+              ) : null}
               {local.warn[vk] ? (
                 <div style={{ color: '#FBBF24', fontSize: 11, marginBottom: 6 }}>{local.warn[vk]}</div>
               ) : null}
               {local.confirm[vk] ? (
                 <div style={{ color: '#2DD4BF', fontSize: 11, marginBottom: 6 }}>{local.confirm[vk]}</div>
               ) : null}
+              {local.aiError[vk] ? (
+                <div style={{ color: '#FBBF24', fontSize: 11, marginBottom: 6 }}>
+                  {'AI Generate: ' + local.aiError[vk]}
+                </div>
+              ) : null}
+              {local.aiAccepted[vk] ? (
+                <div style={{ color: '#2DD4BF', fontSize: 11, marginBottom: 6 }}>Added to timeline</div>
+              ) : null}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                <button type="button" onClick={function() { onFindClick(cand); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: 'none', background: '#0D9488', color: '#fff', cursor: 'pointer' }}>
-                  {local.loading[vk] ? 'Searching Pixabay…' : 'Find Components'}
-                </button>
-                <button type="button" onClick={function() { onUseNative(cand); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: '1px solid rgba(167,139,250,0.5)', background: 'rgba(139,92,246,0.15)', color: '#C4B5FD', cursor: 'pointer' }}>Native</button>
-                <button type="button" onClick={function() { skipCand(cand.__vuid); }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#888', cursor: 'pointer' }}>Skip</button>
+                {function() {
+                  var cardBusy = !!(local.aiGenerating[vk] || local.aiAccepting[vk]);
+                  var btnDis = { opacity: cardBusy ? 0.55 : 1, cursor: cardBusy ? 'not-allowed' : 'pointer' };
+                  return (
+                    <React.Fragment>
+                      <button
+                        type="button"
+                        disabled={cardBusy}
+                        onClick={function() { if (!cardBusy) onFindClick(cand); }}
+                        style={Object.assign({ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: 'none', background: '#0D9488', color: '#fff' }, btnDis)}
+                      >
+                        {local.loading[vk] ? 'Searching Pixabay…' : 'Find Components'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cardBusy}
+                        onClick={function() { if (!cardBusy) onAiGenerateClick(cand); }}
+                        style={Object.assign({
+                          fontSize: 11,
+                          padding: '4px 10px',
+                          borderRadius: 999,
+                          border: '1px solid rgba(45,212,191,0.45)',
+                          background: 'rgba(45,212,191,0.12)',
+                          color: '#5EEAD4',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 6,
+                        }, btnDis)}
+                      >
+                        {local.aiGenerating[vk] ? (
+                          <React.Fragment>
+                            <Loader size={12} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
+                            <span>Generating…</span>
+                          </React.Fragment>
+                        ) : (
+                          <span>{local.aiPreview[vk] ? 'Regenerate' : 'AI Generate'}</span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cardBusy}
+                        onClick={function() { if (!cardBusy) onUseNative(cand); }}
+                        style={Object.assign({ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: '1px solid rgba(167,139,250,0.5)', background: 'rgba(139,92,246,0.15)', color: '#C4B5FD' }, btnDis)}
+                      >
+                        Native
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cardBusy}
+                        onClick={function() { if (!cardBusy) skipCand(cand.__vuid); }}
+                        style={Object.assign({ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(255,255,255,0.04)', color: '#888' }, btnDis)}
+                      >
+                        Skip
+                      </button>
+                    </React.Fragment>
+                  );
+                }()}
               </div>
+              {local.aiPreview[vk] && !local.aiAccepted[vk] ? (
+                <div style={{ marginTop: 10, maxWidth: 240 }}>
+                  <div style={{ position: 'relative', borderRadius: 6, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.06)', background: '#111' }}>
+                    <img
+                      src={'data:' + local.aiPreview[vk].mimeType + ';base64,' + local.aiPreview[vk].base64}
+                      alt=""
+                      style={{ width: '100%', aspectRatio: '9/16', objectFit: 'cover', display: 'block' }}
+                    />
+                    <div style={{ padding: 4 }}>
+                      <button
+                        type="button"
+                        disabled={!!local.aiAccepting[vk]}
+                        onClick={function() { if (!local.aiAccepting[vk]) onAiAcceptClick(cand); }}
+                        style={{
+                          width: '100%',
+                          fontSize: 10,
+                          padding: '3px 0',
+                          border: 'none',
+                          borderRadius: 4,
+                          background: '#0D9488',
+                          color: '#fff',
+                          cursor: local.aiAccepting[vk] ? 'not-allowed' : 'pointer',
+                          opacity: local.aiAccepting[vk] ? 0.7 : 1,
+                        }}
+                      >
+                        {local.aiAccepting[vk] ? 'Adding…' : 'Accept'}
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 9, color: '#64748B', lineHeight: 1.4 }}>
+                    {'AI-generated preview · ' + (local.aiPreview[vk].model || 'gemini') + '. Click Regenerate above for a new version.'}
+                  </div>
+                </div>
+              ) : null}
               {local.expanded[vk] && local.assets[vk] && local.assets[vk].length > 0 ? (
                 <div style={{ marginTop: 10 }}>
                   <button type="button" onClick={function() { onClaudePick(cand, local.assets[vk]); }} style={{ fontSize: 10, marginBottom: 8, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(45,212,191,0.4)', background: 'rgba(45,212,191,0.1)', color: '#5EEAD4', cursor: 'pointer' }}>Let Claude Pick</button>
@@ -497,6 +692,8 @@
     onUseNative,
     onCreateImageClip,
     onClaudePickAsset,
+    onAiGenerate,
+    onAiAccept,
   }) {
     const [inputText,  setInputText]  = useState('');
     const [language,   setLanguage]   = useState('Auto');
@@ -551,6 +748,8 @@
               onUseNative={onUseNative}
               onCreateImageClip={onCreateImageClip}
               onClaudePickAsset={onClaudePickAsset}
+              onAiGenerate={onAiGenerate}
+              onAiAccept={onAiAccept}
             />
           );
         default:       return null;

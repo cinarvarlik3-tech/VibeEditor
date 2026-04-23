@@ -1242,11 +1242,21 @@
         return { assets: [], lowConfidence: false, searchError: 'Brief did not include a search query.' };
       }
       const qs = new URLSearchParams({
-        q:             qStr,
-        asset_type:    kind,
-        per_page:      '9',
-        orientation:   orient,
+        q:            qStr,
+        asset_type:   kind,
+        per_page:     '9',
+        orientation:  orient,
       });
+
+      // Pass through Pass 1 interpretation fields for server-side re-ranking.
+      // Candidate-level fields (richest context):
+      if (Array.isArray(candidate.concrete_subjects) && candidate.concrete_subjects.length > 0) {
+        qs.set('concrete_subjects', JSON.stringify(candidate.concrete_subjects));
+      }
+      if (Array.isArray(candidate.avoid_subjects) && candidate.avoid_subjects.length > 0) {
+        qs.set('avoid_subjects', JSON.stringify(candidate.avoid_subjects));
+      }
+
       const pr = await fetch('/api/pixabay/search?' + qs.toString(), { headers: authHeadersBearer() });
       const pd = await pr.json().catch(() => ({}));
       if (!pr.ok) {
@@ -1258,6 +1268,31 @@
       }
       return { assets: pd.results || [], lowConfidence: false };
     }, [cachedTranscript]);
+
+    const handleAiGenerate = useCallback(async (candidate) => {
+      try {
+        const r = await fetch('/api/visual/generate-image', {
+          method: 'POST',
+          headers: authHeadersJson(),
+          body: JSON.stringify({ candidate }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          return { success: false, error: data.error || 'Generation failed' };
+        }
+        if (!data.base64) {
+          return { success: false, error: 'Server returned no image data' };
+        }
+        return {
+          success: true,
+          base64: data.base64,
+          mimeType: data.mimeType || 'image/png',
+          model: data.model || '',
+        };
+      } catch (e) {
+        return { success: false, error: e.message || String(e) };
+      }
+    }, []);
 
     const handleClaudePickAsset = useCallback(async (candidate, assets) => {
       const r = await fetch('/api/visual/claude-pick', {
@@ -1301,6 +1336,52 @@
         payload: { operations: [{ op: 'CREATE', trackId: 'track_image_0', element: el }], promptText: null },
       });
     }, [dispatch]);
+
+    const handleAiAccept = useCallback(async (candidate, preview) => {
+      if (!projectId) return { success: false, error: 'No active project' };
+      if (!preview || !preview.base64) return { success: false, error: 'No preview to accept' };
+
+      const st = candidate.start_time != null ? candidate.start_time : candidate.startTime;
+      const et = candidate.end_time != null ? candidate.end_time : candidate.endTime;
+      const dur =
+        typeof st === 'number' && typeof et === 'number' && et > st
+          ? Math.max(1, Math.min(10, et - st))
+          : 5;
+
+      try {
+        const r = await fetch('/api/visual/accept-generated', {
+          method: 'POST',
+          headers: authHeadersJson(),
+          body: JSON.stringify({
+            base64: preview.base64,
+            projectId: String(projectId),
+            durationSec: dur,
+            candidateId: candidate.candidate_id || null,
+          }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          return { success: false, error: data.error || 'Accept failed' };
+        }
+
+        const start = typeof st === 'number' ? st : 0;
+        const end = typeof et === 'number' && et > start ? et : start + (data.duration || dur);
+        handleCreateImageClip({
+          src: data.permanentUrl,
+          storageRef: data.storageRef,
+          startTime: start,
+          endTime: end,
+          duration: data.duration || dur,
+          sourceName: 'AI generated (' + (preview.model || 'gemini') + ')',
+          sourceType: 'ai-generated',
+          pixabayId: null,
+        });
+
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e.message || String(e) };
+      }
+    }, [projectId, handleCreateImageClip]);
 
     const handleUseNative = useCallback((candidate) => {
       const st = candidate.start_time != null ? candidate.start_time : candidate.startTime;
@@ -1931,6 +2012,8 @@
             onUseNative={handleUseNative}
             onCreateImageClip={handleCreateImageClip}
             onClaudePickAsset={handleClaudePickAsset}
+            onAiGenerate={handleAiGenerate}
+            onAiAccept={handleAiAccept}
             projectId={projectId}
           />
         </div>

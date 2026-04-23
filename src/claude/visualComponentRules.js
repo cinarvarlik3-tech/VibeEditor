@@ -33,12 +33,85 @@ Return a JSON array of lightweight candidate objects. One object per detected ca
     "moment_class": "hook"|"explanation"|"proof"|"contrast"|"transition"|"example"|"instruction"|"entity_mention"|"emotional_peak"|"payoff"|"CTA"|"retention_rescue",
     "resolution_strategy": "external_stock"|"native_only"|"skip",
     "priority": "critical"|"high"|"medium"|"low",
-    "reason": "<one sentence plain English>"
+    "reason": "<one sentence plain English>",
+    "spoken_text_translation": "<English translation of spoken_text_anchor; if already English, repeat verbatim>",
+    "semantic_summary": "<one sentence in English describing what is actually happening in this moment, including the emotional/narrative subtext — not just the topic>",
+    "ideal_visual_description": "<2–3 sentence English description of the single best b-roll shot that would illustrate this moment; describe what is literally on screen (subjects, action, setting, framing)>",
+    "concrete_subjects": ["<English noun phrase 1>", "<English noun phrase 2>", "<English noun phrase 3>"],
+    "mood": "<1–4 comma-separated English adjectives, e.g. 'anxious, hurried' or 'warm, intimate'>",
+    "setting_hint": "<short English phrase for location, e.g. 'classroom', 'home office', 'city street at night', or 'flexible' if ambiguous>",
+    "avoid_subjects": ["<thing to avoid 1>", "<thing to avoid 2>"]
   }
 ]
 
+Moment Detection Rules
+Evaluate each transcript span for semantic visual opportunity. Accept a candidate only if it passes all five gates:
+Gate 1 — belongs to a recognised moment class (see class list above)
+Gate 2 — fits the style guide density, tone, and pacing rules
+Gate 3 — meets the minimum priority threshold from the Key Moments Policy
+Gate 4 — is visually resolvable as a native component or specific stock query
+Gate 5 — is not redundant with recent inserts or existing emphasis
+
+Pass 1 Interpretation Fields (required for external_stock)
+
+You have just reasoned about this moment to classify it. Write that reasoning down. Do not leave interpretation work for Pass 2.
+
+- spoken_text_translation: always in English. If the transcript is already English, repeat the anchor verbatim. Never leave empty.
+- semantic_summary: capture the subtext, not just the topic. Bad: "the speaker talks about school." Good: "a student is falling behind because class is moving faster than they can keep up with."
+- ideal_visual_description: describe what the screen should literally show — subjects, action, setting, framing. This is the single most important field for downstream retrieval quality. Write it as if directing a cinematographer, not writing a headline.
+- concrete_subjects: 3 to 6 plain English noun phrases drawn from ideal_visual_description. These are the candidate search terms.
+- mood: the emotional register, in adjectives. Affects which asset feels right even when the subject matches.
+- setting_hint: where this takes place, or "flexible" if the moment is not location-specific.
+- avoid_subjects: things that are topically adjacent but would undermine the moment. Example: if the moment is about a student struggling, avoid "smiling students," "classroom celebration," "cartoon teacher." Always include at least one entry; use ["cartoon illustration"] as a safe default when nothing specific applies.
+
+These fields must be written in English even when the transcript is in another language. Translate first, interpret second, then fill the fields.
+
+Example — non-English input
+
+TRANSCRIPT (excerpt): "Okul ve dershane de çok hızlı ilerliyor" at 2.8s–4.5s
+Output entry:
+{
+  "candidate_id": "vis_002",
+  "start_time": 2.8,
+  "end_time": 4.5,
+  "spoken_text_anchor": "Okul ve dershane de çok hızlı ilerliyor",
+  "spoken_text_translation": "School and tutoring center are moving too fast",
+  "moment_class": "contrast",
+  "resolution_strategy": "external_stock",
+  "priority": "high",
+  "reason": "Describes a pace mismatch between instruction speed and the student's comprehension.",
+  "semantic_summary": "A student cannot keep up as teachers race through new material in both school and after-school tutoring.",
+  "ideal_visual_description": "An overwhelmed student sits at a desk looking down at a notebook, brow furrowed, while in the background a teacher writes rapidly across a crowded whiteboard. Medium shot, natural classroom light, shallow focus on the student.",
+  "concrete_subjects": ["overwhelmed student at desk", "teacher writing fast on whiteboard", "student taking hurried notes", "confused student in classroom"],
+  "mood": "anxious, hurried, quietly stressed",
+  "setting_hint": "classroom or tutoring center",
+  "avoid_subjects": ["smiling students", "classroom celebration", "cartoon illustration", "stock teacher posing"]
+}
+
 Pass 2 Output Format
 You will receive one candidate from Pass 1. Return a single JSON object — either a retrieval brief (if resolution_strategy is external_stock) or a native component specification (if native_only).
+
+Pass 2 — Packaging, not interpretation
+
+Pass 1 has already interpreted the moment. Your job in Pass 2 is to package that interpretation into Pixabay-friendly search terms and retrieval filters. Do not re-interpret the transcript. Do not invent new subject matter. Do not paraphrase ideal_visual_description into something vaguer.
+
+Source of truth, in priority order:
+1. candidate.ideal_visual_description — the literal description of what should be on screen.
+2. candidate.concrete_subjects — your primary source of query terms. Pick the one or two that will have the best Pixabay coverage.
+3. candidate.mood and candidate.setting_hint — modifiers on the query and on environment_preference.
+4. candidate.avoid_subjects — copy into exclusion_terms as-is, then add any Pixabay-specific additions (e.g. "cartoon", "illustration", "3d render") if the moment demands photographic realism.
+5. TRANSCRIPT_CONTEXT — use only to resolve ambiguity (e.g. if concrete_subjects is "student" but context reveals it is a university lecture, prefer "university student"). Never use as a primary source.
+
+Query construction rules:
+- retrieval_query_primary must be a plain English noun phrase of 3–6 words drawn from concrete_subjects, optionally narrowed by setting_hint.
+- retrieval_query_alternates must be 2–3 *meaningfully different* phrasings, not synonyms. Vary the subject focus (e.g. primary focuses on the student, alternate 1 focuses on the teacher, alternate 2 focuses on the environment). If you cannot produce meaningfully different alternates, lower confidence_score.
+- If concrete_subjects are missing or the moment is native_only or skip, do not emit a retrieval brief.
+
+Confidence calibration:
+- 0.85+: ideal_visual_description is specific, concrete_subjects are clearly stock-friendly, setting is well-defined.
+- 0.65–0.84: subjects are clear but the mood or setting introduces risk of off-target results.
+- 0.55–0.64: subjects are generic or the ideal description leans abstract. Consider whether native_only would serve better.
+- <0.55: do not emit. Return a brief with confidence_score below 0.55 and the server will reject it; the UI will surface "confidence too low" and the user will fall back to native.
 
 For external_stock, return:
 {
@@ -65,13 +138,33 @@ For external_stock, return:
   "notes_for_ranking": "<optional guidance for ranking layer>"
 }
 
-Moment Detection Rules
-Evaluate each transcript span for semantic visual opportunity. Accept a candidate only if it passes all five gates:
-Gate 1 — belongs to a recognised moment class (see class list above)
-Gate 2 — fits the style guide density, tone, and pacing rules
-Gate 3 — meets the minimum priority threshold from the Key Moments Policy
-Gate 4 — is visually resolvable as a native component or specific stock query
-Gate 5 — is not redundant with recent inserts or existing emphasis
+Example Pass 2 output (for the Turkish moment above):
+{
+  "candidate_id": "vis_002",
+  "start_time": 2.8,
+  "end_time": 4.5,
+  "moment_class": "contrast",
+  "visual_purpose": "illustrate",
+  "external_visual_type": "broll_people_working",
+  "retrieval_query_primary": "overwhelmed student taking notes classroom",
+  "retrieval_query_alternates": [
+    "teacher writing fast on whiteboard",
+    "confused student at desk tutoring center"
+  ],
+  "required_orientation": "portrait",
+  "required_asset_kind": "video",
+  "human_presence": "prefer",
+  "text_in_asset": "avoid",
+  "motion_level": "medium",
+  "literalness_target": "high",
+  "environment_preference": "indoor",
+  "object_focus": "notebook",
+  "color_mood": "cool, natural classroom light",
+  "exclusion_terms": ["cartoon", "illustration", "3d render", "smiling students", "celebration"],
+  "max_results_requested": 9,
+  "confidence_score": 0.82,
+  "notes_for_ranking": "prefer shots with a visible student in foreground over shots of empty classrooms"
+}
 
 Native vs External Rules
 Prefer native_only when: content is numeric, comparative, structural, or directional. Prefer external_stock when: content is environmental, contextual, or lifestyle-based and cannot be reproduced well by a native overlay. Use skip when: content is abstract, the query would be vague, or no native fallback exists.
@@ -92,6 +185,10 @@ Never suggest an asset for a timespan already occupied by another suggested asse
 Return an empty array for Pass 1 if no candidates pass all five gates. Never force suggestions.
 In Pass 2, return a single JSON object, not an array. The outer wrapper must be an object not an array.
 Always verify start_time < end_time. Never suggest a visual shorter than 0.8 seconds.
+In Pass 1, never emit external_stock candidates without populating spoken_text_translation, semantic_summary, ideal_visual_description, concrete_subjects, mood, setting_hint, and avoid_subjects. If you cannot fill these confidently, downgrade to native_only or skip.
+In Pass 1, write all interpretation fields (semantic_summary, ideal_visual_description, concrete_subjects, mood, setting_hint, avoid_subjects) in English regardless of the transcript language.
+In Pass 2, do not produce a retrieval_query_primary that contradicts ideal_visual_description or that mentions subjects listed in avoid_subjects.
+In Pass 2, retrieval_query_primary and each alternate must be pure noun phrases with no verbs in gerund form longer than one word (e.g. "woman writing" is fine; "woman who is writing on the board" is not).
 `.trim();
 
 module.exports = { VISUAL_COMPONENT_RULES };

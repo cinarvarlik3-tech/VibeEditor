@@ -41,6 +41,7 @@ const FEATURE_MODEL_ROUTING = envFeature('FEATURE_MODEL_ROUTING', true);
 const FEATURE_TRANSCRIPT_WINDOWING = envFeature('FEATURE_TRANSCRIPT_WINDOWING', true);
 const FEATURE_HISTORY_SUMMARIES = envFeature('FEATURE_HISTORY_SUMMARIES', true);
 const FEATURE_PROMPT_BUNDLES = envFeature('FEATURE_PROMPT_BUNDLES', true);
+const FEATURE_MINIMAL_HISTORY = process.env.FEATURE_MINIMAL_HISTORY !== 'false';
 
 const MODEL_FOR_GENERATE = FEATURE_MODEL_ROUTING ? MODEL_MINI : MODEL_FLAGSHIP;
 const MODEL_FOR_SUMMARIZE = FEATURE_MODEL_ROUTING ? MODEL_NANO : MODEL_FLAGSHIP;
@@ -48,25 +49,62 @@ const MODEL_FOR_VISUAL_SCAN = FEATURE_MODEL_ROUTING ? MODEL_MINI : MODEL_FLAGSHI
 const MODEL_FOR_VISUAL_BRIEF = FEATURE_MODEL_ROUTING ? MODEL_MINI : MODEL_FLAGSHIP;
 const MODEL_FOR_VISUAL_PICK = FEATURE_MODEL_ROUTING ? MODEL_NANO : MODEL_FLAGSHIP;
 
-const ANIMATION_KEYWORDS = /\b(animat|fade|keyframe|transition|opacity|zoom|pan|slide\s+in|slide\s+out)\b/i;
-const SUBTITLE_KEYWORDS = /\b(subtitle|caption|word|sync|text\s+on\s+screen)\b/i;
-const IMAGE_KEYWORDS = /\b(image|picture|photo|overlay|anchor|layout|fit|cover|contain)\b/i;
-const AUDIO_KEYWORDS = /\b(audio|sound|music|volume|duck|mute|loud)\b/i;
-const COMPLEX_KEYWORDS = /\b(split|trim|reorder|multiple|each|every|all\s+clips)\b/i;
+// Expanded keyword classifier. Bias toward OVER-triggering — the cost of
+// including an unneeded bundle is a few hundred extra tokens; the cost of
+// missing a needed bundle is the model failing on the prompt entirely.
+
+const CLIP_KEYWORDS = /\b(clip|clips|first|second|third|fourth|fifth|last|previous|next|the\s+one|the\s+video|shortest|longest|fastest|slowest|all\s+clips|every\s+clip|each\s+clip|track\s+\d)\b/i;
+
+const SUBTITLE_KEYWORDS = /\b(subtitle|subtitles|caption|captions|text|words|word\s+by\s+word|font|bold|italic|normal|regular|bigger|smaller|color|colour|red|blue|green|yellow|white|black|purple|orange|pink|gold|outline|shadow|glow|uppercase|lowercase|align|position|top|bottom|middle|center|corner|sentence|sentences|per\s+word)\b/i;
+
+const ANIMATION_KEYWORDS = /\b(animat|fade|fades|keyframe|transition|opacity|zoom|scale|pan|slide|slow\s+motion|speed|faster|slower|playback|trim|cut|split|gradually|smoothly|instantly|\d+x|half\s+speed|double\s+speed)\b/i;
+
+const AUDIO_KEYWORDS = /\b(audio|sound|music|volume|quiet|quieter|loud|louder|mute|unmute|fade\s+in|fade\s+out|background\s+music|sound\s+effect|ambient|song|soundtrack|freesound|jamendo|uploaded\s+audio|my\s+audio|my\s+music|my\s+sound)\b/i;
+
+const IMAGE_KEYWORDS = /\b(image|images|picture|pictures|photo|photos|overlay|overlays|anchor|layout|fit|cover|contain|fullscreen|image\s+clip)\b/i;
+
+const TRACK_KEYWORDS = /\b(track|tracks|layer|layers|on\s+top|above|below|behind|in\s+front|foreground|background|reorder|rearrange|swap\s+track|move\s+track|delete\s+track|remove\s+track|new\s+track|add\s+track|create\s+track)\b/i;
+
+const CONVERSATION_REFERENCE_KEYWORDS =
+  /\b(undo|revert|go\s+back|same|do\s+the\s+same|same\s+thing|repeat|again|that|those|them|the\s+ones|keep\s+going|continue|add\s+more|what\s+did\s+you|start\s+over|clear\s+everything|start\s+fresh)\b/i;
+
+/**
+ * Returns true if the current user prompt references prior exchanges in a way
+ * that requires historical state (not just summaries) to resolve.
+ *
+ * @param {string} userPrompt
+ * @returns {boolean}
+ */
+function promptNeedsFullHistorySnapshot(userPrompt) {
+  if (!userPrompt || typeof userPrompt !== 'string') return false;
+  return CONVERSATION_REFERENCE_KEYWORDS.test(userPrompt);
+}
 
 /**
  * @param {string} userPrompt
- * @returns {string[]} bundle ids: animations | subtitles | images | audio | complex
+ * @returns {string[]} bundle ids — subset of:
+ *   'animations' | 'audio' | 'clips' | 'conversation' | 'images' |
+ *   'subtitles' | 'tracks'
  */
 function selectRuleBundles(userPrompt) {
-  const p = String(userPrompt || '');
-  const bundles = [];
-  if (ANIMATION_KEYWORDS.test(p)) bundles.push('animations');
-  if (SUBTITLE_KEYWORDS.test(p)) bundles.push('subtitles');
-  if (IMAGE_KEYWORDS.test(p)) bundles.push('images');
-  if (AUDIO_KEYWORDS.test(p)) bundles.push('audio');
-  if (COMPLEX_KEYWORDS.test(p)) bundles.push('complex');
-  return bundles;
+  if (!userPrompt || typeof userPrompt !== 'string') return [];
+  const p = userPrompt.toLowerCase();
+  const bundles = new Set();
+
+  if (CLIP_KEYWORDS.test(p)) bundles.add('clips');
+  if (SUBTITLE_KEYWORDS.test(p)) bundles.add('subtitles');
+  if (ANIMATION_KEYWORDS.test(p)) bundles.add('animations');
+  if (AUDIO_KEYWORDS.test(p)) bundles.add('audio');
+  if (IMAGE_KEYWORDS.test(p)) bundles.add('images');
+  if (TRACK_KEYWORDS.test(p)) bundles.add('tracks');
+  if (CONVERSATION_REFERENCE_KEYWORDS.test(p)) bundles.add('conversation');
+
+  // If the prompt looks like a styling request but didn't trigger subtitles,
+  // err on the side of including it — styling is the single most common task.
+  const looksLikeStyling = /\b(make|change|set|turn).*\b(bigger|smaller|bold|italic|normal|red|blue|green|yellow|white|black|color|font|size)\b/i.test(userPrompt);
+  if (looksLikeStyling && !bundles.has('subtitles')) bundles.add('subtitles');
+
+  return Array.from(bundles);
 }
 
 /**
@@ -142,25 +180,57 @@ function summarizeOpsForHistory(operations) {
   if (!Array.isArray(operations) || operations.length === 0) return 'No operations applied.';
   const counts = {};
   const details = [];
+
   for (const op of operations) {
     if (!op || typeof op !== 'object') continue;
     const name = op.op;
     if (typeof name === 'string') counts[name] = (counts[name] || 0) + 1;
-    if (name === 'CREATE' && op.element && op.element.type) {
-      details.push('created ' + op.element.type);
+
+    if (name === 'CREATE' && op.element) {
+      const t = op.element.type || 'unknown';
+      const id = op.element.id || '';
+      details.push(`created ${t}${id ? ' (' + id + ')' : ''}`);
+    } else if (name === 'BATCH_CREATE' && Array.isArray(op.elements)) {
+      const templateType = op.template && op.template.type ? op.template.type : 'elements';
+      const ids = op.elements.map((e) => e && e.id).filter(Boolean);
+      if (ids.length <= 4) {
+        details.push(`created ${ids.length} ${templateType}(s): ${ids.join(', ')}`);
+      } else {
+        // Show first 2 and last 2 for ID range recognition without blowing up the summary
+        details.push(
+          `created ${ids.length} ${templateType}(s): ${ids[0]}, ${ids[1]}, …, ${ids[ids.length - 2]}, ${ids[ids.length - 1]}`
+        );
+      }
+    } else if (name === 'CREATE_SUBTITLES') {
+      // Server expands this to BATCH_CREATE at runtime; element IDs aren't known here.
+      details.push('created subtitles (ids assigned at dispatch)');
     } else if (name === 'UPDATE' && op.elementId) {
-      details.push('updated ' + op.elementId);
+      // Include which fields changed — often the reason for the update is in the change keys
+      const changedKeys =
+        op.changes && typeof op.changes === 'object' ? Object.keys(op.changes).slice(0, 3).join(',') : '';
+      details.push(`updated ${op.elementId}${changedKeys ? ' [' + changedKeys + ']' : ''}`);
     } else if (name === 'DELETE' && op.elementId) {
-      details.push('deleted ' + op.elementId);
+      details.push(`deleted ${op.elementId}`);
+    } else if (name === 'ADD_KEYFRAME' && op.elementId) {
+      details.push(`keyframed ${op.trackName || 'track'} on ${op.elementId}`);
+    } else if (name === 'SPLIT_ELEMENT' && op.elementId) {
+      details.push(`split ${op.elementId} at ${op.splitTime}s`);
+    } else if (name === 'CREATE_TRACK' && op.trackType) {
+      details.push(`created ${op.trackType} track`);
+    } else if (name === 'DELETE_TRACK' && op.trackId) {
+      details.push(`deleted track ${op.trackId}`);
+    } else if (name === 'REORDER_TRACK') {
+      details.push(`reordered ${op.trackType || 'track'} ${op.fromIndex}→${op.toIndex}`);
+    } else if (name === 'SEARCH_AUDIO') {
+      details.push(`searched audio: "${String(op.query || '').slice(0, 40)}"`);
     } else if (typeof name === 'string') {
       details.push(name);
     }
   }
+
   const countSummary = Object.entries(counts).map(([t, n]) => n + '×' + t).join(', ');
   const det = details.slice(0, 10).join('; ');
-  return (
-    `Applied ${operations.length} op(s): ${countSummary}. Details: ${det}${details.length > 10 ? '…' : ''}`
-  );
+  return `Applied ${operations.length} op(s): ${countSummary}. Details: ${det}${details.length > 10 ? '…' : ''}`;
 }
 
 /**
@@ -1125,9 +1195,18 @@ function isSummaryExchangeRow(ex) {
  */
 function buildStrippedUserMessageFromExchange(ex) {
   const prompt = ex && ex.promptText != null ? String(ex.promptText) : '';
+
+  // When minimal history is enabled, past user turns carry only the prompt.
+  // CLIP_SUMMARY and tracks from a past turn are stale by the next turn anyway
+  // (the current turn's CURRENT_TRACKS is ground truth). The assistant's
+  // enriched summary carries the element IDs needed for reference resolution.
+  if (FEATURE_MINIMAL_HISTORY) {
+    return 'PROMPT: ' + prompt;
+  }
+
+  // Legacy behavior (FEATURE_MINIMAL_HISTORY=false): keep CLIP_SUMMARY.
   const raw = ex && ex.clipSummary != null ? String(ex.clipSummary).trim() : '';
   if (raw) {
-    // Client stores clipSummary already prefixed with "CLIP_SUMMARY:\n…"
     if (/^CLIP_SUMMARY:/i.test(raw)) {
       return 'PROMPT: ' + prompt + '\n\n' + raw;
     }
@@ -1154,7 +1233,11 @@ function buildFullUserMessageFromExchange(ex) {
   });
 }
 
-const FULL_SNAPSHOT_DEFAULT = 1;
+// When FEATURE_MINIMAL_HISTORY is true, the default is 0 full snapshots.
+// Conversational prompts bump this to 1 at call time via
+// promptNeedsFullHistorySnapshot(). Callers that want explicit control
+// still pass fullSnapshotCount directly to buildMessagesForGenerate.
+const FULL_SNAPSHOT_DEFAULT = FEATURE_MINIMAL_HISTORY ? 0 : 1;
 const MAX_HISTORY_EXCHANGES   = 10;
 
 /**
@@ -1214,6 +1297,11 @@ function buildHistoryMessagesFromConversationExchanges(exchanges, fullSnapshotCo
       ? nonSummary.slice(-MAX_HISTORY_EXCHANGES)
       : nonSummary.slice();
 
+  const cappedFull = Math.max(0, Math.min(nFull, tail.length));
+  const nStripped = Math.max(0, tail.length - nFull);
+  metrics.counts.historyFullSnapshots = (metrics.counts.historyFullSnapshots || 0) + cappedFull;
+  metrics.counts.historyStrippedTurns = (metrics.counts.historyStrippedTurns || 0) + nStripped;
+
   const startFullSnapshotIndex = Math.max(0, tail.length - nFull);
 
   for (let index = 0; index < tail.length; index++) {
@@ -1246,18 +1334,32 @@ function buildHistoryMessagesFromConversationExchanges(exchanges, fullSnapshotCo
  *
  * @param {Array<object>} conversationExchanges
  * @param {string}        currentUserMessageContent
- * @param {number}        fullSnapshotCount
- * @returns {Array<{role:string,content:string}>}
+ * @param {number}        [fullSnapshotCount] — if omitted, derived from the current turn (PROMPT line).
+ * @returns {{ messages: Array<{role:string,content:string}>, resolvedFullSnapshotCount: number }}
  */
 function buildMessagesForGenerate(conversationExchanges, currentUserMessageContent, fullSnapshotCount) {
+  let nFull = fullSnapshotCount;
+  if (nFull === undefined || nFull === null) {
+    const promptMatch =
+      typeof currentUserMessageContent === 'string'
+        ? currentUserMessageContent.match(/^PROMPT:\s*([^\n]*)/)
+        : null;
+    const currentPrompt = promptMatch ? promptMatch[1] : '';
+    const needsFull = promptNeedsFullHistorySnapshot(currentPrompt);
+    nFull = needsFull ? 1 : FULL_SNAPSHOT_DEFAULT;
+    if (needsFull) {
+      metrics.counts.historyConversationalEscalation = (metrics.counts.historyConversationalEscalation || 0) + 1;
+    }
+  }
+
   const prior = buildHistoryMessagesFromConversationExchanges(
     Array.isArray(conversationExchanges) ? conversationExchanges : [],
-    fullSnapshotCount
+    nFull
   );
   if (prior.length === 0) {
-    return [{ role: 'user', content: currentUserMessageContent }];
+    return { messages: [{ role: 'user', content: currentUserMessageContent }], resolvedFullSnapshotCount: nFull };
   }
-  return [...prior, { role: 'user', content: currentUserMessageContent }];
+  return { messages: [...prior, { role: 'user', content: currentUserMessageContent }], resolvedFullSnapshotCount: nFull };
 }
 
 const SUMMARY_SYSTEM =
@@ -1595,20 +1697,17 @@ async function generateOperations(
     { useCanonicalJson: true }
   );
 
-  let fullSnapshotsUsed = FULL_SNAPSHOT_DEFAULT;
-  let messages = buildMessagesForGenerate(
+  let { messages, resolvedFullSnapshotCount: fullSnapshotsUsed } = buildMessagesForGenerate(
     Array.isArray(conversationExchanges) ? conversationExchanges : [],
-    userMessage,
-    FULL_SNAPSHOT_DEFAULT
+    userMessage
   );
 
   if (estimateTokens(messages, systemPrompt) > 20000) {
-    fullSnapshotsUsed = 1;
-    messages = buildMessagesForGenerate(
+    ({ messages, resolvedFullSnapshotCount: fullSnapshotsUsed } = buildMessagesForGenerate(
       Array.isArray(conversationExchanges) ? conversationExchanges : [],
       userMessage,
       1
-    );
+    ));
   }
 
   if (estimateTokens(messages, systemPrompt) > 25000) {
@@ -1919,11 +2018,12 @@ async function generateOperations(
 // ── Visual pipeline (Pass 1 / Pass 2) — VISUAL_COMPONENT_RULES never mixed into generateOperations ──
 
 function visualPassSystemContent() {
-  if (!FEATURE_PROMPT_BUNDLES) {
-    return `${SYSTEM_PROMPT.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
-  }
-  const sp = buildSystemPrompt(['animations', 'audio', 'complex', 'images', 'subtitles'], true);
-  return `${sp.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
+  // Visual pipeline always uses the full rule set — it depends on every
+  // surface (subtitles, images, animations, tracks, etc.) — so we go
+  // through the backwards-compat SYSTEM_PROMPT export rather than trying
+  // to enumerate bundles. This matches the v1 behavior of "system prompt +
+  // visual rules".
+  return `${SYSTEM_PROMPT.trim()}\n\n${VISUAL_COMPONENT_RULES}`;
 }
 
 function detectVisualIntent(prompt) {
@@ -2040,6 +2140,31 @@ async function generateVisualCandidates(
       return pr === 'critical' || pr === 'high';
     });
   }
+
+  const REQUIRED_INTERP_FIELDS = [
+    'spoken_text_translation',
+    'semantic_summary',
+    'ideal_visual_description',
+    'concrete_subjects',
+    'mood',
+    'setting_hint',
+    'avoid_subjects',
+  ];
+  for (const c of arr) {
+    if (String(c.resolution_strategy || '') !== 'external_stock') continue;
+    const missing = REQUIRED_INTERP_FIELDS.filter(k => {
+      const v = c[k];
+      if (v == null) return true;
+      if (Array.isArray(v) && v.length === 0) return true;
+      if (typeof v === 'string' && !v.trim()) return true;
+      return false;
+    });
+    if (missing.length > 0) {
+      log(
+        `[visual-pass1] candidate ${c.candidate_id || '(no id)'} missing interpretation fields: ${missing.join(', ')}`
+      );
+    }
+  }
   return arr;
 }
 
@@ -2096,6 +2221,9 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy,
   }
   if (!Array.isArray(obj.retrieval_query_alternates)) return null;
 
+  log(
+    `[visual-pass2] candidate=${obj.candidate_id} primary="${obj.retrieval_query_primary}" alternates=${JSON.stringify(obj.retrieval_query_alternates)} conf=${obj.confidence_score}`
+  );
   return obj;
 }
 

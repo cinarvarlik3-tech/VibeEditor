@@ -34,6 +34,9 @@ const counts = {
   historySummaryUsed:       0,
   historyRawJsonUsed:       0,
   historyFullSnapshotsGt1:    0,
+  historyConversationalEscalation: 0,
+  historyFullSnapshots: 0,
+  historyStrippedTurns: 0,
 };
 
 /** Bounded ring buffer of recent samples per metric name (avg / p50 / p95). */
@@ -155,6 +158,9 @@ function reset() {
   counts.historySummaryUsed = 0;
   counts.historyRawJsonUsed = 0;
   counts.historyFullSnapshotsGt1 = 0;
+  counts.historyConversationalEscalation = 0;
+  counts.historyFullSnapshots = 0;
+  counts.historyStrippedTurns = 0;
   for (const k of [...Object.keys(counts)]) {
     if (k.startsWith('bundles_') || k.startsWith('transcriptMode_')) delete counts[k];
   }

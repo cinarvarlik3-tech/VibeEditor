@@ -10,6 +10,7 @@
     "test:stage1": "node tests/test-stage1.js"
   },
   "dependencies": {
+    "@google/genai": "^1.0.0",
     "@remotion/cli": "^4.0.190",
     "@supabase/supabase-js": "^2.103.3",
     "axios": "^1.7.2",
