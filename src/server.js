@@ -1602,6 +1602,20 @@ app.post('/api/visual/scan', requireAuth, async (req, res) => {
       visualScanLlmCache.set(scanKey, { candidates });
       log(`LLM response cache MISS (${visualScanLlmCache.name}) key=${scanKey.slice(0, 12)}…`);
     }
+    if (Array.isArray(candidates)) {
+      candidates = candidates.map(c => {
+        if (!c || typeof c !== 'object') return c;
+        const rich = c.ideal_visual_description != null && String(c.ideal_visual_description).trim() !== ''
+          ? String(c.ideal_visual_description).trim()
+          : '';
+        return {
+          ...c,
+          originalDescription: c.originalDescription != null && String(c.originalDescription).trim() !== ''
+            ? String(c.originalDescription).trim()
+            : rich,
+        };
+      });
+    }
     res.json({
       candidates,
       llmCacheHit: !!cachedScan,
@@ -1614,13 +1628,23 @@ app.post('/api/visual/scan', requireAuth, async (req, res) => {
 
 app.post('/api/visual/brief', requireAuth, async (req, res) => {
   try {
-    const { candidate, transcript, stylePolicy } = req.body || {};
+    const { candidate, transcript, stylePolicy, originalDescription } = req.body || {};
     if (!candidate) return res.status(400).json({ error: 'candidate is required' });
+    const mergedCandidate = {
+      ...candidate,
+      ...(originalDescription != null && String(originalDescription).trim() !== ''
+        ? { originalDescription: String(originalDescription).trim() }
+        : {}),
+    };
     const st = candidate.start_time != null ? candidate.start_time : candidate.startTime;
     const ctx = extractTranscriptContext(transcript || [], st, 10);
     const briefPayload = {
       userId:        req.user.id,
-      candidate,
+      candidate:     mergedCandidate,
+      originalDescription:
+        mergedCandidate.originalDescription != null && String(mergedCandidate.originalDescription).trim() !== ''
+          ? String(mergedCandidate.originalDescription).trim()
+          : (mergedCandidate.ideal_visual_description != null ? String(mergedCandidate.ideal_visual_description).trim() : ''),
       transcriptCtx: ctx,
       stylePolicy:   stylePolicy || {},
       stockProvider: 'pexels',
@@ -1632,12 +1656,12 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
       brief = cachedBrief.brief;
       log(`LLM response cache HIT (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
     } else {
-      brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {}, req.user.id);
+      brief = await generateRetrievalBrief(mergedCandidate, ctx, stylePolicy || {}, req.user.id);
       visualBriefLlmCache.set(briefKey, { brief });
       log(`LLM response cache MISS (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
     }
     if (brief) {
-      applySearchQueryToBrief(brief, candidate);
+      applySearchQueryToBrief(brief, mergedCandidate);
     }
     res.json({
       brief,
@@ -1651,28 +1675,53 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
 
 app.post('/api/visual/claude-pick', requireAuth, async (req, res) => {
   try {
-    const { candidate, assets } = req.body || {};
+    const { candidate, assets, originalDescription, searchQuery } = req.body || {};
+    const cand = candidate && typeof candidate === 'object' ? candidate : {};
+    const origDesc =
+      originalDescription != null && String(originalDescription).trim() !== ''
+        ? String(originalDescription).trim()
+        : (cand.originalDescription != null && String(cand.originalDescription).trim() !== ''
+            ? String(cand.originalDescription).trim()
+            : (cand.ideal_visual_description != null ? String(cand.ideal_visual_description).trim() : ''));
+    const sQuery = searchQuery != null && String(searchQuery).trim() !== '' ? String(searchQuery).trim() : '';
     const pickPayload = {
-      userId:   req.user.id,
-      candidate: candidate || {},
-      assets:    Array.isArray(assets) ? assets : [],
-      stockProvider: 'pexels',
+      userId:          req.user.id,
+      candidate:     cand,
+      originalDescription: origDesc,
+      searchQuery:     sQuery,
+      assets:          Array.isArray(assets) ? assets : [],
+      stockProvider:   'pexels',
+      pickSchemaVersion: 'v2',
     };
     const pickKey = visualPickLlmCache.keyForPayload(pickPayload);
     const cachedPick = visualPickLlmCache.get(pickKey);
     let out;
-    if (cachedPick && cachedPick.chosen_id != null) {
+    const validCachedPick = cachedPick && (
+      cachedPick.rejected === true ||
+      (cachedPick.chosen_id != null && String(cachedPick.chosen_id).trim() !== '')
+    );
+    if (validCachedPick) {
       out = cachedPick;
       log(`LLM response cache HIT (${visualPickLlmCache.name}) key=${pickKey.slice(0, 12)}…`);
     } else {
       out = await visualPipelineAiPick(
-        candidate || {},
+        cand,
         Array.isArray(assets) ? assets : [],
-        req.user.id
+        req.user.id,
+        { originalDescription: origDesc, searchQuery: sQuery }
       );
       visualPickLlmCache.set(pickKey, out);
       log(`LLM response cache MISS (${visualPickLlmCache.name}) key=${pickKey.slice(0, 12)}…`);
     }
+    const resultKind = out.rejected ? 'rejected' : 'picked';
+    const em =
+      out.expressionMatch === true ? 'true' : (out.expressionMatch === null || out.expressionMatch === undefined ? 'null' : 'false');
+    const rsn = out.rejectDetail != null && String(out.rejectDetail).trim() !== '' ? String(out.rejectDetail).trim() : '';
+    log(
+      `[visual-pick] candidate=${JSON.stringify(sQuery || '""')} result=${resultKind} ` +
+      `expressionMatch=${em}` +
+      (rsn ? ` reason=${JSON.stringify(rsn)}` : '')
+    );
     res.json({
       ...out,
       llmCacheHit: !!cachedPick,

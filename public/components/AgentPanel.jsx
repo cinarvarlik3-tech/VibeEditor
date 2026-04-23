@@ -223,6 +223,7 @@
         aiAccepted: {},
         aiError: {},
         stockAttribution: {},
+        searchQueries: {},
       };
     });
 
@@ -284,6 +285,9 @@
           var n = Object.assign({}, prev);
           n.loading = Object.assign({}, n.loading, { [k]: false });
           n.assets = Object.assign({}, n.assets, { [k]: res.assets || [] });
+          n.searchQueries = Object.assign({}, n.searchQueries || {}, {
+            [k]: (res.searchQuery != null && res.searchQuery !== '') ? String(res.searchQuery) : '',
+          });
           n.expanded = Object.assign({}, n.expanded, { [k]: true });
           return n;
         });
@@ -360,8 +364,69 @@
     }
 
     async function onClaudePick(cand, assets) {
-      var chosen = await onClaudePickAsset(cand, assets);
-      if (chosen) await onUseThis(cand, chosen);
+      var vk = vkey(cand);
+      var sq = (local.searchQueries && local.searchQueries[vk]) != null
+        ? local.searchQueries[vk]
+        : '';
+      var od = (cand.originalDescription != null && String(cand.originalDescription) !== '')
+        ? String(cand.originalDescription)
+        : (cand.ideal_visual_description != null ? String(cand.ideal_visual_description) : '');
+      var res = await onClaudePickAsset(cand, assets, { searchQuery: sq, originalDescription: od });
+      if (!res || res.kind === 'error') return;
+      if (res.kind === 'rejected_suggest_ai') {
+        setLocal(function(prev) {
+          var n = Object.assign({}, prev);
+          n.aiGenerating = Object.assign({}, n.aiGenerating, { [vk]: true });
+          n.aiError = Object.assign({}, n.aiError, { [vk]: '' });
+          n.aiAccepted = Object.assign({}, n.aiAccepted);
+          delete n.aiAccepted[vk];
+          return n;
+        });
+        var genCand = Object.assign({}, res.candidate || cand, {
+          ideal_visual_description: (res.originalDescription && String(res.originalDescription).trim() !== '')
+            ? String(res.originalDescription)
+            : (cand.ideal_visual_description != null ? String(cand.ideal_visual_description) : ''),
+        });
+        var result;
+        try {
+          result = await onAiGenerate(genCand);
+        } catch (e) {
+          result = { success: false, error: e.message || String(e) };
+        }
+        if (result && result.success) {
+          setLocal(function(prev) {
+            var n2 = Object.assign({}, prev);
+            n2.aiGenerating = Object.assign({}, n2.aiGenerating, { [vk]: false });
+            n2.aiPreview = Object.assign({}, n2.aiPreview, {
+              [vk]: {
+                base64: result.base64,
+                mimeType: result.mimeType || 'image/png',
+                model: result.model || '',
+              },
+            });
+            n2.aiAccepted = Object.assign({}, n2.aiAccepted);
+            delete n2.aiAccepted[vk];
+            return n2;
+          });
+          return;
+        }
+        setLocal(function(prev) {
+          var n3 = Object.assign({}, prev);
+          n3.aiGenerating = Object.assign({}, n3.aiGenerating, { [vk]: false });
+          n3.aiError = Object.assign({}, n3.aiError, { [vk]: '' });
+          n3.warn = Object.assign({}, n3.warn, {
+            [vk]: 'AI image generation is unavailable. Added the first stock result; expression may not match the moment.',
+          });
+          return n3;
+        });
+        if (res.assets && res.assets[0]) {
+          await onUseThis(cand, res.assets[0]);
+        }
+        return;
+      }
+      if (res.kind === 'stock' && res.asset) {
+        await onUseThis(cand, res.asset);
+      }
     }
 
     async function onAiGenerateClick(cand) {

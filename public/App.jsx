@@ -1220,13 +1220,14 @@
     }, [cachedTranscript, projectId, addMessage]);
 
     const handleFindAssets = useCallback(async (candidate) => {
-      const r = await fetch('/api/visual/brief', {
+        const r = await fetch('/api/visual/brief', {
         method:  'POST',
         headers: authHeadersJson(),
         body:    JSON.stringify({
           candidate,
           transcript: cachedTranscript || [],
           stylePolicy: {},
+          originalDescription: candidate.originalDescription ?? candidate.ideal_visual_description ?? '',
         }),
       });
       const data = await r.json().catch(() => ({}));
@@ -1274,7 +1275,7 @@
         }
         raw = Array.isArray(pd.results) ? pd.results : [];
       }
-      return { assets: raw.map(mapStock), lowConfidence: false };
+      return { assets: raw.map(mapStock), lowConfidence: false, searchQuery: qStr };
     }, [cachedTranscript]);
 
     const handleAiGenerate = useCallback(async (candidate) => {
@@ -1302,16 +1303,40 @@
       }
     }, []);
 
-    const handleClaudePickAsset = useCallback(async (candidate, assets) => {
+    const handleClaudePickAsset = useCallback(async (candidate, assets, pickCtx) => {
+      const originalDescription = (pickCtx && pickCtx.originalDescription) != null
+        ? pickCtx.originalDescription
+        : (candidate.originalDescription != null
+            ? candidate.originalDescription
+            : (candidate.ideal_visual_description != null ? candidate.ideal_visual_description : ''));
+      const searchQuery = (pickCtx && pickCtx.searchQuery) != null ? pickCtx.searchQuery : (candidate.searchQuery != null ? candidate.searchQuery : '');
       const r = await fetch('/api/visual/claude-pick', {
         method:  'POST',
         headers: authHeadersJson(),
-        body:    JSON.stringify({ candidate, assets }),
+        body:    JSON.stringify({
+          candidate,
+          assets,
+          originalDescription: String(originalDescription),
+          searchQuery: String(searchQuery),
+        }),
       });
       const data = await r.json().catch(() => ({}));
-      if (!r.ok || data.chosen_id == null) return null;
-      const idStr = String(data.chosen_id);
-      return (assets || []).find(a => String(a.id) === idStr) || null;
+      if (!r.ok) return { kind: 'error', error: data.error || 'Pick failed' };
+      if (data.rejected && data.suggestAiGeneration) {
+        return {
+          kind: 'rejected_suggest_ai',
+          originalDescription: String(originalDescription).trim() || (candidate.ideal_visual_description != null ? String(candidate.ideal_visual_description).trim() : ''),
+          candidate,
+          assets: assets || [],
+        };
+      }
+      const idStr = data.chosen_id != null
+        ? String(data.chosen_id)
+        : (data.picked && data.picked.chosen_id != null ? String(data.picked.chosen_id) : null);
+      if (idStr == null) return { kind: 'error', error: 'No selection' };
+      const asset = (assets || []).find(a => String(a.id) === idStr) || null;
+      if (!asset) return { kind: 'error', error: 'Selected asset not in list' };
+      return { kind: 'stock', asset };
     }, []);
 
     const handleCreateImageClip = useCallback((payload) => {

@@ -21,6 +21,7 @@ const {
   SYSTEM_PROMPT_VERSION,
   buildSystemPrompt,
 } = require('./systemPrompt');
+const { VISUAL_PICK_PROMPT_TEMPLATE } = require('./visualComponentRules');
 const { searchAudio } = require('../assets/audio');
 const { canonicalStringify } = require('../cache/hash');
 const metrics = require('../cache/metrics');
@@ -2230,30 +2231,61 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy,
 }
 
 function narrowAssetsForVisualPick(assets) {
-  return (Array.isArray(assets) ? assets : []).map(a => ({
-    id: a.id,
-    type: a.type,
-    width: a.width,
-    height: a.height,
-    duration: a.duration,
-    alt: a.alt != null ? a.alt : null,
-    thumbnail: a.thumbnail,
-  }));
+  return (Array.isArray(assets) ? assets : []).map(a => {
+    const altStr = a.alt != null && String(a.alt).trim() !== '' ? String(a.alt) : 'No title available';
+    return {
+      id:         String(a.id),
+      type:       a.type === 'video' ? 'video' : 'photo',
+      width:      typeof a.width === 'number' ? a.width : Number(a.width) || 0,
+      height:     typeof a.height === 'number' ? a.height : Number(a.height) || 0,
+      duration:   a.duration != null && a.duration !== '' ? Number(a.duration) : null,
+      alt:        altStr,
+      thumbnail:  a.thumbnail != null ? String(a.thumbnail) : '',
+    };
+  });
 }
 
-async function visualPipelineAiPick(candidate, assets, userId = null) {
+/**
+ * @param {object} opts
+ * @param {string} [opts.originalDescription]
+ * @param {string} [opts.searchQuery]
+ * @returns {Promise<object>} Response body fields for /api/visual/claude-pick (before llmCache*).
+ */
+async function visualPipelineAiPick(candidate, assets, userId = null, opts = {}) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('visualPipelineAiPick: OPENAI_API_KEY is not set');
   }
-  const pickSystem = 'You respond with JSON only. No markdown.';
   const narrow = narrowAssetsForVisualPick(assets);
+  const firstId = narrow.length > 0 ? String(narrow[0].id) : null;
+
+  let orig =
+    String(opts.originalDescription != null && opts.originalDescription !== ''
+      ? opts.originalDescription
+      : (candidate && candidate.originalDescription) || (candidate && candidate.ideal_visual_description) || ''
+    ).trim();
+  if (!orig) {
+    log('[visual-pick] missing originalDescription — substituting');
+    orig = 'No scene description available.';
+  }
+
+  let sq =
+    String(opts.searchQuery != null && opts.searchQuery !== ''
+      ? opts.searchQuery
+      : (candidate && candidate.searchQuery) || ''
+    ).trim();
+  if (!sq) {
+    log('[visual-pick] missing searchQuery — substituting');
+    sq = 'No search query available.';
+  }
+
+  const pickSystem = 'You respond with JSON only. No markdown.';
   const userMsg =
-    'Given these ranked Pexels stock assets for the moment described, choose the single best one. ' +
-    'Each asset has `id`, `type` (photo or video), dimensions, `duration` (seconds, videos only), ' +
-    "`alt` (the photographer's own title on Pexels — strong relevance signal; use it heavily), and `thumbnail` (URL). " +
-    'Return only JSON: { "chosen_id": "<string>" } using the exact `id` string from the best asset.\n\n' +
-    'CANDIDATE: ' + canonicalStringify(candidate || {}) + '\n' +
-    'ASSETS: ' + canonicalStringify(narrow);
+    VISUAL_PICK_PROMPT_TEMPLATE
+      .replace('"{originalDescription}"', JSON.stringify(orig))
+      .replace('"{searchQuery}"', JSON.stringify(sq)) +
+    '\n' +
+    'ASSETS: ' +
+    canonicalStringify(narrow);
 
   let response;
   try {
@@ -2261,7 +2293,7 @@ async function visualPipelineAiPick(candidate, assets, userId = null) {
       model:                 MODEL_FOR_VISUAL_PICK,
       messages:              [{ role: 'user', content: userMsg }],
       systemPrompt:          pickSystem,
-      max_completion_tokens: 256,
+      max_completion_tokens: 800,
       userId,
       callSite:              'visual_pick',
     });
@@ -2281,17 +2313,119 @@ async function visualPipelineAiPick(candidate, assets, userId = null) {
   const raw = stripMarkdownJsonFence(
     typeof rawMsg === 'string' ? rawMsg : messageContentToString(rawMsg)
   ) || '{}';
+  const cleaned = String(raw)
+    .replace(/^```(?:json)?/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
   let parsed;
+  let parseFailed = false;
   try {
-    parsed = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
+    parsed = JSON.parse(cleaned);
   } catch (_) {
-    parsed = {};
+    parseFailed = true;
+    parsed = null;
   }
-  const rawChosen = parsed && parsed.chosen_id != null ? parsed.chosen_id : null;
-  if (rawChosen == null) throw new Error('visualPipelineAiPick: missing chosen_id');
-  const idStr = String(rawChosen).trim();
-  if (!idStr) throw new Error('visualPipelineAiPick: invalid chosen_id');
-  return { chosen_id: idStr };
+
+  function idInAssets(id) {
+    const s = id != null ? String(id).trim() : '';
+    if (!s) return null;
+    return narrow.some(a => String(a.id) === s) ? s : null;
+  }
+
+  function optionCAmbiguous(expressionNote) {
+    const id = firstId;
+    if (!id) {
+      throw new Error('visualPipelineAiPick: no assets to pick from');
+    }
+    return {
+      chosen_id:         id,
+      picked:            {
+        chosen_id:         id,
+        expressionMatch:   null,
+        expressionNote:    expressionNote || 'Could not parse model response; using first result.',
+      },
+      rejected:          false,
+      expressionMatch:   null,
+      expressionNote:    expressionNote || 'Could not parse model response; using first result.',
+      suggestAiGeneration: false,
+      rejectReason:      undefined,
+      rejectDetail:      undefined,
+    };
+  }
+
+  if (parseFailed || !parsed || typeof parsed !== 'object') {
+    log(`[visual-pick] JSON parse failed — treating as ambiguous (Option C)`);
+    return optionCAmbiguous('Response was not valid JSON; using first result.');
+  }
+
+  if (parsed.reject === true) {
+    if (!parsed.rejectReason) {
+      log(`[visual-pick] reject without rejectReason — treating as ambiguous (Option C)`);
+      return optionCAmbiguous('Model rejected but gave no reason; using first result.');
+    }
+    return {
+      chosen_id:             undefined,
+      picked:                null,
+      rejected:              true,
+      expressionMatch:       false,
+      suggestAiGeneration:   true,
+      rejectReason:          parsed.rejectReason,
+      rejectDetail:          parsed.rejectDetail != null ? String(parsed.rejectDetail) : '',
+      expressionNote:        undefined,
+    };
+  }
+
+  const ex = parsed.expressionMatch;
+  const chosenRaw = parsed.chosen_id;
+  if (chosenRaw == null) {
+    log(`[visual-pick] missing chosen_id after non-reject — ambiguous (Option C)`);
+    return optionCAmbiguous('Model did not return chosen_id; using first result.');
+  }
+
+  const idStr = idInAssets(chosenRaw);
+  if (!idStr) {
+    log(`[visual-pick] chosen_id not in ASSETS — ambiguous (Option C)`);
+    if (firstId) {
+      return {
+        chosen_id:         firstId,
+        picked:            {
+          chosen_id:         firstId,
+          expressionMatch:   null,
+          expressionNote:    (parsed && parsed.expressionNote != null)
+            ? String(parsed.expressionNote)
+            : 'requested id not in result set; using first result',
+        },
+        rejected:            false,
+        expressionMatch:     null,
+        expressionNote:      (parsed && parsed.expressionNote != null)
+          ? String(parsed.expressionNote)
+          : 'requested id not in result set; using first result',
+        suggestAiGeneration: false,
+      };
+    }
+    throw new Error('visualPipelineAiPick: chosen_id not in asset list');
+  }
+
+  if (ex === null) {
+    return {
+      chosen_id:         idStr,
+      picked:            { ...parsed, chosen_id: idStr, expressionMatch: null },
+      rejected:          false,
+      expressionMatch:   null,
+      expressionNote:    parsed.expressionNote != null ? String(parsed.expressionNote) : '',
+      suggestAiGeneration: false,
+    };
+  }
+
+  return {
+    chosen_id:         idStr,
+    picked:            { ...parsed, chosen_id: idStr, expressionMatch: true },
+    rejected:          false,
+    expressionMatch:   true,
+    suggestAiGeneration: false,
+    expressionNote:    undefined,
+  };
 }
 
 (function logCompressionRatioOnce() {

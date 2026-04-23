@@ -422,15 +422,15 @@ Run **`node src/state/timelineReducer.js`** to execute the file’s **self-tests
 **Spec:** `docs/VISUAL_PIPELINE.md` (authoritative for passes, JSON shapes, gating, UI states).
 
 **Stock path (3 LLM steps + Pexels):**
-1. `POST /api/visual/scan` — **candidates** from transcript
-2. `POST /api/visual/brief` — per-candidate **search brief** (includes `searchQuery` for Pexels, distilled in Pass 2)
-3. `POST /api/visual/claude-pick` — pick asset id from ranked results  
-Rules text: `src/claude/visualComponentRules.js` (**Pass 1 / Pass 2** in the sense of *rules for the model*, not the Gemini module name).
+1. `POST /api/visual/scan` — **candidates** from transcript (each includes **`originalDescription`**, alias of Pass 1’s emotion-rich `ideal_visual_description`, for downstream context)
+2. `POST /api/visual/brief` — per-candidate **search brief** (includes `searchQuery` for Pexels, distilled in Pass 2); request may include **`originalDescription`** for pass-through caching / consistency
+3. `POST /api/visual/claude-pick` — scores ranked Pexels results against **`originalDescription`** (scene intent) and **`searchQuery`** (what was actually searched). **Three outcomes:** confident pick (`expressionMatch: true`), ambiguous best-effort pick (`expressionMatch: null`, no user-facing warning), or **reject** (`rejected: true`, `suggestAiGeneration: true`) when no result passes **Priority 1 — emotional register / expression**  
+Scoring **Priority 1** is expression-aware; subject/setting match follow. Pick rules text: `src/claude/visualComponentRules.js` (Pass 1 / Pass 2 / **Pass 3** pick template). Implementation assembles the pick prompt in `src/claude/generate.js` (`visualPipelineAiPick`).
 
 **AI still path (Gemini):**
 - `POST /api/visual/generate-image` — `generateImageFromDescription` in `aiImageGen.js` — **PNG in JSON (base64)**; large response.
 - `POST /api/visual/accept-generated` — image → **MP4** (ffmpeg) → **Supabase** `image-layer` — same **shape** as Pexels ingest for client `CREATE` of `imageClip`.
-- If **`GEMINI_API_KEY`** is unset, that path **errors** — UI should hide or message clearly.
+- **Stock pick hard-reject** (`expression_mismatch`) **automatically** triggers the same `generate-image` path as the manual “AI Generate” control (no separate failure UI; optional fallback to the first Pexels result if Gemini is unavailable). If **`GEMINI_API_KEY`** is unset, that path **errors** — the client falls back to the best available stock result when that happens after an auto-trigger.
 
 Each visual endpoint has its own **in-memory** LLM cache (see env names in §9).
 
@@ -506,6 +506,7 @@ Each visual endpoint has its own **in-memory** LLM cache (see env names in §9).
 - **Presets** — `/presets` is empty; `presetName` in `/generate` is **forward-looking**.
 - **Model names** in env default to a **5.4** family; OpenAI’s catalog can change — **env overrides** are the escape hatch.
 - **Roadmap** documents may describe **sharing**, **version history**, **batch** — **verify** in code before assuming shipped.
+- **Expression-aware Pexels pick** — relies on Pexels **alt** text (photographer title) and optional thumbnail context. When titles omit expression language and thumbs are low-res, the model correctly degrades to an **ambiguous** pick (`expressionMatch: null`, no user warning) instead of a false reject. This is **expected** behavior; observability: `[visual-pick] … expressionMatch=…` logs in `server.js`.
 
 ---
 

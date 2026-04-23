@@ -264,4 +264,99 @@ In Pass 2, do not produce a retrieval_query_primary that contradicts ideal_visua
 In Pass 2, retrieval_query_primary and each alternate must be pure noun phrases with no verbs in gerund form longer than one word (e.g. "woman writing" is fine; "woman who is writing on the board" is not).
 `.trim();
 
-module.exports = { VISUAL_COMPONENT_RULES };
+/**
+ * Pass 3 (claude-pick) — user message body template. generate.js injects
+ * {originalDescription} and {searchQuery}, then appends a JSON stringified
+ * ASSETS array. System prompt: JSON only, no markdown.
+ */
+const VISUAL_PICK_PROMPT_TEMPLATE = `You are selecting the best stock asset for a scene in a short-form vertical video.
+
+SCENE INTENT — this is the authoritative description of what the editor needs:
+"{originalDescription}"
+
+SEARCH QUERY USED — this is the compressed query that was sent to Pexels for retrieval:
+"{searchQuery}"
+
+Important: the search query was deliberately stripped of emotion and mood language to 
+improve retrieval. It does not represent the full scene requirement. Always score 
+candidates against SCENE INTENT, not against the search query. The search query tells 
+you what was asked of the stock library; the scene intent tells you what is actually needed.
+
+After that context, you will receive a JSON array ASSETS with entries to score.
+
+Score each candidate against the scene intent using these criteria in strict priority order.
+A higher-priority failure cannot be compensated by strength in a lower-priority criterion.
+
+PRIORITY 1 — EMOTIONAL REGISTER AND FACIAL EXPRESSION (hard filter)
+This is the highest-weighted criterion and the most common source of bad picks.
+
+Extract the intended emotional register from the scene intent. Map it to one of:
+  - SERIOUS: concern, worry, stress, concentration, frustration, sadness, 
+              tension, anxiety, exhaustion, conflict, grief
+  - NEUTRAL: focused, calm, attentive, thoughtful, composed, professional
+  - POSITIVE: warmth, joy, happiness, celebration, pride, excitement, love, relief
+
+Then evaluate each candidate's subjects:
+  - If the scene intent register is SERIOUS or NEUTRAL:
+    Disqualify any candidate where subjects are visibly smiling broadly, 
+    laughing, or appear cheerful. A slight or ambiguous expression is acceptable. 
+    A clear smile is a hard disqualifier regardless of how well everything else matches.
+  - If the scene intent register is POSITIVE:
+    Disqualify any candidate where subjects appear tense, unhappy, or distressed.
+  - If the alt text title contains expression-contradicting language 
+    ("Laughing", "Smiling", "Happy", "Cheerful", "Celebrating", "Playing") 
+    and the scene intent is SERIOUS or NEUTRAL, disqualify without needing to 
+    inspect the thumbnail further.
+
+PRIORITY 2 — SUBJECT AND RELATIONSHIP MATCH
+  - Do the subjects match the relationship described? (e.g. parent-child, couple, colleagues)
+  - Does the apparent age range match?
+  - Does the number of people match?
+  Penalise mismatches proportionally to how specific the scene intent is about these.
+
+PRIORITY 3 — SETTING AND PROPS MATCH
+  - Does the physical environment match? (kitchen, office, outdoors, etc.)
+  - Are key props present? (homework materials, laptop, phone, etc.)
+  This is a soft criterion — a close setting match with correct expression beats 
+  a perfect setting match with wrong expression every time.
+
+PRIORITY 4 — TECHNICAL FIT
+  - Portrait orientation preferred (this should already be enforced by search params)
+  - Appropriate subject framing for the context
+  - Sufficient visual clarity
+
+SCORING RULE: A candidate that fails Priority 1 must not be selected, 
+even if it scores perfectly on Priorities 2–4.
+
+OUTPUT OPTIONS:
+
+Option A — You found an acceptable candidate:
+Return your selection in the existing JSON format with all currently required fields.
+Add one new field: "expressionMatch": true
+
+The required selection shape is a single JSON object with at minimum:
+"chosen_id" (string, must exactly match one asset id from ASSETS) and "expressionMatch": true.
+
+Option B — No candidate passes Priority 1 (all results have wrong emotional register):
+Return this exact JSON and nothing else:
+{
+  "reject": true,
+  "rejectReason": "expression_mismatch",
+  "rejectDetail": "<one sentence explaining what expression was needed and what was found>"
+}
+
+Option C — Results are technically relevant but expression is ambiguous across all candidates
+(you cannot confidently determine expression from alt text alone and thumbnails are unclear):
+Return your best pick in the existing format with:
+"expressionMatch": null,
+"expressionNote": "<one sentence describing the uncertainty>"
+(and include "chosen_id" matching the best-effort pick)
+
+Do not use Option B unless you are confident that the available results genuinely 
+cannot serve the scene. Ambiguity is Option C. Only use Option B when you can 
+positively identify that the expression or register is wrong across all candidates.
+
+The ASSETS array follows:
+`.trim();
+
+module.exports = { VISUAL_COMPONENT_RULES, VISUAL_PICK_PROMPT_TEMPLATE };
