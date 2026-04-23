@@ -1235,38 +1235,46 @@
         return { assets: [], lowConfidence: true };
       }
       const b = data.brief;
-      const kind = b.required_asset_kind === 'image' ? 'image' : 'video';
-      const orient = b.required_orientation === 'portrait' ? 'portrait' : 'all';
-      const qStr = String(b.retrieval_query_primary || '').trim().slice(0, 100);
+      const qStr = String(b.searchQuery || '').trim();
       if (!qStr) {
-        return { assets: [], lowConfidence: false, searchError: 'Brief did not include a search query.' };
+        return { assets: [], lowConfidence: false, searchError: 'Brief did not include a searchQuery.' };
       }
-      const qs = new URLSearchParams({
-        q:            qStr,
-        asset_type:   kind,
-        per_page:     '9',
-        orientation:  orient,
+      const mapStock = (row) => ({
+        ...row,
+        previewUrl: row.thumbnail,
+        thumbnailUrl: row.thumbnail,
+        downloadUrl: row.url,
+        contributor: row.photographer,
+        pageURL: row.pexelsUrl,
+        tags: row.alt || '',
       });
-
-      // Pass through Pass 1 interpretation fields for server-side re-ranking.
-      // Candidate-level fields (richest context):
-      if (Array.isArray(candidate.concrete_subjects) && candidate.concrete_subjects.length > 0) {
-        qs.set('concrete_subjects', JSON.stringify(candidate.concrete_subjects));
-      }
-      if (Array.isArray(candidate.avoid_subjects) && candidate.avoid_subjects.length > 0) {
-        qs.set('avoid_subjects', JSON.stringify(candidate.avoid_subjects));
-      }
-
-      const pr = await fetch('/api/pixabay/search?' + qs.toString(), { headers: authHeadersBearer() });
-      const pd = await pr.json().catch(() => ({}));
+      const runSearch = async (assetType) => {
+        const qs = new URLSearchParams({ q: qStr, asset_type: assetType, per_page: '15' });
+        return fetch('/api/pexels/search?' + qs.toString(), { headers: authHeadersBearer() });
+      };
+      let pr = await runSearch('videos');
+      let pd = await pr.json().catch(() => ({}));
       if (!pr.ok) {
         return {
           assets: [],
           lowConfidence: false,
-          searchError: pd.error || pd.message || 'Pixabay search failed',
+          searchError: pd.error || pd.message || 'Pexels search failed',
         };
       }
-      return { assets: pd.results || [], lowConfidence: false };
+      let raw = Array.isArray(pd.results) ? pd.results : [];
+      if (raw.length < 3) {
+        pr = await runSearch('photos');
+        pd = await pr.json().catch(() => ({}));
+        if (!pr.ok) {
+          return {
+            assets: [],
+            lowConfidence: false,
+            searchError: pd.error || pd.message || 'Pexels search failed',
+          };
+        }
+        raw = Array.isArray(pd.results) ? pd.results : [];
+      }
+      return { assets: raw.map(mapStock), lowConfidence: false };
     }, [cachedTranscript]);
 
     const handleAiGenerate = useCallback(async (candidate) => {
@@ -1302,8 +1310,8 @@
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok || data.chosen_id == null) return null;
-      const id = Number(data.chosen_id);
-      return (assets || []).find(a => a.id === id) || null;
+      const idStr = String(data.chosen_id);
+      return (assets || []).find(a => String(a.id) === idStr) || null;
     }, []);
 
     const handleCreateImageClip = useCallback((payload) => {
@@ -1318,10 +1326,10 @@
         startTime:        startTime != null ? startTime : 0,
         endTime:          endTime != null ? endTime : (startTime != null ? startTime : 0) + dur,
         src,
-        originalFilename: sourceName || 'pixabay',
+        originalFilename: sourceName || 'pexels',
         isImage:          false,
         sourceName:       sourceName || 'B-roll',
-        sourceType:       sourceType || 'pixabay',
+        sourceType:       sourceType || 'pexels',
         pixabayId:        pixabayId != null ? pixabayId : null,
         opacity:          1.0,
         volume:           0.3,

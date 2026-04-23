@@ -2030,7 +2030,7 @@ function detectVisualIntent(prompt) {
   const p = String(prompt || '').toLowerCase();
   const keys = [
     'b-roll', 'broll', 'visual', 'footage', 'cutaway', 'stock', 'overlay',
-    'image layer', 'add footage', 'pixabay', 'illustrate', 'emphasize visually',
+    'image layer', 'add footage', 'pexels', 'pixabay', 'illustrate', 'emphasize visually',
     'show footage', 'visual component', 'add visuals', 'suggest visuals',
     'analyse visuals', 'analyze visuals', 'scan for visuals', 'scan visuals',
   ];
@@ -2222,9 +2222,23 @@ async function generateRetrievalBrief(candidate, transcriptContext, stylePolicy,
   if (!Array.isArray(obj.retrieval_query_alternates)) return null;
 
   log(
-    `[visual-pass2] candidate=${obj.candidate_id} primary="${obj.retrieval_query_primary}" alternates=${JSON.stringify(obj.retrieval_query_alternates)} conf=${obj.confidence_score}`
+    `[visual-pass2] candidate=${obj.candidate_id} primary="${obj.retrieval_query_primary}" ` +
+    `searchQuery=${JSON.stringify(obj.searchQuery != null ? obj.searchQuery : '')} ` +
+    `alternates=${JSON.stringify(obj.retrieval_query_alternates)} conf=${obj.confidence_score}`
   );
   return obj;
+}
+
+function narrowAssetsForVisualPick(assets) {
+  return (Array.isArray(assets) ? assets : []).map(a => ({
+    id: a.id,
+    type: a.type,
+    width: a.width,
+    height: a.height,
+    duration: a.duration,
+    alt: a.alt != null ? a.alt : null,
+    thumbnail: a.thumbnail,
+  }));
 }
 
 async function visualPipelineAiPick(candidate, assets, userId = null) {
@@ -2232,11 +2246,14 @@ async function visualPipelineAiPick(candidate, assets, userId = null) {
     throw new Error('visualPipelineAiPick: OPENAI_API_KEY is not set');
   }
   const pickSystem = 'You respond with JSON only. No markdown.';
+  const narrow = narrowAssetsForVisualPick(assets);
   const userMsg =
-    'Given these ranked visual assets for the moment described, choose the single best one. ' +
-    'Return only the asset id as a JSON object: { "chosen_id": <number> }\n\n' +
+    'Given these ranked Pexels stock assets for the moment described, choose the single best one. ' +
+    'Each asset has `id`, `type` (photo or video), dimensions, `duration` (seconds, videos only), ' +
+    "`alt` (the photographer's own title on Pexels — strong relevance signal; use it heavily), and `thumbnail` (URL). " +
+    'Return only JSON: { "chosen_id": "<string>" } using the exact `id` string from the best asset.\n\n' +
     'CANDIDATE: ' + canonicalStringify(candidate || {}) + '\n' +
-    'ASSETS: ' + canonicalStringify(assets || []);
+    'ASSETS: ' + canonicalStringify(narrow);
 
   let response;
   try {
@@ -2270,9 +2287,11 @@ async function visualPipelineAiPick(candidate, assets, userId = null) {
   } catch (_) {
     parsed = {};
   }
-  const id = parsed && parsed.chosen_id != null ? Number(parsed.chosen_id) : NaN;
-  if (!Number.isFinite(id)) throw new Error('visualPipelineAiPick: invalid chosen_id');
-  return { chosen_id: id };
+  const rawChosen = parsed && parsed.chosen_id != null ? parsed.chosen_id : null;
+  if (rawChosen == null) throw new Error('visualPipelineAiPick: missing chosen_id');
+  const idStr = String(rawChosen).trim();
+  if (!idStr) throw new Error('visualPipelineAiPick: invalid chosen_id');
+  return { chosen_id: idStr };
 }
 
 (function logCompressionRatioOnce() {

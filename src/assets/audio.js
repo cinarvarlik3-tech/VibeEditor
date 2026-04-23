@@ -131,11 +131,11 @@ async function searchJamendo(query, pageSize = 6) {
 
 /**
  * searchAudio
- * Calls Freesound and/or Pixabay in parallel and interleaves the results.
+ * Calls Freesound and/or Jamendo in parallel and interleaves the results.
  * One source failing does not prevent the other from returning results.
  *
  * @param {string}   query     Search terms.
- * @param {string[]} sources   Which APIs to query, default ['freesound','pixabay'].
+ * @param {string[]} sources   Which APIs to query, default ['freesound','jamendo'].
  * @param {number}   pageSize  Results per source (default 3, so ~6 total).
  * @returns {Promise<Array>}   Interleaved normalized results.
  */

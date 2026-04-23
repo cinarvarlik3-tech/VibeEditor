@@ -1237,6 +1237,7 @@
     const SOURCE_BADGE = {
       upload:  { label: 'UPLOAD',  bg: 'rgba(0,137,123,0.2)',  color: '#00897B' },
       pixabay: { label: 'PIXABAY', bg: 'rgba(30,136,229,0.2)', color: '#1E88E5' },
+      pexels: { label: 'PEXELS', bg: 'rgba(5, 150, 105, 0.2)', color: '#059669' },
       native:  { label: 'NATIVE',  bg: 'rgba(245,158,11,0.2)', color: '#F59E0B' },
     };
     const badge = SOURCE_BADGE[element.sourceType] || SOURCE_BADGE.upload;

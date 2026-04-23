@@ -38,6 +38,7 @@ const cors    = require('cors');
 const path    = require('path');
 const fs      = require('fs');
 const os      = require('os');
+const { randomUUID } = require('crypto');
 const axios   = require('axios');
 const ffmpeg  = require('fluent-ffmpeg');
 const { spawn } = require('child_process');
@@ -78,7 +79,7 @@ const { makeLlmResponseCache } = require('./cache/llmResponseCache');
 
 /** In-memory API response caches (see docs/sql/cache_tables.sql for Supabase transcript cache). */
 const fontsLRU           = makeLRU({ max: 2, ttlMs: 24 * 60 * 60 * 1000, name: 'fonts' });
-const pixabayLRU         = makeLRU({ max: 500, ttlMs: 24 * 60 * 60 * 1000, name: 'pixabay' });
+const pexelsLRU          = makeLRU({ max: 500, ttlMs: 24 * 60 * 60 * 1000, name: 'pexels' });
 const audioFreesoundLRU  = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_freesound' });
 const audioJamendoLRU    = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_jamendo' });
 const audioUnifiedLRU    = makeLRU({ max: 500, ttlMs: 30 * 60 * 1000, name: 'audio_unified' });
@@ -369,6 +370,8 @@ app.get('/api/_debug/cache', requireAuth, (req, res) => {
 
   res.json({
     SYSTEM_PROMPT_VERSION,
+    /** In-process LRU hit/miss counters (includes `pexels`, `fonts`, audio pools, etc.) */
+    lru: snap.lru,
     cacheMetrics:     snap,
     routingFallback:  snap.routingFallback,
     whisperMinutes:   snap.whisperMinutes,
@@ -571,188 +574,6 @@ function getVideoDuration(filePath) {
       else resolve(metadata.format.duration || 0);
     });
   });
-}
-
-// ---------------------------------------------------------------------------
-// Visual pipeline — tokenization + re-ranking helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Stopwords stripped before tokenization. Deliberately small; we match
- * Pixabay's own tag-matching behavior (which is close to naive word match).
- */
-const RERANK_STOPWORDS = new Set([
-  'the', 'a', 'an', 'at', 'in', 'on', 'of', 'and', 'or', 'with',
-  'to', 'for', 'from', 'by', 'is', 'are', 'was', 'were',
-]);
-
-/**
- * tokenizePhrase
- * Lowercase, strip punctuation, split on whitespace + commas, drop stopwords.
- * Returns a Set for O(1) membership checks.
- *
- * Examples:
- *   "Overwhelmed student at desk" → Set(['overwhelmed', 'student', 'desk'])
- *   "student, classroom, education" → Set(['student', 'classroom', 'education'])
- *   "" or null → Set()
- *
- * @param {string|null|undefined} phrase
- * @returns {Set<string>}
- */
-function tokenizePhrase(phrase) {
-  if (!phrase || typeof phrase !== 'string') return new Set();
-  const cleaned = phrase.toLowerCase().replace(/[^\p{L}\p{N}\s,]/gu, ' ');
-  const tokens = cleaned.split(/[\s,]+/).filter(Boolean);
-  const out = new Set();
-  for (const t of tokens) {
-    if (t.length < 2) continue;
-    if (RERANK_STOPWORDS.has(t)) continue;
-    out.add(t);
-  }
-  return out;
-}
-
-/**
- * tokenizeList
- * Tokenize each entry of a string array and union the tokens.
- * Used to turn ['overwhelmed student at desk', 'confused student'] into
- * a single bag of meaningful tokens.
- *
- * @param {string[]|null|undefined} phrases
- * @returns {Set<string>}
- */
-function tokenizeList(phrases) {
-  const out = new Set();
-  if (!Array.isArray(phrases)) return out;
-  for (const p of phrases) {
-    const toks = tokenizePhrase(p);
-    for (const t of toks) out.add(t);
-  }
-  return out;
-}
-
-/**
- * scoreAssetAgainstSubjects
- * Returns a numeric relevance score for a single Pixabay-normalized asset
- * against bags of positive (concrete_subjects) and negative (avoid_subjects)
- * tokens. Higher = better.
- *
- * Scoring:
- *   +3 per exact tag match in concreteTokens
- *   -4 per exact tag match in avoidTokens
- *   +1 per concreteTokens entry that appears as a substring of any tag
- *       (covers e.g. 'student' hitting a tag like 'studentdesk')
- *   0  otherwise
- *
- * If neither set is provided, returns 0 (no reordering effect).
- *
- * @param {{ tags?: string }} asset  — normalized asset from normalizePixabay*
- * @param {Set<string>}       concreteTokens
- * @param {Set<string>}       avoidTokens
- * @returns {number}
- */
-function scoreAssetAgainstSubjects(asset, concreteTokens, avoidTokens) {
-  if (concreteTokens.size === 0 && avoidTokens.size === 0) return 0;
-  const assetTokens = tokenizePhrase(asset && asset.tags);
-  if (assetTokens.size === 0) return 0;
-
-  let score = 0;
-  for (const t of concreteTokens) {
-    if (assetTokens.has(t)) {
-      score += 3;
-    } else {
-      for (const at of assetTokens) {
-        if (at.length > 3 && at.includes(t)) {
-          score += 1;
-          break;
-        }
-      }
-    }
-  }
-  for (const t of avoidTokens) {
-    if (assetTokens.has(t)) score -= 4;
-  }
-  return score;
-}
-
-/**
- * buildPixabayQueryWithExclusions
- * CURRENTLY UNUSED — see 2026-04-22 rollback note in /api/pixabay/search handler.
- * Retained because its defensive logic (stem check, cap, positive-token collision
- * check) is reusable if we later introduce an implied-tags map to make exclusion
- * safe at the query layer.
- *
- * Appends `-term` tokens to the base query with three safety rules that
- * prevent self-defeating queries:
- *
- *   1. Never exclude a token that already appears in the positive query.
- *      Pixabay would return zero results (e.g. q="student desk -student").
- *
- *   2. Never exclude a token that shares a stem with any positive token,
- *      for tokens of 4+ characters on both sides. This handles the common
- *      case of "students" being excluded when "student" is a positive
- *      subject, and "classroom" being excluded when "class" is positive.
- *      The 4-char threshold prevents false positives on short words like
- *      "at", "of", "to".
- *
- *   3. Cap total emitted negatives at MAX_EXCLUSIONS. Pass 2 orders
- *      exclusion_terms roughly by importance (cartoon, illustration, and
- *      explicit genre-killers come first), so truncation preserves the
- *      most valuable exclusions. A higher cap degrades recall faster
- *      than it improves precision, given Pixabay's tag-match retrieval.
- *
- * Respects Pixabay's 100-char q limit; silently drops overflow.
- *
- * @param {string}              baseQuery
- * @param {string[]|undefined}  exclusionTerms
- * @returns {string}            final q param, <= 100 chars
- */
-function buildPixabayQueryWithExclusions(baseQuery, exclusionTerms) {
-  const MAX_EXCLUSIONS = 3;
-  const base = String(baseQuery || '').trim();
-  if (!Array.isArray(exclusionTerms) || exclusionTerms.length === 0) {
-    return base.length > 100 ? base.slice(0, 100) : base;
-  }
-
-  const positiveTokens = tokenizePhrase(base);
-  const seen = new Set(positiveTokens);
-  const toAppend = [];
-
-  for (const raw of exclusionTerms) {
-    if (toAppend.length >= MAX_EXCLUSIONS) break;
-    const toks = tokenizePhrase(raw);
-    for (const t of toks) {
-      if (toAppend.length >= MAX_EXCLUSIONS) break;
-      if (seen.has(t)) continue;
-      if (seen.has('-' + t)) continue;
-
-      // Stem-conflict check: skip exclusion tokens that share a prefix
-      // with a positive token when both are 4+ chars. Covers the common
-      // student/students and class/classroom collisions from the bug report.
-      let conflicts = false;
-      for (const pt of positiveTokens) {
-        if (pt === t) { conflicts = true; break; }
-        if (pt.length >= 4 && t.length >= 4) {
-          if (pt.startsWith(t) || t.startsWith(pt)) {
-            conflicts = true;
-            break;
-          }
-        }
-      }
-      if (conflicts) continue;
-
-      toAppend.push('-' + t);
-      seen.add('-' + t);
-    }
-  }
-
-  let out = base;
-  for (const neg of toAppend) {
-    const candidate = out ? (out + ' ' + neg) : neg;
-    if (candidate.length > 100) break;
-    out = candidate;
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,246 +1143,433 @@ app.post('/api/summarize-conversation', requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Pixabay + visual pipeline (server-side only — key never sent to browser)
+// Pexels stock + visual pipeline (server-side only — key never sent to browser)
+// SMOKE TEST:
+// 1. GET /api/pexels/search?q=Mother+Reviewing+Homework&asset_type=videos
+//    → expect results array, all items portrait orientation, source: "pexels"
+// 2. GET /api/pexels/search?q=Mother+Reviewing+Homework&asset_type=all
+//    → expect interleaved photos and videos
+// 3. GET /api/pexels/search (no q param) → expect 400
+// 4. Run Scan for Visuals end-to-end → confirm searchQuery appears in brief response
+//    and is used (not the full description) in the Pexels search call
+// 5. Accept a visual → confirm attribution renders in the UI
+// 6. GET /api/_debug/cache → confirm "pixabay" no longer appears, "pexels" does
 // ---------------------------------------------------------------------------
 
-function normalizePixabayVideo(hit) {
-  const vids = hit.videos || {};
-  const previewUrl = (vids.tiny && vids.tiny.url) || (vids.small && vids.small.url) || '';
-  const downloadUrl = (vids.large && vids.large.url) || (vids.medium && vids.medium.url) || (vids.small && vids.small.url) || previewUrl;
-  const w = (vids.medium && vids.medium.width) || (vids.small && vids.small.width) || 0;
-  const h = (vids.medium && vids.medium.height) || (vids.small && vids.small.height) || 0;
-  const thumbnailUrl =
-    (vids.large && vids.large.thumbnail) ||
-    (vids.medium && vids.medium.thumbnail) ||
-    (vids.small && vids.small.thumbnail) ||
-    (vids.tiny && vids.tiny.thumbnail) ||
-    '';
-  return {
-    id:             hit.id,
-    type:           'video',
-    previewUrl,
-    thumbnailUrl,
-    downloadUrl,
-    duration:       typeof hit.duration === 'number' ? hit.duration : null,
-    width:          Number(w) || 0,
-    height:         Number(h) || 0,
-    tags:           hit.tags || '',
-    contributor:    hit.user || '',
-    pageURL:        hit.pageURL || '',
-  };
-}
+const SEARCH_QUERY_BANNED_RE =
+  /\b(worried|concerned|stressed|framing|shot|scene|candid|authentic|warm|cozy|natural|domestic|slightly|gently|carefully)\b/i;
+const SEARCH_QUERY_BANNED_WORDS = new Set([
+  'worried', 'concerned', 'stressed', 'framing', 'shot', 'scene', 'candid', 'authentic',
+  'warm', 'cozy', 'natural', 'domestic', 'slightly', 'gently', 'carefully',
+]);
 
-function normalizePixabayImage(hit) {
-  const previewUrl = hit.previewURL || hit.webformatURL || '';
-  return {
-    id:             hit.id,
-    type:           'image',
-    previewUrl,
-    thumbnailUrl:   previewUrl,
-    downloadUrl:    hit.largeImageURL || hit.imageURL || hit.webformatURL || '',
-    duration:       null,
-    width:          hit.imageWidth || 0,
-    height:         hit.imageHeight || 0,
-    tags:           hit.tags || '',
-    contributor:    hit.user || '',
-    pageURL:        hit.pageURL || '',
-  };
-}
-
-app.get('/api/pixabay/search', requireAuth, async (req, res) => {
-  const key = process.env.PIXABAY_API_KEY;
-  if (!key) return res.status(503).json({ results: [], error: 'PIXABAY_API_KEY not configured' });
-  const qRaw = String(req.query.q || '').trim();
-  if (!qRaw) return res.status(400).json({ results: [], error: 'q is required' });
-  const qUser = qRaw.length > 100 ? qRaw.slice(0, 100) : qRaw;
-  const assetType = String(req.query.asset_type || 'video').toLowerCase();
-  let perPage = parseInt(String(req.query.per_page || '9'), 10);
-  if (!Number.isFinite(perPage) || perPage < 1) perPage = 9;
-  perPage = Math.min(20, Math.max(1, perPage));
-  const orientation = String(req.query.orientation || 'all').toLowerCase();
-
-  // ── Parse optional re-ranking + exclusion params ──────────────────────
-  function parseJsonArrayParam(raw) {
-    if (!raw) return [];
-    try {
-      const v = JSON.parse(String(raw));
-      return Array.isArray(v) ? v.filter(x => typeof x === 'string') : [];
-    } catch (_) {
-      return [];
-    }
-  }
-  const concreteSubjects = parseJsonArrayParam(req.query.concrete_subjects);
-  const avoidSubjects    = parseJsonArrayParam(req.query.avoid_subjects);
-  const exclusionTerms   = parseJsonArrayParam(req.query.exclusion_terms);
-
-  const concreteTokens = tokenizeList(concreteSubjects);
-  const avoidTokens    = tokenizeList(avoidSubjects);
-  const willRerank     = concreteTokens.size > 0 || avoidTokens.size > 0;
-
-  // Lever B rollback: we do not append `-term` exclusions to the Pixabay query.
-  // Pixabay's tag matching is too brittle — any exclusion on a descriptive query
-  // risks eliminating the entire result set. Re-ranking (Lever A) handles genre
-  // filtering better by demoting rather than dropping. exclusionTerms is parsed
-  // above for backward compatibility but intentionally not applied to q.
-  const q = qUser;
-
-  // ── Cache: key includes every signal that can change results or order ─
-  const cacheKey = JSON.stringify({
-    q,
-    assetType,
-    perPage,
-    orientation,
-    concreteSubjects,
-    avoidSubjects,
+function fallbackSearchQueryFromCandidate(candidate) {
+  const desc = String(
+    (candidate && candidate.ideal_visual_description) ||
+    (candidate && candidate.retrieval_query_primary) ||
+    ''
+  ).trim();
+  const words = desc.split(/\s+/).filter(Boolean);
+  const first6 = words.slice(0, 6);
+  const filtered = first6.filter(w => {
+    const alpha = w.replace(/[^a-zA-Z]/g, '');
+    if (!alpha) return false;
+    return !SEARCH_QUERY_BANNED_WORDS.has(alpha.toLowerCase());
   });
-  const cached = pixabayLRU.get(cacheKey);
-  if (cached !== undefined) return res.json(cached);
+  let out = filtered.join(' ').trim();
+  if (!out) out = 'Person Working at Desk';
+  if (out.length > 80) out = out.slice(0, 80);
+  return out;
+}
 
-  const results = [];
-  const pushNorm = (arr, normFn) => {
-    for (const h of arr || []) {
-      try {
-        results.push(normFn(h));
-      } catch (_) { /* skip */ }
-    }
+function isSearchQueryValid(sq) {
+  if (sq == null) return false;
+  const t = String(sq).trim();
+  if (!t || t.length > 80) return false;
+  if (SEARCH_QUERY_BANNED_RE.test(t)) return false;
+  return true;
+}
+
+/**
+ * @param {object|null} brief
+ * @param {object} candidate
+ * @returns {object|null}
+ */
+function applySearchQueryToBrief(brief, candidate) {
+  if (!brief || typeof brief !== 'object') return brief;
+  const raw = brief.searchQuery;
+  if (isSearchQueryValid(raw)) {
+    brief.searchQuery = String(raw).trim();
+  } else {
+    log(
+      '[visual-brief] searchQuery missing/invalid; fallback from description — ' +
+      `candidate=${brief.candidate_id || '?'}`
+    );
+    brief.searchQuery = fallbackSearchQueryFromCandidate(candidate);
+  }
+  return brief;
+}
+
+function selectBestPexelsVideoFile(videoFiles) {
+  if (!Array.isArray(videoFiles) || !videoFiles.length) return null;
+  const withDims = videoFiles.filter(f => f && Number(f.width) > 0 && Number(f.height) > 0);
+  const pool = withDims.length ? withDims : videoFiles;
+  const portrait = pool.filter(f => Number(f.height) > Number(f.width));
+  const use = portrait.length ? portrait : pool;
+  return use.sort(
+    (a, b) => Number(b.width) * Number(b.height) - Number(a.width) * Number(a.height)
+  )[0];
+}
+
+function forwardPexelsRateHeadersFromFetch(resp, res) {
+  if (!resp || !resp.headers || !res) return;
+  const rem = resp.headers.get('x-ratelimit-remaining');
+  const reset = resp.headers.get('x-ratelimit-reset');
+  if (rem) res.setHeader('X-Ratelimit-Remaining', rem);
+  if (reset) res.setHeader('X-Ratelimit-Reset', reset);
+}
+
+function normalizePexelsPhoto(hit) {
+  const src = hit.src || {};
+  const altRaw = hit.alt;
+  const alt = altRaw != null && String(altRaw).trim() ? String(altRaw).trim() : null;
+  return {
+    id: String(hit.id),
+    type: 'photo',
+    width: Number(hit.width) || 0,
+    height: Number(hit.height) || 0,
+    duration: null,
+    thumbnail: src.medium || src.small || src.tiny || '',
+    url: src.original || src.large2x || src.large || '',
+    pexelsUrl: String(hit.url || ''),
+    photographer: String(hit.photographer || ''),
+    photographerUrl: String(hit.photographer_url || ''),
+    alt,
+  };
+}
+
+function normalizePexelsVideo(hit) {
+  const user = hit.user || {};
+  const best = selectBestPexelsVideoFile(hit.video_files);
+  const link = best && best.link ? String(best.link) : '';
+  return {
+    id: String(hit.id),
+    type: 'video',
+    width: Number(hit.width) || 0,
+    height: Number(hit.height) || 0,
+    duration: typeof hit.duration === 'number' ? hit.duration : (hit.duration != null ? Number(hit.duration) : null),
+    thumbnail: String(hit.image || ''),
+    url: link,
+    pexelsUrl: String(hit.url || ''),
+    photographer: String(user.name || ''),
+    photographerUrl: String(user.url || ''),
+    alt: null,
+  };
+}
+
+function interleavePexelsResults(videos, photos) {
+  const out = [];
+  const n = Math.max(videos.length, photos.length);
+  for (let i = 0; i < n; i++) {
+    if (i < videos.length) out.push(videos[i]);
+    if (i < photos.length) out.push(photos[i]);
+  }
+  return out;
+}
+
+function pexelsPhotoSearchUrl(q, perPage) {
+  const u = new URL('https://api.pexels.com/v1/search');
+  u.searchParams.set('query', q);
+  u.searchParams.set('per_page', String(perPage));
+  u.searchParams.set('orientation', 'portrait');
+  u.searchParams.set('locale', 'en-US');
+  return u.toString();
+}
+
+function pexelsVideoSearchUrl(q, perPage) {
+  const u = new URL('https://api.pexels.com/videos/search');
+  u.searchParams.set('query', q);
+  u.searchParams.set('per_page', String(perPage));
+  u.searchParams.set('orientation', 'portrait');
+  u.searchParams.set('locale', 'en-US');
+  return u.toString();
+}
+
+app.get('/api/pexels/search', requireAuth, async (req, res) => {
+  const key = process.env.PEXELS_API_KEY;
+  if (!key || !String(key).trim()) {
+    return res.status(503).json({ results: [], error: 'PEXELS_API_KEY not configured' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) {
+    return res.status(400).json({ error: 'q is required' });
+  }
+  let assetType = String(req.query.asset_type || 'all').toLowerCase();
+  if (assetType !== 'photos' && assetType !== 'videos' && assetType !== 'all') {
+    assetType = 'all';
+  }
+  let perPage = parseInt(String(req.query.per_page || '15'), 10);
+  if (!Number.isFinite(perPage) || perPage < 1) perPage = 15;
+  perPage = Math.min(80, Math.max(1, perPage));
+
+  const cacheKey = `${assetType}:${q}`;
+  const cachedVal = pexelsLRU.get(cacheKey);
+  if (cachedVal !== undefined) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.json({ ...cachedVal, cache: 'HIT' });
+  }
+
+  const authKey = String(key).trim();
+  const authHeaders = { Authorization: authKey };
+
+  const readPexelsError = (resp, text) => {
+    log(`[pexels-search] upstream status=${resp.status} body=${(text || '').slice(0, 800)}`);
   };
 
   try {
-    if (assetType === 'image') {
-      const params = {
-        key,
-        q,
-        per_page: perPage,
-        image_type: 'photo',
-        safesearch: 'true',
+    if (assetType === 'photos') {
+      const url = pexelsPhotoSearchUrl(q, perPage);
+      const resp = await fetch(url, { headers: authHeaders, signal: AbortSignal.timeout(25000) });
+      const text = await resp.text();
+      if (!resp.ok) {
+        readPexelsError(resp, text);
+        return res.status(502).json({ error: 'Pexels stock search failed' });
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        return res.status(502).json({ error: 'Pexels stock search failed' });
+      }
+      forwardPexelsRateHeadersFromFetch(resp, res);
+      res.setHeader('X-Cache', 'MISS');
+      const results = (data.photos || []).map(normalizePexelsPhoto);
+      const body = {
+        results,
+        total_results: data.total_results != null ? Number(data.total_results) : results.length,
+        warnings: [],
+        source: 'pexels',
       };
-      if (orientation === 'portrait') params.orientation = 'vertical';
-      const r = await axios.get('https://pixabay.com/api/', { params, timeout: 20000 });
-      pushNorm(r.data && r.data.hits, normalizePixabayImage);
-    } else if (assetType === 'video') {
-      const r = await axios.get('https://pixabay.com/api/videos/', {
-        params: { key, q, per_page: perPage, video_type: 'all', safesearch: 'true' },
-        timeout: 20000,
-      });
-      pushNorm(r.data && r.data.hits, normalizePixabayVideo);
+      pexelsLRU.set(cacheKey, body);
+      return res.json({ ...body, cache: 'MISS' });
+    }
+    if (assetType === 'videos') {
+      const url = pexelsVideoSearchUrl(q, perPage);
+      const resp = await fetch(url, { headers: authHeaders, signal: AbortSignal.timeout(25000) });
+      const text = await resp.text();
+      if (!resp.ok) {
+        readPexelsError(resp, text);
+        return res.status(502).json({ error: 'Pexels stock search failed' });
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        return res.status(502).json({ error: 'Pexels stock search failed' });
+      }
+      forwardPexelsRateHeadersFromFetch(resp, res);
+      res.setHeader('X-Cache', 'MISS');
+      const results = (data.videos || []).map(normalizePexelsVideo).filter(x => x.url);
+      const body = {
+        results,
+        total_results: data.total_results != null ? Number(data.total_results) : results.length,
+        warnings: [],
+        source: 'pexels',
+      };
+      pexelsLRU.set(cacheKey, body);
+      return res.json({ ...body, cache: 'MISS' });
+    }
+
+    // asset_type === 'all'
+    const urlV = pexelsVideoSearchUrl(q, perPage);
+    const urlP = pexelsPhotoSearchUrl(q, perPage);
+    const [vOutcome, pOutcome] = await Promise.all([
+      (async () => {
+        try {
+          const r = await fetch(urlV, { headers: authHeaders, signal: AbortSignal.timeout(25000) });
+          const t = await r.text();
+          return { r, t };
+        } catch (e) {
+          return { err: e };
+        }
+      })(),
+      (async () => {
+        try {
+          const r = await fetch(urlP, { headers: authHeaders, signal: AbortSignal.timeout(25000) });
+          const t = await r.text();
+          return { r, t };
+        } catch (e) {
+          return { err: e };
+        }
+      })(),
+    ]);
+
+    const warnings = [];
+    let vData = { videos: [], total_results: 0 };
+    let pData = { photos: [], total_results: 0 };
+    let rateFrom = null;
+
+    if (vOutcome.err) {
+      log(`[pexels-search] videos parallel error: ${vOutcome.err.message || vOutcome.err}`);
+      warnings.push('videos: request failed');
     } else {
-      const half = Math.min(perPage, Math.ceil(perPage / 2));
-      const [rv, ri] = await Promise.all([
-        axios.get('https://pixabay.com/api/videos/', {
-          params: { key, q, per_page: half, video_type: 'all', safesearch: 'true' },
-          timeout: 20000,
-        }).catch(() => ({ data: { hits: [] } })),
-        axios.get('https://pixabay.com/api/', {
-          params: {
-            key, q, per_page: half, image_type: 'photo', safesearch: 'true',
-            ...(orientation === 'portrait' ? { orientation: 'vertical' } : {}),
-          },
-          timeout: 20000,
-        }).catch(() => ({ data: { hits: [] } })),
-      ]);
-      pushNorm(rv.data && rv.data.hits, normalizePixabayVideo);
-      pushNorm(ri.data && ri.data.hits, normalizePixabayImage);
-    }
-
-    // ── Watermark filter (unchanged from previous behavior) ─────────────
-    let filtered = results.filter(r => {
-      const t = String(r.tags || '').toLowerCase();
-      return !t.includes('watermark');
-    });
-
-    // ── Re-rank if we have any scoring signal ───────────────────────────
-    if (willRerank && filtered.length > 1) {
-      const scored = filtered.map(asset => ({
-        asset,
-        score: scoreAssetAgainstSubjects(asset, concreteTokens, avoidTokens),
-      }));
-      // Stable sort: higher score first; preserve Pixabay's original order
-      // within equal-scoring groups by using a parallel index.
-      scored.forEach((s, i) => { s._origIndex = i; });
-      scored.sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return a._origIndex - b._origIndex;
-      });
-      filtered = scored.map(s => s.asset);
-    }
-
-    const payload = {
-      results:  filtered.slice(0, perPage),
-      query:    q,
-      total:    filtered.length,
-      reranked: willRerank && filtered.length > 1,
-    };
-    pixabayLRU.set(cacheKey, payload);
-
-    log(
-      `[pixabay-search] q="${q}" type=${assetType} returned=${filtered.length} reranked=${payload.reranked}` +
-      (willRerank ? ` concrete=${concreteTokens.size} avoid=${avoidTokens.size}` : '')
-    );
-
-    res.json(payload);
-  } catch (err) {
-    const status = err.response && err.response.status;
-    let msg = err.message || 'Pixabay request failed';
-    if (status === 429) {
-      msg = 'Pixabay rate limit exceeded. Wait a moment and try again.';
-    } else if (err.response && err.response.data) {
-      const d = err.response.data;
-      if (typeof d === 'string' && d.trim()) msg = d.trim();
-      else if (d && typeof d === 'object' && d.error) msg = String(d.error);
-    }
-    const http = status === 429 ? 429 : 502;
-    res.status(http).json({ results: [], error: msg });
-  }
-});
-
-app.post('/api/pixabay/ingest', requireAuth, async (req, res) => {
-  const userId = req.user.id;
-  const { assetId, assetType, downloadUrl, projectId, duration } = req.body || {};
-  if (!downloadUrl || !projectId || !assetId) {
-    return res.status(400).json({ error: 'assetId, downloadUrl, and projectId are required' });
-  }
-  const { data: chk } = await supabaseAdmin.from('projects').select('user_id').eq('id', projectId).single();
-  if (!chk || chk.user_id !== userId) return res.status(403).json({ error: 'Invalid project' });
-
-  const ext = String(assetType).toLowerCase() === 'image' ? '.jpg' : '.mp4';
-  const tmpBase = path.join(os.tmpdir(), `pixabay_${assetId}_${Date.now()}`);
-  const tmpDl = tmpBase + ext;
-
-  try {
-    const resp = await axios.get(String(downloadUrl), { responseType: 'arraybuffer', timeout: 120000, maxContentLength: MAX_UPLOAD_BYTES });
-    fs.writeFileSync(tmpDl, Buffer.from(resp.data));
-
-    let uploadPath = tmpDl;
-    let outDuration = typeof duration === 'number' && duration > 0 ? duration : null;
-
-    if (String(assetType).toLowerCase() === 'image') {
-      const conv = await convertImageToVideo(tmpDl, outDuration || 5);
-      uploadPath = conv.outputPath;
-      outDuration = conv.duration;
-      try { fs.unlinkSync(tmpDl); } catch (_) { /* ignore */ }
-    } else {
-      if (!outDuration) {
-        outDuration = await getVideoDuration(uploadPath);
+      rateFrom = vOutcome.r;
+      if (!vOutcome.r.ok) {
+        readPexelsError(vOutcome.r, vOutcome.t);
+        warnings.push('videos: upstream request failed');
+      } else {
+        try {
+          vData = JSON.parse(vOutcome.t);
+        } catch (_) {
+          warnings.push('videos: invalid response');
+        }
       }
     }
 
-    const filename = `pixabay_${assetId}.mp4`;
-    const storagePath = `${userId}/${projectId}/${filename}`;
-    const buf = fs.readFileSync(uploadPath);
-    const up = await uploadBufferToSupabase('image-layer', storagePath, buf, 'video/mp4');
+    if (pOutcome.err) {
+      log(`[pexels-search] photos parallel error: ${pOutcome.err.message || pOutcome.err}`);
+      warnings.push('photos: request failed');
+    } else {
+      if (!rateFrom) rateFrom = pOutcome.r;
+      if (!pOutcome.r.ok) {
+        readPexelsError(pOutcome.r, pOutcome.t);
+        warnings.push('photos: upstream request failed');
+      } else {
+        try {
+          pData = JSON.parse(pOutcome.t);
+        } catch (_) {
+          warnings.push('photos: invalid response');
+        }
+      }
+    }
 
-    try { fs.unlinkSync(uploadPath); } catch (_) { /* ignore */ }
+    if (rateFrom) forwardPexelsRateHeadersFromFetch(rateFrom, res);
+    res.setHeader('X-Cache', 'MISS');
 
-    res.json({
+    const vNorm = (vData.videos || []).map(normalizePexelsVideo).filter(x => x.url);
+    const pNorm = (pData.photos || []).map(normalizePexelsPhoto);
+    const interleaved = interleavePexelsResults(vNorm, pNorm).slice(0, perPage);
+    const total_results =
+      (vData.total_results != null ? Number(vData.total_results) : 0) +
+      (pData.total_results != null ? Number(pData.total_results) : 0);
+
+    const body = {
+      results: interleaved,
+      total_results: Number.isFinite(total_results) ? total_results : interleaved.length,
+      warnings: warnings.length ? warnings : [],
+      source: 'pexels',
+    };
+    pexelsLRU.set(cacheKey, body);
+    return res.json({ ...body, cache: 'MISS' });
+  } catch (err) {
+    log(`[pexels-search] ${err.message || err}`);
+    return res.status(502).json({ error: 'Pexels stock search failed' });
+  }
+});
+
+app.post('/api/pexels/ingest', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const { asset, projectId } = req.body || {};
+  if (!asset || typeof asset !== 'object' || !projectId) {
+    return res.status(400).json({ error: 'asset and projectId are required' });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: 'Storage is not configured' });
+  const { data: chk } = await supabaseAdmin.from('projects').select('user_id').eq('id', projectId).single();
+  if (!chk || chk.user_id !== userId) return res.status(403).json({ error: 'Invalid project' });
+
+  const type = String(asset.type || '').toLowerCase();
+  const isPhoto = type === 'photo';
+  const mediaUrl = String(asset.url || '').trim();
+  if (!mediaUrl) return res.status(400).json({ error: 'asset.url is required' });
+
+  const uid = randomUUID();
+  const ext = isPhoto ? '.jpg' : '.mp4';
+  const tmpDl = path.join(os.tmpdir(), `pexels_dl_${uid}${ext}`);
+  let uploadPath = tmpDl;
+  let tmpConvertPath = null;
+
+  try {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 30000);
+    let resp;
+    try {
+      resp = await fetch(mediaUrl, { signal: ac.signal });
+    } finally {
+      clearTimeout(to);
+    }
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      log(`[pexels-ingest] download failed status=${resp.status} body=${t.slice(0, 400)}`);
+      return res.status(502).json({ error: 'Failed to download asset from Pexels' });
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf || !buf.length) {
+      return res.status(502).json({ error: 'Downloaded file was empty' });
+    }
+    fs.writeFileSync(tmpDl, buf);
+
+    let outW = Number(asset.width) || 0;
+    let outH = Number(asset.height) || 0;
+    let outDuration = typeof asset.duration === 'number' && asset.duration > 0 ? asset.duration : null;
+
+    if (isPhoto) {
+      const conv = await convertImageToVideo(tmpDl, 5);
+      tmpConvertPath = conv.outputPath;
+      uploadPath = conv.outputPath;
+      outDuration = conv.duration;
+      outW = conv.width > 0 ? conv.width : outW;
+      outH = conv.height > 0 ? conv.height : outH;
+      try { if (fs.existsSync(tmpDl)) fs.unlinkSync(tmpDl); } catch (_) { /* ignore */ }
+    } else if (outDuration == null || outDuration <= 0) {
+      outDuration = await getVideoDuration(uploadPath);
+    }
+
+    const fileBase = `pexels_${String(asset.id || uid).replace(/[^\w-]/g, '_')}_${uid.slice(0, 8)}.mp4`;
+    const storagePath = `${userId}/${projectId}/${fileBase}`;
+    const upBuf = fs.readFileSync(uploadPath);
+    const up = await uploadBufferToSupabase('image-layer', storagePath, upBuf, 'video/mp4');
+
+    const thumb = String(asset.thumbnail || '');
+    const pexU = String(asset.pexelsUrl || 'https://www.pexels.com/');
+    const pName = String(asset.photographer || '');
+    const pUrl = String(asset.photographerUrl || pexU);
+    const isVid = !isPhoto;
+    const attribution = isVid
+      ? {
+        photographer: pName,
+        photographerUrl: pUrl,
+        pexelsUrl: pexU,
+        text: 'Video provided by Pexels',
+      }
+      : {
+        photographer: pName,
+        photographerUrl: pUrl,
+        pexelsUrl: pexU,
+        text: 'Photo provided by Pexels',
+      };
+
+    return res.json({
       permanentUrl: up.permanentUrl,
-      storageRef:   { bucket: 'image-layer', path: storagePath },
-      duration:     outDuration || 5,
-      filename,
+      storageRef: { bucket: 'image-layer', path: storagePath },
+      width: outW,
+      height: outH,
+      duration: outDuration != null && outDuration > 0 ? outDuration : 5,
+      thumbnail: thumb,
+      filename: fileBase,
+      attribution,
     });
   } catch (err) {
+    const msg = err && err.name === 'AbortError' ? 'Download timed out' : (err.message || 'Ingest failed');
+    if (err && err.name === 'AbortError') {
+      return res.status(502).json({ error: 'Failed to download asset from Pexels' });
+    }
+    log(`[pexels-ingest] ${msg}`);
+    return res.status(502).json({ error: 'Failed to download or process asset' });
+  } finally {
     try { if (fs.existsSync(tmpDl)) fs.unlinkSync(tmpDl); } catch (_) { /* ignore */ }
-    res.status(500).json({ error: err.message || 'Ingest failed' });
+    if (tmpConvertPath) {
+      try { if (fs.existsSync(tmpConvertPath) && tmpConvertPath !== tmpDl) fs.unlinkSync(tmpConvertPath); } catch (_) { /* ignore */ }
+    }
   }
 });
 
@@ -1615,6 +1623,7 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
       candidate,
       transcriptCtx: ctx,
       stylePolicy:   stylePolicy || {},
+      stockProvider: 'pexels',
     };
     const briefKey = visualBriefLlmCache.keyForPayload(briefPayload);
     const cachedBrief = visualBriefLlmCache.get(briefKey);
@@ -1626,6 +1635,9 @@ app.post('/api/visual/brief', requireAuth, async (req, res) => {
       brief = await generateRetrievalBrief(candidate, ctx, stylePolicy || {}, req.user.id);
       visualBriefLlmCache.set(briefKey, { brief });
       log(`LLM response cache MISS (${visualBriefLlmCache.name}) key=${briefKey.slice(0, 12)}…`);
+    }
+    if (brief) {
+      applySearchQueryToBrief(brief, candidate);
     }
     res.json({
       brief,
@@ -1644,6 +1656,7 @@ app.post('/api/visual/claude-pick', requireAuth, async (req, res) => {
       userId:   req.user.id,
       candidate: candidate || {},
       assets:    Array.isArray(assets) ? assets : [],
+      stockProvider: 'pexels',
     };
     const pickKey = visualPickLlmCache.keyForPayload(pickPayload);
     const cachedPick = visualPickLlmCache.get(pickKey);
@@ -1732,7 +1745,7 @@ app.post('/api/visual/generate-image', requireAuth, async (req, res) => {
  * Accepts a base64-encoded PNG previously returned by
  * /api/visual/generate-image, converts it to a 5s MP4, and uploads to
  * the image-layer bucket. Returns permanentUrl + storageRef in the same
- * shape as /api/pixabay/ingest so the client-side CREATE dispatch is
+ * shape as /api/pexels/ingest so the client-side CREATE dispatch is
  * symmetric with stock.
  */
 app.post('/api/visual/accept-generated', requireAuth, async (req, res) => {
@@ -1746,7 +1759,7 @@ app.post('/api/visual/accept-generated', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'projectId is required' });
   }
 
-  // Ownership check — same pattern as /api/pixabay/ingest.
+  // Ownership check — same pattern as /api/pexels/ingest.
   const { data: chk } = await supabaseAdmin
     .from('projects')
     .select('user_id')
@@ -2175,8 +2188,8 @@ app.get('/api/audio/search/jamendo', requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Searches Freesound and Pixabay in parallel, interleaves results.
- * Query params: q (required), sources (comma-separated, default "freesound,pixabay")
+ * Searches Freesound and Jamendo in parallel, interleaves results.
+ * Query params: q (required), sources (comma-separated, default "freesound,jamendo")
  * Response: { results, query, warning? }
  */
 app.get('/api/audio/search', requireAuth, async (req, res) => {

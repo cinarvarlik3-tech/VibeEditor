@@ -7,7 +7,7 @@
 const VISUAL_COMPONENT_RULES = `
 VISUAL COMPONENT ADDITION RULES
 
-When a visual component task is requested, you operate in visual analysis mode. Your job is to detect candidate moments in the transcript and classify each one. You do not insert assets directly. You do not choose specific Pixabay files. You return structured JSON output that the deterministic pipeline processes.
+When a visual component task is requested, you operate in visual analysis mode. Your job is to detect candidate moments in the transcript and classify each one. You do not insert assets directly. You do not choose specific Pexels files. You return structured JSON output that the deterministic pipeline processes.
 
 Your Four Jobs in Visual Mode
 1. Detect candidate moments in the transcript where a visual would materially improve the video.
@@ -93,13 +93,13 @@ You will receive one candidate from Pass 1. Return a single JSON object — eith
 
 Pass 2 — Packaging, not interpretation
 
-Pass 1 has already interpreted the moment. Your job in Pass 2 is to package that interpretation into Pixabay-friendly search terms and retrieval filters. Do not re-interpret the transcript. Do not invent new subject matter. Do not paraphrase ideal_visual_description into something vaguer.
+Pass 1 has already interpreted the moment. Your job in Pass 2 is to package that interpretation into Pexels-friendly search terms and retrieval filters. Do not re-interpret the transcript. Do not invent new subject matter. Do not paraphrase ideal_visual_description into something vaguer.
 
 Source of truth, in priority order:
 1. candidate.ideal_visual_description — the literal description of what should be on screen.
-2. candidate.concrete_subjects — your primary source of query terms. Pick the one or two that will have the best Pixabay coverage.
+2. candidate.concrete_subjects — your primary source of query terms. Pick the one or two that will have the best Pexels coverage.
 3. candidate.mood and candidate.setting_hint — modifiers on the query and on environment_preference.
-4. candidate.avoid_subjects — copy into exclusion_terms as-is, then add any Pixabay-specific additions (e.g. "cartoon", "illustration", "3d render") if the moment demands photographic realism.
+4. candidate.avoid_subjects — copy into exclusion_terms as-is, then add any stock-specific additions (e.g. "cartoon", "illustration", "3d render") if the moment demands photographic realism.
 5. TRANSCRIPT_CONTEXT — use only to resolve ambiguity (e.g. if concrete_subjects is "student" but context reveals it is a university lecture, prefer "university student"). Never use as a primary source.
 
 Query construction rules:
@@ -113,6 +113,77 @@ Confidence calibration:
 - 0.55–0.64: subjects are generic or the ideal description leans abstract. Consider whether native_only would serve better.
 - <0.55: do not emit. Return a brief with confidence_score below 0.55 and the server will reject it; the UI will surface "confidence too low" and the user will fall back to native.
 
+SEARCH QUERY GENERATION — CRITICAL:
+You must also generate a searchQuery field for each candidate. This query will be sent
+directly to the Pexels stock API. Pexels indexes content by the titles photographers give
+their photos and videos. These titles follow a strict, consistent grammar. Your searchQuery
+MUST match this grammar exactly or results will be poor.
+
+PEXELS TITLE GRAMMAR:
+  [Relationship noun] [present-participle verb] [object or second person] [optional: "at/on/in" + concrete location noun]
+
+RULES — follow every one without exception:
+
+1. RELATIONSHIP NOUNS ONLY — never generic roles
+   Use: Mother, Father, Son, Daughter, Brother, Sister, Grandmother, Grandfather,
+        Woman, Man, Girl, Boy, Person, People, Family, Couple, Teacher, Student
+   Never use: parent, child, adult, individual, someone, figure, subject
+
+2. ONE PRIMARY ACTION — present participle, one verb only
+   Good: "Reviewing", "Writing", "Reading", "Sitting", "Looking at", "Helping",
+         "Teaching", "Drawing", "Studying", "Working on"
+   Never include two actions joined with "and" on the subject side
+
+3. CONCRETE LOCATION NOUNS ONLY — if you include a setting at all
+   Good: "at the Kitchen Table", "at a Desk", "on the Couch", "in the Living Room"
+   Never use: "in a domestic setting", "in a home environment", "in a warm space"
+
+4. STRIP ALL OF THE FOLLOWING completely — they score zero in Pexels' index:
+   - Emotion and mood words: worried, concerned, stressed, joyful, tense, loving
+   - Cinematographic language: medium framing, close-up, shot, scene, framing, angle
+   - Atmosphere words: warm, cozy, authentic, real, natural, candid
+   - Adverbs: slightly, carefully, gently, intently
+   - Possessives in descriptions: "child's materials", "her belongings" → drop the prop, keep the action
+
+5. LENGTH: 5–9 words. No more, no less.
+
+6. TITLE CASE: Capitalize every meaningful word.
+
+7. GENDER: If the brief specifies or implies a gender, use the gendered noun.
+   If gender is unspecified, prefer "Mother" over "Parent", "Father" over "Parent".
+   If truly ambiguous, use "Person" or "Woman"/"Man" based on the most statistically
+   likely photographer framing for that scenario.
+
+8. SINGLE SUBJECT RULE: If the scene has two people, the title should still lead with
+   one primary subject and treat the second as the object.
+   Good: "Mother Helping Son with Homework at Table"
+   Bad: "Mother and Son Both Doing Homework Together"
+
+VALIDATION — before emitting searchQuery, check:
+  ✓ Does it contain any word from the banned list? → rewrite
+  ✓ Is it between 5 and 9 words? → trim or expand
+  ✓ Does it start with a relationship/role noun? → if not, rewrite
+  ✓ Is there exactly one present-participle verb? → if not, rewrite
+  ✓ Is every word something a photographer would type when uploading a stock photo? → if not, remove it
+
+EXAMPLES (brief → searchQuery):
+  "A worried parent sits at a kitchen table reviewing a child's schoolwork and report card,
+   with notebooks, a pencil case, and a phone nearby. The shot should feel like a real home
+   study scene, medium framing, with the parent looking concerned."
+  → "Mother Reviewing Daughter's Homework at Kitchen Table"
+
+  "An elderly person sits alone by a window, light coming in from the side, looking
+   contemplative and slightly melancholy. Soft focus background."
+  → "Elderly Woman Sitting Alone by Window"
+
+  "Two friends laugh together on a city street, one pointing at something off camera,
+   both in casual clothes. Candid, energetic feel."
+  → "Two Friends Laughing Together on Street"
+
+  "A person types urgently at a laptop in what looks like a home office late at night,
+   with papers around them and a coffee cup nearby. Stressed atmosphere."
+  → "Man Working on Laptop at Home Office"
+
 For external_stock, return:
 {
   "candidate_id": "<same id from Pass 1>",
@@ -123,6 +194,7 @@ For external_stock, return:
   "external_visual_type": "broll_office"|"broll_city"|"broll_phone"|"broll_lifestyle"|"broll_product_generic"|"broll_people_working"|"still_photo_generic"|"environment_cutaway"|"conceptual_texture",
   "retrieval_query_primary": "<plain noun phrase>",
   "retrieval_query_alternates": ["<alt 1>","<alt 2>","<alt 3>"],
+  "searchQuery": "<5–9 words, Title Case, Pexels title grammar; sent verbatim to the Pexels search API>",
   "required_orientation": "portrait"|"flexible",
   "required_asset_kind": "video"|"image",
   "human_presence": "prefer"|"avoid"|"neutral",
@@ -151,6 +223,7 @@ Example Pass 2 output (for the Turkish moment above):
     "teacher writing fast on whiteboard",
     "confused student at desk tutoring center"
   ],
+  "searchQuery": "Student Studying at Desk in Classroom",
   "required_orientation": "portrait",
   "required_asset_kind": "video",
   "human_presence": "prefer",
@@ -179,7 +252,7 @@ Hard Rejection Rules
 Always reject if: VRS < 0.35 and no native fallback, style fit < 0.30, saturation penalty > 0.80 (unless KPS > 0.85 and style permits aggressive pacing), retrieval confidence < 0.55, or moment overlaps heavily with a stronger nearby candidate.
 
 Visual Mode Error Prevention
-Never fabricate Pixabay asset IDs or URLs. The retrieval brief is a query specification only.
+Never fabricate Pexels asset IDs or URLs. The retrieval brief is a query specification only.
 Never insert imageClip elements directly into CURRENT_TRACKS. Visual candidates are suggestions for the pipeline.
 Never suggest an asset for a timespan already occupied by another suggested asset.
 Return an empty array for Pass 1 if no candidates pass all five gates. Never force suggestions.

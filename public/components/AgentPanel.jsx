@@ -222,6 +222,7 @@
         aiAccepting: {},
         aiAccepted: {},
         aiError: {},
+        stockAttribution: {},
       };
     });
 
@@ -265,7 +266,7 @@
           setLocal(function(prev) {
             var n = Object.assign({}, prev);
             n.loading = Object.assign({}, n.loading, { [k]: false });
-            n.warn = Object.assign({}, n.warn, { [k]: 'Confidence too low for Pixabay retrieval. Use native component instead.' });
+            n.warn = Object.assign({}, n.warn, { [k]: 'Confidence too low for stock retrieval. Use native component instead.' });
             return n;
           });
           return;
@@ -301,21 +302,34 @@
         var hdr = { 'Content-Type': 'application/json' };
         var tok = window.Auth && typeof window.Auth.getToken === 'function' && window.Auth.getToken();
         if (tok) hdr.Authorization = 'Bearer ' + tok;
-        var r = await fetch('/api/pixabay/ingest', {
+        var payloadAsset = {
+          id: asset.id,
+          type: asset.type,
+          width: asset.width,
+          height: asset.height,
+          duration: asset.duration,
+          thumbnail: asset.thumbnail,
+          url: asset.url || asset.downloadUrl,
+          pexelsUrl: asset.pexelsUrl || asset.pageURL,
+          photographer: asset.photographer || asset.contributor,
+          photographerUrl: asset.photographerUrl,
+          alt: asset.alt != null ? asset.alt : null,
+        };
+        var r = await fetch('/api/pexels/ingest', {
           method:  'POST',
           headers: hdr,
           body: JSON.stringify({
-            assetId: asset.id,
-            assetType: asset.type,
-            downloadUrl: asset.downloadUrl,
+            asset: payloadAsset,
             projectId: projectId,
-            duration: asset.duration,
           }),
         });
         var data = await r.json().catch(function() { return {}; });
         if (!r.ok) throw new Error(data.error || 'Ingest failed');
         var st = cand.start_time != null ? cand.start_time : cand.startTime;
         var et = cand.end_time != null ? cand.end_time : cand.endTime;
+        var pid = null;
+        var idn = Number(asset.id);
+        if (idn === idn) pid = idn;
         onCreateImageClip({
           src: data.permanentUrl,
           storageRef: data.storageRef,
@@ -325,16 +339,19 @@
           sourceName: (function() {
             var parts = [asset.contributor, asset.tags].filter(Boolean);
             var s = parts.join(' · ');
-            return (s && s.slice(0, 120)) || 'Pixabay';
+            return (s && s.slice(0, 120)) || 'Pexels';
           })(),
-          sourceType: 'pixabay',
-          pixabayId: asset.id,
+          sourceType: 'pexels',
+          pixabayId: pid,
         });
         var vk = vkey(cand);
         setLocal(function(prev) {
           var n = Object.assign({}, prev);
           n.confirm = Object.assign({}, n.confirm, { [vk]: 'Added to timeline' });
           n.expanded = Object.assign({}, n.expanded, { [vk]: false });
+          n.stockAttribution = Object.assign({}, prev.stockAttribution || {}, {
+            [vk]: data.attribution || null,
+          });
           return n;
         });
       } catch (e) {
@@ -480,6 +497,27 @@
               {local.confirm[vk] ? (
                 <div style={{ color: '#2DD4BF', fontSize: 11, marginBottom: 6 }}>{local.confirm[vk]}</div>
               ) : null}
+              {function() {
+                var att = local.stockAttribution && local.stockAttribution[vk];
+                if (!att || !att.text || !att.pexelsUrl) return null;
+                var isVideo = String(att.text || '').indexOf('Video') === 0;
+                if (isVideo) {
+                  return (
+                    <div style={{ fontSize: 10, color: '#94A3B8', marginBottom: 8, lineHeight: 1.45 }}>
+                      Video provided by{' '}
+                      <a href={att.pexelsUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#5EEAD4' }}>Pexels</a>
+                    </div>
+                  );
+                }
+                return (
+                  <div style={{ fontSize: 10, color: '#94A3B8', marginBottom: 8, lineHeight: 1.45 }}>
+                    Photo by{' '}
+                    <a href={att.photographerUrl || att.pexelsUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#5EEAD4' }}>{att.photographer || 'Photographer'}</a>
+                    {' '}on{' '}
+                    <a href={att.pexelsUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#5EEAD4' }}>Pexels</a>
+                  </div>
+                );
+              }()}
               {local.aiError[vk] ? (
                 <div style={{ color: '#FBBF24', fontSize: 11, marginBottom: 6 }}>
                   {'AI Generate: ' + local.aiError[vk]}
@@ -500,7 +538,7 @@
                         onClick={function() { if (!cardBusy) onFindClick(cand); }}
                         style={Object.assign({ fontSize: 11, padding: '4px 10px', borderRadius: 999, border: 'none', background: '#0D9488', color: '#fff' }, btnDis)}
                       >
-                        {local.loading[vk] ? 'Searching Pixabay…' : 'Find Components'}
+                        {local.loading[vk] ? 'Searching Pexels…' : 'Find Components'}
                       </button>
                       <button
                         type="button"
@@ -609,9 +647,9 @@
                     })}
                   </div>
                   <div style={{ marginTop: 8, fontSize: 9, color: '#64748B', lineHeight: 1.4 }}>
-                    Photos and videos shown above are from{' '}
-                    <a href="https://pixabay.com/" target="_blank" rel="noopener noreferrer" style={{ color: '#5EEAD4' }}>Pixabay</a>
-                    {' '}(see Pixabay license for use).
+                    Stock photos and videos are from{' '}
+                    <a href="https://www.pexels.com/" target="_blank" rel="noopener noreferrer" style={{ color: '#5EEAD4' }}>Pexels</a>
+                    {' '}(see Pexels license for use).
                   </div>
                 </div>
               ) : null}

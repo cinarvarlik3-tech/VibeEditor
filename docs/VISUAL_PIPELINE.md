@@ -2,7 +2,7 @@
 
 > Everything about how the "**Scan for Visuals**" button turns a transcript
 > into suggested b-roll, images, and native overlays — including the exact
-> prompts the LLM sees, the JSON schemas it must emit, the Pixabay search
+> prompts the LLM sees, the JSON schemas it must emit, the Pexels search
 > behaviour, and how the chosen asset ends up on the image track.
 
 Read this alongside:
@@ -10,7 +10,7 @@ Read this alongside:
   system prompt for Pass 1 and Pass 2.
 - `src/claude/generate.js` (lines ~1940–2175) — `generateVisualCandidates`,
   `generateRetrievalBrief`, `visualPipelineAiPick`, `extractTranscriptContext`.
-- `src/server.js` — the three `/api/visual/*` endpoints + Pixabay proxy.
+- `src/server.js` — the three `/api/visual/*` endpoints + Pexels proxy.
 - `public/App.jsx` — `handleVisualScan`, `handleFindAssets`,
   `handleClaudePickAsset`, `handleCreateImageClip`, `handleUseNative`.
 - `public/components/AgentPanel.jsx` — `VisualCandidatesPanel` UI.
@@ -32,11 +32,12 @@ It is a **three-pass pipeline** behind a single UI button:
 2. **Pass 2 — Brief.** On demand (when the user presses *Find Components*),
    a second model call generates a detailed retrieval brief (search query,
    orientation, filters) for that specific candidate.
-3. **Pass 3 — Pick.** After Pixabay returns a grid of ~9 normalized candidates,
+3. **Pass 3 — Pick.** After Pexels returns a grid of normalized candidates,
    the user can press *Let Claude Pick* and a tiny model call returns the best
    asset id from that grid.
 
-Between Pass 2 and Pass 3 there is a **deterministic Pixabay search** (no LLM).
+Between Pass 2 and Pass 3 there is a **deterministic Pexels search** (no LLM) using
+the Pass 2 `searchQuery` (Pexels title grammar), not the long cinematographic brief.
 After Pass 3 there is a **deterministic ingest step** that downloads the asset,
 converts images to MP4, uploads to Supabase Storage, and dispatches a `CREATE`
 operation on `track_image_0`.
@@ -89,61 +90,30 @@ Each candidate renders as a collapsible card with:
 Card state is local (`VisualCandidatesPanel` uses `useState`) and keyed with
 `__vuid` (generated from `candidate_id` or a fallback unique id).
 
-### 2.3 Find Components → Pass 2 + Pixabay
+### 2.3 Find Components → Pass 2 + Pexels
 
-Pressing **Find Components** runs `handleFindAssets(candidate)` in `App.jsx`:
-
-```1222:1260:public/App.jsx
-    const handleFindAssets = useCallback(async (candidate) => {
-      const r = await fetch('/api/visual/brief', {
-        method:  'POST',
-        headers: authHeadersJson(),
-        body:    JSON.stringify({
-          candidate,
-          transcript: cachedTranscript || [],
-          stylePolicy: {},
-        }),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.error || 'Brief failed');
-      if (!data.brief) {
-        return { assets: [], lowConfidence: true };
-      }
-      const b = data.brief;
-      const kind   = b.required_asset_kind  === 'image'    ? 'image'    : 'video';
-      const orient = b.required_orientation === 'portrait' ? 'portrait' : 'all';
-      const qStr   = String(b.retrieval_query_primary || '').trim().slice(0, 100);
-      if (!qStr) {
-        return { assets: [], lowConfidence: false,
-                 searchError: 'Brief did not include a search query.' };
-      }
-      const qs = new URLSearchParams({ q: qStr, asset_type: kind,
-                                       per_page: '9', orientation: orient });
-      const pr = await fetch('/api/pixabay/search?' + qs.toString(),
-                             { headers: authHeadersBearer() });
-      // returns { assets, lowConfidence, searchError? }
-    }, [cachedTranscript]);
-```
+Pressing **Find Components** runs `handleFindAssets(candidate)` in `App.jsx`.
+It posts to `/api/visual/brief`, then runs `GET /api/pexels/search` with
+`q = brief.searchQuery` (portrait is enforced server-side), `per_page: 15`, and
+**videos first**; if there are fewer than 3 results, it searches **photos**.
 
 Possible outcomes the UI handles explicitly:
 
 | Backend result | UI treatment |
 |----------------|--------------|
-| Brief returns `null` (model confidence < 0.55) | Yellow warning: "Confidence too low for Pixabay retrieval. Use native component instead." |
-| Brief returned but query was empty | Yellow warning: "Brief did not include a search query." |
-| Pixabay returned 429 | Yellow warning: "Pixabay rate limit exceeded. Wait a moment and try again." |
-| Pixabay returned other errors | Yellow warning with the error message from Pixabay |
-| Pixabay returned zero hits | Grid simply shows nothing (still expanded) |
-| Pixabay returned hits | Render a 3×3 grid of thumbnails with per-thumbnail **Use This** buttons + a top-level **Let Claude Pick** button |
+| Brief returns `null` (model confidence < 0.55) | Yellow warning: "Confidence too low for stock retrieval. Use native component instead." |
+| Brief returned but `searchQuery` empty | Yellow warning: "Brief did not include a searchQuery." |
+| Pexels returned an error (e.g. 502) | Yellow warning with the error message |
+| Pexels returned zero hits | Grid simply shows nothing (still expanded) |
+| Pexels returned hits | Thumbnail grid with **Use This** and **Let Claude Pick** |
 
 ### 2.4 Use This → ingest → imageClip
 
-Pressing **Use This** on a card POSTs to `/api/pixabay/ingest` with
-`{ assetId, assetType, downloadUrl, projectId, duration }`. The server
-downloads the asset, converts images to a 5-second MP4 (via
-`convertImageToVideo`), uploads to the `image-layer` Supabase bucket as
-`{userId}/{projectId}/pixabay_{assetId}.mp4`, and returns
-`{ permanentUrl, storageRef, duration, filename }`.
+Pressing **Use This** on a card POSTs to `/api/pexels/ingest` with
+`{ asset, projectId }` (normalized Pexels result). The server
+downloads the asset, converts photos to a 5-second MP4 (via
+`convertImageToVideo`), uploads to the `image-layer` Supabase bucket, and returns
+`{ permanentUrl, storageRef, width, height, duration, thumbnail, filename, attribution }`.
 
 The UI then calls `handleCreateImageClip` which dispatches:
 
@@ -161,7 +131,7 @@ URL + a `defaultImageClipLayoutPayload()` (fullscreen). See
 
 Pressing **Let Claude Pick** calls `handleClaudePickAsset(candidate, assets)`
 which POSTs `{ candidate, assets }` to `/api/visual/claude-pick`. The response
-`{ chosen_id }` is matched against the asset list; if found, the UI runs the
+`{ chosen_id }` (string id) is matched against the asset list; if found, the UI runs the
 same ingest path as **Use This** with that asset.
 
 ### 2.6 Native → keyword overlay
@@ -377,7 +347,7 @@ The full text lives in `src/claude/visualComponentRules.js`. Summary:
 
 1. **Role framing.** "You operate in visual analysis mode. Your job is to
    detect candidate moments in the transcript and classify each one. You do
-   not insert assets directly. You do not choose specific Pixabay files. You
+   not insert assets directly. You do not choose specific Pexels files. You
    return structured JSON output that the deterministic pipeline processes."
 2. **Four jobs.** Detect moments → classify them → decide native vs external
    stock → (Pass 2) emit a retrieval brief.
@@ -408,7 +378,7 @@ The full text lives in `src/claude/visualComponentRules.js`. Summary:
 10. **Hard rejection.** VRS < 0.35 and no native fallback; style fit < 0.30;
     saturation penalty > 0.80 unless KPS > 0.85 with aggressive style; any
     overlap with a stronger neighbouring candidate.
-11. **Error prevention.** Never fabricate Pixabay IDs/URLs. Never insert
+11. **Error prevention.** Never fabricate Pexels IDs/URLs. Never insert
     imageClip elements directly into `CURRENT_TRACKS`. Never overlap two
     suggestions. Empty array if nothing passes all five gates. Pass 2 must
     return a single object, not an array. Always `start_time < end_time`.
@@ -442,11 +412,11 @@ Uses its own minimal system prompt (`'You respond with JSON only. No markdown.'`
 User message:
 
 ```
-Given these ranked visual assets for the moment described, choose the single best one.
-Return only the asset id as a JSON object: { "chosen_id": <number> }
+Given these ranked Pexels stock assets… (narrowed fields: id, type, width, height, duration, alt, thumbnail)
+Return JSON: { "chosen_id": "<string>" }
 
 CANDIDATE: <candidate>
-ASSETS:    <normalized Pixabay hits>
+ASSETS:    <normalized Pexels hits (narrowed for the model)>
 ```
 
 ---
@@ -527,6 +497,7 @@ object**:
   "retrieval_query_alternates": ["coworkers collaborating",
                                  "open plan office",
                                  "startup office meeting"],
+  "searchQuery":                "Team Working at Desk in Office",
   "required_orientation":       "portrait",   // portrait | flexible
   "required_asset_kind":        "video",      // video | image
   "human_presence":             "prefer",     // prefer | avoid | neutral
@@ -554,83 +525,66 @@ object**:
 Failures all collapse to the same outcome — the endpoint returns
 `{ brief: null }` and the UI shows the low-confidence warning.
 
-**How the UI uses the brief.**
+**How the UI uses the brief (stock search).**
 
-```text
-qStr   = brief.retrieval_query_primary (trimmed, max 100 chars)
-kind   = brief.required_asset_kind === 'image'    ? 'image'    : 'video'
-orient = brief.required_orientation === 'portrait' ? 'portrait' : 'all'
-```
+`searchQuery` is set by the model (Pexels title grammar) and validated/fallback-sanitized
+in `POST /api/visual/brief`. The app calls `GET /api/pexels/search` with
+`q = brief.searchQuery`, `per_page=15`, and prefers **videos**; if &lt; 3 results,
+it falls back to **photos**. `orientation=portrait` and `locale=en-US` are fixed on
+the server.
 
-and then:
-
-```
-GET /api/pixabay/search?q=<qStr>&asset_type=<kind>&per_page=9&orientation=<orient>
-```
-
-Note: **alternates are currently unused** at the UI level. They exist so a
-future ranker can try them in a fallback loop if primary returns no hits.
+`retrieval_query_primary` / alternates remain for future ranking fallbacks; the
+**live** search string is `searchQuery`.
 
 ---
 
-## 7. Pixabay layer
+## 7. Pexels layer
 
-### 7.1 Search (`GET /api/pixabay/search`)
+### 7.1 Search (`GET /api/pexels/search`)
 
 Key server behaviour (see `src/server.js`):
 
-- 503 returned if `PIXABAY_API_KEY` is missing.
-- 400 returned if `q` is empty.
-- `q` is truncated at 100 chars.
-- `per_page` clamped to `[1, 20]`.
-- **24-hour in-memory LRU** keyed by `{ q, assetType, perPage, orientation }`
-  (`pixabayLRU`, max 500 entries).
-- `asset_type=image` hits `pixabay.com/api/` with `image_type=photo` and
-  `safesearch=true`. `orientation=portrait` maps to Pixabay's
-  `orientation=vertical`.
-- `asset_type=video` hits `pixabay.com/api/videos/` with `video_type=all`
-  and `safesearch=true`.
-- `asset_type=all` runs both endpoints in parallel, each at `per_page/2`.
-- Hits with `watermark` in `tags` are filtered out post-hoc.
-- Pixabay 429 → client sees `429` with message "Pixabay rate limit exceeded.
-  Wait a moment and try again." Anything else → `502` with the provider message.
+- 503 if `PEXELS_API_KEY` is missing. Auth header: `Authorization: <key>` (no `Bearer` prefix).
+- 400 if `q` is empty.
+- `per_page` default 15, max 80. Every request includes `orientation=portrait` and `locale=en-US`.
+- `asset_type`: `photos` → `https://api.pexels.com/v1/search`; `videos` → `.../videos/search`;
+  `all` → both in parallel, results **interleaved** (video, photo, video, photo, …), then
+  truncated to `per_page` total in the handler.
+- **24h LRU** cache key: `${asset_type}:${q}` (`pexelsLRU`, max 500). Response includes
+  `X-Cache: HIT|MISS` and Pexels rate-limit headers are forwarded.
+- Non-2xx from Pexels → `502` with a generic message; body is logged. For `asset_type=all`,
+  partial success returns `warnings: [...]` and merged results when one side fails.
 
-### 7.2 Normalized asset shape
+### 7.2 Normalized asset shape (API + pick)
 
-Both image and video hits are normalized to a single shape before being sent
-to the browser (and then forwarded to `visualPipelineAiPick`):
+Pexels hits are normalized server-side; the client maps legacy grid fields
+(`downloadUrl` ← `url`, `thumbnailUrl` ← `thumbnail`, etc.):
 
 ```jsonc
 {
-  "id":           12345,           // pixabay id (number)
-  "type":         "video"|"image",
-  "previewUrl":   "...",
-  "thumbnailUrl": "...",
-  "downloadUrl":  "...",           // the largest available URL
-  "duration":     number|null,     // seconds for videos, null for images
-  "width":        number,
-  "height":       number,
-  "tags":         "comma, separated",
-  "contributor":  "username",
-  "pageURL":      "https://pixabay.com/..."
+  "id":               "12345",        // string
+  "type":             "photo"|"video",
+  "width":            number,
+  "height":           number,
+  "duration":         number|null,    // seconds; null for photos
+  "thumbnail":        "https://...",
+  "url":              "https://...",  // download — original image or best portrait video file
+  "pexelsUrl":        "https://www.pexels.com/...",
+  "photographer":     "Name",
+  "photographerUrl":  "https://...",
+  "alt":              "string"|null
 }
 ```
 
-Response envelope: `{ results: Asset[], query: string, total: number }`.
+### 7.3 Ingest (`POST /api/pexels/ingest`)
 
-### 7.3 Ingest (`POST /api/pixabay/ingest`)
+Body: `{ asset: <normalized result>, projectId }`.
 
-Body: `{ assetId, assetType, downloadUrl, projectId, duration }`.
-
-1. Ownership check: the `projects` row must belong to `req.user.id`.
-2. Download to `os.tmpdir()` (`axios.get(..., { responseType:'arraybuffer',
-   timeout: 120000, maxContentLength: MAX_UPLOAD_BYTES })`).
-3. If `assetType === 'image'`, `convertImageToVideo(tmpDl, duration || 5)` to
-   produce a 5 s MP4.
-4. If video, probe duration via `getVideoDuration` if the browser didn't
-   supply it.
-5. Upload to `image-layer/{userId}/{projectId}/pixabay_{assetId}.mp4`.
-6. Respond: `{ permanentUrl, storageRef:{bucket,path}, duration, filename }`.
+1. Ownership check.
+2. Download with `fetch` and a 30 s timeout; stream to temp; photos → `convertImageToVideo`;
+   videos → upload MP4 as-is.
+3. Upload to `image-layer`. Respond with `permanentUrl`, `storageRef`, dimensions, `duration`,
+   `thumbnail`, `filename`, and **`attribution`** (Pexels terms).
 
 This is the only file-creating step in the visual pipeline. The LLM never
 touches it.
@@ -757,7 +711,7 @@ Expect `visual_pick` to have very small averages (single-digit output tokens).
 ## 10. End-to-end sequence
 
 ```
- User                   App.jsx / AgentPanel          Express               OpenAI        Pixabay     Supabase
+ User                   App.jsx / AgentPanel          Express               OpenAI        Pexels     Supabase
   │                           │                           │                    │             │            │
   │ click "Scan for Visuals"  │                           │                    │             │            │
   │──────────────────────────▶│                           │                    │             │            │
@@ -772,10 +726,10 @@ Expect `visual_pick` to have very small averages (single-digit output tokens).
   │                           │──────────────────────────▶│  cache? ──miss──▶  │ generateRetrievalBrief   │
   │                           │                           │◀──────────────────│                            │
   │                           │◀── { brief: {...} } ──────│                    │             │            │
-  │                           │ GET /api/pixabay/search   │                    │             │            │
-  │                           │──────────────────────────▶│  LRU hit or ──────▶│             ◀── 9 hits ──│            │
-  │                           │◀── { results: [9] } ──────│                    │             │            │
-  │    (3×3 thumbnail grid)   │                           │                    │             │            │
+  │                           │ GET /api/pexels/search   │                    │             │            │
+  │                           │──────────────────────────▶│  LRU hit or ──────▶│             ◀── hits ──│            │
+  │                           │◀── { results: [...] } ───│                    │             │            │
+  │    (thumbnail grid)       │                           │                    │             │            │
   │                           │                           │                    │             │            │
   │ click "Let Claude Pick"   │                           │                    │             │            │
   │──────────────────────────▶│ POST /api/visual/claude-pick                   │             │            │
@@ -784,7 +738,7 @@ Expect `visual_pick` to have very small averages (single-digit output tokens).
   │                           │◀── { chosen_id } ─────────│                    │             │            │
   │                           │                           │                    │             │            │
   │ click "Use This"          │                           │                    │             │            │
-  │──────────────────────────▶│ POST /api/pixabay/ingest  │                    │             │            │
+  │──────────────────────────▶│ POST /api/pexels/ingest   │                    │             │            │
   │                           │──────────────────────────▶│ download asset ────┼────────────▶│            │
   │                           │                           │ ffmpeg if image    │             │            │
   │                           │                           │ upload ────────────┼─────────────┼──────────▶ image-layer/

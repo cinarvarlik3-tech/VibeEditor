@@ -404,7 +404,7 @@
         {element.type === 'imageClip' && (function() {
           var st = element.sourceType;
           var badge = null;
-          if (st === 'pixabay') {
+          if (st === 'pixabay' || st === 'pexels') {
             badge = { text: 'PIX', bg: 'rgba(139, 92, 246, 0.85)', fg: '#fff' };
           } else if (st === 'native') {
             badge = { text: 'NAT', bg: 'rgba(245, 158, 11, 0.9)', fg: '#111' };
